@@ -163,19 +163,18 @@ func ReadUntilSpaceOrPipe(s string) string {
 	return strings.TrimSpace(out)
 }
 
-// projectNameToKey maps common project names to their Jira keys.
-var projectNameToKey = map[string]string{
-	"transportador":           "TPTDR",
-	"transporte":              "TPTDR",
-	"portal do transportador": "TPTDR",
-	"tptdr":                   "TPTDR",
-	"faturamento":             "INV",
-	"sistema de faturamento":  "INV",
-	"inv":                     "INV",
-	"sfm":                     "INV",
-	"gerador":                 "GR",
-	"portal do gerador":       "GR",
-	"gr":                      "GR",
+// projectNameToKey maps human-readable project names (lowercase) to their
+// Jira keys.  It is empty by default and populated at startup via
+// SetProjectNameMap using values from the JIRA_PROJECT_NAME_MAP env var.
+var projectNameToKey = map[string]string{}
+
+// SetProjectNameMap replaces the project name→key lookup table used by
+// ParseProjectKeyFromText and LooksLikeJiraCreateIntent.  It should be
+// called once during application startup after loading configuration.
+// The supplied map must use lowercase names as keys and uppercase Jira
+// project keys as values (e.g. {"backend": "BE", "frontend": "FE"}).
+func SetProjectNameMap(m map[string]string) {
+	projectNameToKey = m
 }
 
 // ParseProjectKeyFromText attempts to extract a project key from a
@@ -190,7 +189,7 @@ func ParseProjectKeyFromText(s string) string {
 
 	low := strings.ToLower(s)
 
-	// 1) Map common project names: "projeto do transportador" -> TPTDR
+	// 1) Map configured project names: "projeto do backend" -> BE (via SetProjectNameMap)
 	reProjectName := regexp.MustCompile(`(?i)\b(?:projeto|prefixo|project)\s+(?:do|da|de|of|the)\s+(\w+)\b`)
 	if m := reProjectName.FindStringSubmatch(s); len(m) >= 2 {
 		name := strings.ToLower(strings.TrimSpace(m[1]))
@@ -199,23 +198,22 @@ func ParseProjectKeyFromText(s string) string {
 		}
 	}
 
-	// 2) Direct project name mention: "transportador", "inventário", etc.
+	// 2) Direct project name mention alongside project/prefixo keyword (uses configured map)
 	for name, key := range projectNameToKey {
 		if strings.Contains(low, name) && (strings.Contains(low, "projeto") || strings.Contains(low, "prefixo") || strings.Contains(low, "project")) {
 			return key
 		}
 	}
 
-	// 2b) Destination preposition: "no portal do transportador", "na TPTDR", "em TPTDR", etc.
-	// This covers create-card phrases like "ambos no portal do transportador TPTDR"
-	// where "projeto" is absent but the destination is unambiguous.
+	// 2b) Destination preposition: "no backend", "na OPS", "em INFRA", etc.
+	// This covers create-card phrases where "projeto" is absent but the destination is unambiguous.
 	for name, key := range projectNameToKey {
 		if strings.Contains(low, "no "+name) || strings.Contains(low, "na "+name) || strings.Contains(low, "em "+name) {
 			return key
 		}
 	}
 
-	// 3) Original behavior: prefixo/projeto/project TPTDR (but exclude articles)
+	// 3) Explicit key: "projeto BE", "prefixo=BACKEND" (excludes common articles)
 	re := regexp.MustCompile(`(?i)\b(prefixo|projeto|project)\s*[:=]?\s*([A-Z][A-Z0-9]+)\b`)
 	if m := re.FindStringSubmatch(s); len(m) >= 3 {
 		k := strings.ToUpper(strings.TrimSpace(m[2]))
@@ -226,7 +224,7 @@ func ParseProjectKeyFromText(s string) string {
 		return k
 	}
 
-	// 4) "roadmap do TPTDR" / "roadmap da TPTDR" / "roadmap de TPTDR"
+	// 4) "roadmap do PROJ" / "roadmap da PROJ" / "roadmap de PROJ"
 	if strings.Contains(low, "roadmap") {
 		reRoadmap := regexp.MustCompile(`(?i)\broadmap\s+(?:do|da|de)\s+([A-Z][A-Z0-9]+)\b`)
 		if m := reRoadmap.FindStringSubmatch(s); len(m) >= 2 {
@@ -237,7 +235,7 @@ func ParseProjectKeyFromText(s string) string {
 			return k
 		}
 
-		// 5) Fallback: "roadmap TPTDR"
+		// 5) Fallback: "roadmap PROJ"
 		reRoadmap2 := regexp.MustCompile(`(?i)\broadmap\s+([A-Z][A-Z0-9]+)\b`)
 		if m := reRoadmap2.FindStringSubmatch(s); len(m) >= 2 {
 			k := strings.ToUpper(strings.TrimSpace(m[1]))
