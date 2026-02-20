@@ -56,6 +56,7 @@ type openAIChatResponse struct {
 type Client struct {
 	APIKey      string
 	JiraBaseURL string
+	BotName     string
 }
 
 // NewClient constructs a new LLM client from the provided configuration.
@@ -63,6 +64,7 @@ func NewClient(cfg config.Config) *Client {
 	return &Client{
 		APIKey:      cfg.OpenAIAPIKey,
 		JiraBaseURL: cfg.JiraBaseURL,
+		BotName:     cfg.BotName,
 	}
 }
 
