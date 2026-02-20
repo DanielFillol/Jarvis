@@ -11,6 +11,7 @@ import (
 	httpinternal "github.com/DanielFillol/Jarvis/internal/http"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
+	"github.com/DanielFillol/Jarvis/internal/parse"
 	"github.com/DanielFillol/Jarvis/internal/slack"
 	"github.com/DanielFillol/Jarvis/internal/state"
 )
@@ -18,7 +19,9 @@ import (
 func main() {
 	// Load configuration (from .env and environment)
 	cfg := config.Load()
-	log.Printf("[BOOT] env check: SLACK_SIGNING_SECRET=%t SLACK_BOT_TOKEN=%t SLACK_USER_TOKEN=%t OPENAI_API_KEY=%t OPENAI_MODEL=%q OPENAI_FALLBACK_MODEL=%q JIRA_BASE_URL=%t JIRA_EMAIL=%t JIRA_API_TOKEN=%t JIRA_CREATE_ENABLED=%t", cfg.SlackSigningSecret != "", cfg.SlackBotToken != "", cfg.SlackUserToken != "", cfg.OpenAIAPIKey != "", cfg.OpenAIModel, cfg.OpenAIFallbackModel, cfg.JiraBaseURL != "", cfg.JiraEmail != "", cfg.JiraAPIToken != "", cfg.JiraCreateEnabled)
+	log.Printf("[BOOT] env check: SLACK_SIGNING_SECRET=%t SLACK_BOT_TOKEN=%t SLACK_USER_TOKEN=%t OPENAI_API_KEY=%t OPENAI_MODEL=%q OPENAI_FALLBACK_MODEL=%q JIRA_BASE_URL=%t JIRA_EMAIL=%t JIRA_API_TOKEN=%t JIRA_CREATE_ENABLED=%t JIRA_PROJECT_KEYS=%v BOT_NAME=%q", cfg.SlackSigningSecret != "", cfg.SlackBotToken != "", cfg.SlackUserToken != "", cfg.OpenAIAPIKey != "", cfg.OpenAIModel, cfg.OpenAIFallbackModel, cfg.JiraBaseURL != "", cfg.JiraEmail != "", cfg.JiraAPIToken != "", cfg.JiraCreateEnabled, cfg.JiraProjectKeys, cfg.BotName)
+	// Register project name→key mapping for natural language parsing
+	parse.SetProjectNameMap(cfg.JiraProjectNameMap)
 	// Initialize clients
 	slackClient := slack.NewClient(cfg)
 	jiraClient := jira.NewClient(cfg)
