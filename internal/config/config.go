@@ -25,8 +25,16 @@ type Config struct {
 	JiraBaseURL         string
 	JiraEmail           string
 	JiraAPIToken        string
-	JiraProjectKeys     []string
-	JiraCreateEnabled   bool
+	// JiraProjectKeys is the list of Jira project keys to search by default
+	// (e.g. ["PROJ", "BACKEND"]).  Set via JIRA_PROJECT_KEYS=PROJ,BACKEND.
+	JiraProjectKeys []string
+	// JiraProjectNameMap maps human-readable project names (lowercase) to their
+	// Jira keys.  Loaded from JIRA_PROJECT_NAME_MAP=name1:KEY1,name2:KEY2.
+	JiraProjectNameMap map[string]string
+	JiraCreateEnabled  bool
+	// BotName is the display name of the bot used in messages and prompts.
+	// Defaults to "Jarvis".  Set via BOT_NAME=MyBot.
+	BotName string
 }
 
 // Load reads configuration from environment variables.  If a .env file
@@ -52,7 +60,9 @@ func Load() Config {
 	cfg.JiraEmail = os.Getenv("JIRA_EMAIL")
 	cfg.JiraAPIToken = os.Getenv("JIRA_API_TOKEN")
 	cfg.JiraCreateEnabled = strings.EqualFold(strings.TrimSpace(getEnv("JIRA_CREATE_ENABLED", "false")), "true")
-	cfg.JiraProjectKeys = parseCSV(getEnv("JIRA_PROJECT_KEYS", "TPTDR,INV,GR"))
+	cfg.JiraProjectKeys = parseCSV(getEnv("JIRA_PROJECT_KEYS", ""))
+	cfg.JiraProjectNameMap = parseProjectNameMap(os.Getenv("JIRA_PROJECT_NAME_MAP"))
+	cfg.BotName = getEnv("BOT_NAME", "Jarvis")
 	pages := getEnv("SLACK_SEARCH_MAX_PAGES", "10")
 	if n, err := strconv.Atoi(pages); err == nil {
 		cfg.SlackSearchMaxPages = n
@@ -69,6 +79,29 @@ func getEnv(key, def string) string {
 		return def
 	}
 	return v
+}
+
+// parseProjectNameMap parses a string of the form "name1:KEY1,name2:KEY2"
+// into a map from lowercased name to uppercase Jira key.
+// Entries that are malformed or empty are silently ignored.
+func parseProjectNameMap(s string) map[string]string {
+	m := make(map[string]string)
+	for _, entry := range strings.Split(s, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name := strings.TrimSpace(strings.ToLower(parts[0]))
+		key := strings.TrimSpace(strings.ToUpper(parts[1]))
+		if name != "" && key != "" {
+			m[name] = key
+		}
+	}
+	return m
 }
 
 // parseCSV splits a comma-separated string into a slice of strings,
