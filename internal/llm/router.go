@@ -25,19 +25,25 @@ type RetrievalDecision struct {
 // DecideRetrieval consults the language model to determine which
 // contexts (Slack, Jira) should be retrieved for a given question.
 // It passes a prompt describing the routing task along with the
-// recent thread history and the user's question.  The returned JSON
-// is unmarshalled into a RetrievalDecision.  If the JSON is invalid
-// or the API call fails, a non-nil error is returned.
-func (c *Client) DecideRetrieval(question, threadHistory, model string) (RetrievalDecision, error) {
-	prompt := fmt.Sprintf(`Você é um roteador de contexto do Jarvis (Slack + Jira).
-Decida quais fontes buscar para responder a pergunta.
+// recent thread history, the user's question and the list of
+// configured Jira project keys.  The returned JSON is unmarshalled
+// into a RetrievalDecision.  If the JSON is invalid or the API call
+// fails, a non-nil error is returned.
+func (c *Client) DecideRetrieval(question, threadHistory, model string, projectKeys []string) (RetrievalDecision, error) {
+	projectsCtx := ""
+	if len(projectKeys) > 0 {
+		projectsCtx = fmt.Sprintf("\nProjetos Jira configurados: %s\n", strings.Join(projectKeys, ", "))
+	}
 
+	prompt := fmt.Sprintf(`Você é um roteador de contexto de um assistente Slack+Jira.
+Decida quais fontes buscar para responder a pergunta.
+%s
 Retorne APENAS JSON válido:
 {
   "need_slack": true/false,
   "slack_query": "...",
   "need_jira": true/false,
-  "jira_intent": "listar_bugs_abertos|explicar_v2|default",
+  "jira_intent": "listar_bugs_abertos|busca_texto|default",
   "jira_jql": ""
 }
 
@@ -48,27 +54,36 @@ Fontes disponíveis:
 Regras de roteamento:
 1. Roadmap, escopo, "o que foi feito", "está no ar", bugs abertos → need_jira=true.
 2. "onde falamos", "qual foi a decisão", "me manda o link", "thread do slack" → need_slack=true.
-3. Resumo/retrospectiva de processo (faturamento, sprint, fechamento) → need_jira=true E need_slack=true.
+3. Resumo/retrospectiva de processo (sprint, fechamento, entrega) → need_jira=true E need_slack=true.
 4. Se need_jira=true para pergunta substantiva (não apenas listagem de tickets), considere need_slack=true também — discussões no Slack enriquecem a resposta com contexto que o Jira não tem.
 5. Perguntas curtas (≤ 2 palavras) ou que já têm resposta no histórico da thread → need_slack=false, need_jira=false.
 6. Criar card no Jira → need_slack=false, need_jira=false.
+
+Valores de jira_intent:
+- "listar_bugs_abertos": perguntas sobre bugs em aberto, falhas, erros.
+- "busca_texto": pesquisa de contexto sobre um tema específico no Jira (funcionalidades, épicos, histórias).
+- "default": listagem geral ou roadmap.
+
+Regras para jira_jql:
+- Se souber exatamente o JQL, preencha. Caso contrário, deixe "" e use jira_intent.
+- Use apenas campos padrão do Jira Cloud: project, issuetype, status, statusCategory, text, assignee, priority, labels, sprint, fixVersion, updated, created.
+- Para busca por texto: text ~ "termo"
+- Para bugs abertos: issuetype = Bug AND statusCategory != Done
 
 Regras para slack_query (IMPORTANTE):
 - Use apenas 2–4 palavras-chave do tema, sem filtros extras.
 - NÃO use has:thread, has:link, has:reaction — reduzem o recall drasticamente.
 - Só use in:#canal se o usuário mencionar explicitamente um canal.
 - Prefira termos sem aspas; use aspas apenas para frases exatas críticas.
-- Exemplo ruim: "faturamento janeiro in:#faturamento has:thread"
-- Exemplo bom: "faturamento janeiro"
-
-jira_jql: se não tiver certeza, deixe vazio e use jira_intent="default".
+- Exemplo ruim: "deploy produção in:#deploys has:thread"
+- Exemplo bom: "deploy produção"
 
 Thread (contexto recente):
 %s
 
 Pergunta:
 %s
-`, clip(threadHistory, 1200), question)
+`, projectsCtx, clip(threadHistory, 1200), question)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
 	out, err := c.Chat(messages, model, 0.2, 600)
@@ -126,7 +141,7 @@ func applyDeterministicOverrides(question string, d *RetrievalDecision) {
 	}
 
 	// 3. Roadmap + explicit project → Jira only (structured listing).
-	if strings.Contains(qLower, "roadmap") && !strings.Contains(qLower, "v2") {
+	if strings.Contains(qLower, "roadmap") {
 		if proj := parse.ParseProjectKeyFromText(question); proj != "" {
 			d.NeedSlack = false
 			d.SlackQuery = ""
