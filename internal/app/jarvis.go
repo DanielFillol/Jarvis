@@ -88,7 +88,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	}
 	// 5) Decide Slack/Jira search (LLM)
 	questionForLLM := parse.StripSlackPermalinks(question)
-	decision, err := s.LLM.DecideRetrieval(questionForLLM, threadHist, s.Cfg.OpenAIModel)
+	decision, err := s.LLM.DecideRetrieval(questionForLLM, threadHist, s.Cfg.OpenAIModel, s.Cfg.JiraProjectKeys)
 	if err != nil {
 		log.Printf("[WARN] decideRetrieval failed: %v", err)
 		if hasThreadPermalink {
@@ -344,7 +344,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 			NeedType:     needType,
 		})
 		if !updated {
-			_ = s.Slack.PostMessage(channel, threadTs, "Não consegui ler `projeto=` e/ou `tipo=`. Exemplo: `jarvis: jira definir | projeto=TPTDR | tipo=Bug`")
+			_ = s.Slack.PostMessage(channel, threadTs, "Não consegui ler `projeto=` e/ou `tipo=`. Exemplo: `jarvis: jira definir | projeto=PROJ | tipo=Bug`")
 			return true, nil
 		}
 		if needProject || needType {
@@ -599,7 +599,7 @@ func buildJiraContextGrouped(issues []jira.JiraSearchJQLRespIssue) string {
 func defaultJQLForIntent(intent, question string, projects []string) string {
 	proj := strings.Join(projects, ", ")
 
-	// 🔒 Robustness: if there is no project, do not generate "project in ()"
+	// Robustness: if there is no project, do not generate "project in ()"
 	hasProj := strings.TrimSpace(proj) != ""
 
 	switch strings.TrimSpace(intent) {
@@ -609,10 +609,14 @@ func defaultJQLForIntent(intent, question string, projects []string) string {
 		}
 		return `issuetype = Bug AND statusCategory != Done ORDER BY updated DESC`
 
-	case "explicar_v2":
-		q := safeJQLTextQuery(question)
+	case "busca_texto":
+		q := extractJQLTextQuery(question)
 		if q == "" {
-			q = "V2"
+			// Fallback to default listing when no meaningful term found
+			if hasProj {
+				return fmt.Sprintf(`project in (%s) ORDER BY updated DESC`, proj)
+			}
+			return "ORDER BY updated DESC"
 		}
 		if hasProj {
 			return fmt.Sprintf(`project in (%s) AND text ~ %q ORDER BY updated DESC`, proj, q)
@@ -653,18 +657,36 @@ func sanitizeJQL(jql string) string {
 	return result
 }
 
-func safeJQLTextQuery(question string) string {
-	q := strings.ToLower(question)
-	if strings.Contains(q, "portal") && strings.Contains(q, "v2") {
-		return "portal musa v2"
+// extractJQLTextQuery extracts 1-3 meaningful keywords from a natural
+// language question to use as a Jira text search term.  Common stopwords
+// and intent verbs are stripped so only the topic remains.
+func extractJQLTextQuery(question string) string {
+	skip := map[string]bool{
+		"o": true, "a": true, "os": true, "as": true, "um": true, "uma": true,
+		"de": true, "do": true, "da": true, "dos": true, "das": true,
+		"em": true, "no": true, "na": true, "nos": true, "nas": true,
+		"para": true, "por": true, "com": true, "e": true, "é": true,
+		"me": true, "que": true, "já": true, "qual": true, "quais": true,
+		"quando": true, "como": true, "sobre": true, "tem": true, "foi": true,
+		"está": true, "estão": true, "ser": true, "isso": true, "esse": true,
+		// intent verbs
+		"explica": true, "explique": true, "mostre": true, "mostra": true,
+		"liste": true, "listar": true, "busca": true, "buscar": true,
+		"resume": true, "resumo": true, "fala": true, "fale": true,
+		"quero": true, "preciso": true, "gostaria": true,
 	}
-	if strings.Contains(q, "musa v2") {
-		return "musa v2"
+	var kept []string
+	for _, w := range strings.Fields(strings.ToLower(question)) {
+		w = strings.Trim(w, ".,!?;:\"'()[]{}")
+		if w == "" || skip[w] {
+			continue
+		}
+		kept = append(kept, w)
+		if len(kept) == 3 {
+			break
+		}
 	}
-	if strings.Contains(q, "v2") {
-		return "V2"
-	}
-	return ""
+	return strings.Join(kept, " ")
 }
 
 // buildInformativeFallback constructs a fallback answer when the LLM
@@ -699,7 +721,7 @@ func buildInformativeFallback(triedSlack bool, slackMatches int, triedJira bool,
 		sug = append(sug, "Se você colar a descrição/AC da issue aqui, eu resumo certinho.")
 	}
 	if triedJira && jiraIssues == 0 && issueKey == "" {
-		sug = append(sug, "Tenta incluir uma issue key específica (ex: TPTDR-123) ou o nome do épico.")
+		sug = append(sug, "Tenta incluir uma issue key específica (ex: PROJ-123) ou o nome do épico.")
 	}
 	if triedSlack && slackMatches == 0 {
 		sug = append(sug, "Tenta especificar o canal ou termos exatos (ex: 'tratamento em branco' ou '#coletas').")
