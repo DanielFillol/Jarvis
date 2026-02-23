@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/DanielFillol/Jarvis/internal/config"
+	"github.com/DanielFillol/Jarvis/internal/github"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
 	"github.com/DanielFillol/Jarvis/internal/parse"
@@ -22,21 +23,23 @@ import (
 // questions and handle issue creation flows.  The Service does not
 // depend on net/http and is therefore easily testable.
 type Service struct {
-	Slack *slack.Client
-	Jira  *jira.Client
-	LLM   *llm.Client
-	Store *state.Store
-	Cfg   config.Config
+	Slack  *slack.Client
+	Jira   *jira.Client
+	LLM    *llm.Client
+	GitHub *github.Client
+	Store  *state.Store
+	Cfg    config.Config
 }
 
 // NewService constructs a new Jarvis service from its dependencies.
-func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, store *state.Store) *Service {
+func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, githubClient *github.Client, store *state.Store) *Service {
 	return &Service{
-		Slack: slackClient,
-		Jira:  jiraClient,
-		LLM:   llmClient,
-		Store: store,
-		Cfg:   cfg,
+		Slack:  slackClient,
+		Jira:   jiraClient,
+		LLM:    llmClient,
+		GitHub: githubClient,
+		Store:  store,
+		Cfg:    cfg,
 	}
 }
 
@@ -227,6 +230,10 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		if strings.TrimSpace(d.Summary) == "" {
 			d.Summary = "Card criado via Jarvis"
 		}
+		// Enrich bug cards with GitHub code context before saving/creating
+		if isBugType(d.IssueType) {
+			d = s.enrichBugWithGitHub(d)
+		}
 		needProject := strings.TrimSpace(d.Project) == ""
 		needType := strings.TrimSpace(d.IssueType) == ""
 		if needProject || needType {
@@ -301,6 +308,10 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		}
 		if strings.TrimSpace(parsedType) != "" {
 			draft.IssueType = parsedType
+		}
+		// Enrich bug cards with GitHub code context before saving/creating
+		if isBugType(draft.IssueType) {
+			draft = s.enrichBugWithGitHub(draft)
 		}
 		needProject := strings.TrimSpace(draft.Project) == ""
 		needType := strings.TrimSpace(draft.IssueType) == ""
@@ -428,6 +439,59 @@ func (s *Service) appendSlackOrigin(d *jira.IssueDraft, channel, threadTs, origi
 		b.WriteString(fmt.Sprintf("\n- Comando: %q\n", clip(originalText, 400)))
 	}
 	d.Description = b.String()
+}
+
+// isBugType returns true when the issue type string indicates a bug.
+func isBugType(issueType string) bool {
+	return strings.Contains(strings.ToLower(issueType), "bug")
+}
+
+// enrichBugWithGitHub enriches a bug draft with code context from GitHub.
+// It generates a focused search query via LLM, searches GitHub code, builds
+// a code context string and then asks the LLM to enrich the description.
+// If any step fails, or GitHub is not configured, the original draft is
+// returned unchanged (graceful degradation).
+func (s *Service) enrichBugWithGitHub(draft jira.IssueDraft) jira.IssueDraft {
+	if s.GitHub == nil || !s.GitHub.Enabled() {
+		return draft
+	}
+	log.Printf("[GITHUB] enriching bug draft summary=%q", preview(draft.Summary, 80))
+
+	// 1. Generate focused search query
+	query, err := s.LLM.GenerateGitHubSearchQuery(draft.Summary, draft.Description, s.Cfg.OpenAIModel)
+	if err != nil || strings.TrimSpace(query) == "" {
+		log.Printf("[GITHUB] query generation failed (skipping enrichment): %v", err)
+		return draft
+	}
+	log.Printf("[GITHUB] search query=%q", query)
+
+	// 2. Search GitHub
+	matches, err := s.GitHub.SearchCode(query, 5)
+	if err != nil {
+		log.Printf("[GITHUB] SearchCode failed (skipping enrichment): %v", err)
+		return draft
+	}
+	if len(matches) == 0 {
+		log.Printf("[GITHUB] no code matches found for query=%q", query)
+		return draft
+	}
+	log.Printf("[GITHUB] found %d code match(es)", len(matches))
+
+	// 3. Build code context string
+	codeCtx := github.BuildCodeContext(matches, s.GitHub, 3, 60)
+	if strings.TrimSpace(codeCtx) == "" {
+		log.Printf("[GITHUB] empty code context after building (skipping enrichment)")
+		return draft
+	}
+
+	// 4. Enrich bug description
+	enriched, err := s.LLM.EnhanceBugWithCodeContext(draft, codeCtx, s.Cfg.OpenAIModel)
+	if err != nil {
+		log.Printf("[GITHUB] EnhanceBugWithCodeContext failed (skipping enrichment): %v", err)
+		return draft
+	}
+	log.Printf("[GITHUB] enrichment done description_len=%d", len(enriched.Description))
+	return enriched
 }
 
 // fetchExampleIssues is a helper that fetches real Jira cards from the same project/type
