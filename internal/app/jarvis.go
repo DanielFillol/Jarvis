@@ -446,48 +446,82 @@ func isBugType(issueType string) bool {
 	return strings.Contains(strings.ToLower(issueType), "bug")
 }
 
-// enrichBugWithGitHub rewrites a bug draft with technical depth.
-// It always produces a structured technical description — even when GitHub
-// finds no code — by asking the LLM to reason about what the bug likely
-// involves.  GitHub code context is used when available to make the
-// description even more specific (exact files, functions, fix proposal).
-// On hard failures the original draft is returned unchanged.
+// enrichBugWithGitHub rewrites a bug draft as a proper technical bug report.
+//
+// When GitHub is configured it follows an exploratory approach:
+//  1. Select which repos (from the configured list) are relevant to the bug
+//  2. Fetch each repo's file tree and let the LLM pick the files to read
+//  3. Read those files to get real code context
+//  4. Ask the LLM to write the technical description using that context
+//
+// When GitHub is not configured (or any step fails) the LLM still produces a
+// structured technical description using hypotheses and "A confirmar" markers.
+// The original draft is returned only on a hard LLM failure.
 func (s *Service) enrichBugWithGitHub(draft jira.IssueDraft, threadHistory string) jira.IssueDraft {
 	log.Printf("[GITHUB] enriching bug draft summary=%q", preview(draft.Summary, 80))
 
-	// 1. Generate focused search query based on the thread context
-	//    (reasons about code patterns, not just extracts user words)
-	var codeCtx string
-	if s.GitHub != nil && s.GitHub.Enabled() {
-		query, err := s.LLM.GenerateGitHubSearchQuery(draft.Summary, threadHistory, s.Cfg.OpenAIModel)
-		if err != nil || strings.TrimSpace(query) == "" {
-			log.Printf("[GITHUB] query generation failed: %v", err)
-		} else {
-			log.Printf("[GITHUB] search query=%q", query)
+	var codeCtx strings.Builder
 
-			// 2. Search GitHub
-			matches, err := s.GitHub.SearchCode(query, 5)
+	if s.GitHub != nil && s.GitHub.Enabled() {
+		allRepos := s.GitHub.NormalizedRepos()
+		log.Printf("[GITHUB] repos available=%d", len(allRepos))
+
+		// Step 1: LLM selects which repos are relevant for this bug
+		selectedRepos, err := s.LLM.SelectReposForBug(draft.Summary, draft.Project, allRepos, s.Cfg.OpenAIModel)
+		if err != nil || len(selectedRepos) == 0 {
+			log.Printf("[GITHUB] repo selection failed (%v); trying first 2 repos", err)
+			if len(allRepos) > 0 {
+				end := 2
+				if len(allRepos) < end {
+					end = len(allRepos)
+				}
+				selectedRepos = allRepos[:end]
+			}
+		}
+		log.Printf("[GITHUB] selected repos=%v", selectedRepos)
+
+		for _, repo := range selectedRepos {
+			// Step 2: Fetch the repository file tree
+			fileTree, err := s.GitHub.GetRepoTree(repo, 300)
 			if err != nil {
-				log.Printf("[GITHUB] SearchCode failed: %v", err)
-			} else if len(matches) == 0 {
-				log.Printf("[GITHUB] no code matches found for query=%q", query)
-			} else {
-				log.Printf("[GITHUB] found %d code match(es)", len(matches))
-				// 3. Build code context string
-				codeCtx = github.BuildCodeContext(matches, s.GitHub, 3, 60)
+				log.Printf("[GITHUB] GetRepoTree repo=%s err=%v", repo, err)
+				continue
+			}
+			log.Printf("[GITHUB] repo=%s tree_files=%d", repo, len(fileTree))
+			if len(fileTree) == 0 {
+				continue
+			}
+
+			// Step 3: LLM selects which files to investigate
+			selectedFiles, err := s.LLM.SelectFilesForBug(draft.Summary, repo, fileTree, s.Cfg.OpenAIModel)
+			if err != nil || len(selectedFiles) == 0 {
+				log.Printf("[GITHUB] file selection failed for repo=%s err=%v", repo, err)
+				continue
+			}
+			log.Printf("[GITHUB] repo=%s selected_files=%v", repo, selectedFiles)
+
+			// Step 4: Read each selected file
+			for _, filePath := range selectedFiles {
+				content, err := s.GitHub.GetFileContent(repo, filePath, 120)
+				if err != nil {
+					log.Printf("[GITHUB] GetFileContent repo=%s path=%s err=%v", repo, filePath, err)
+					continue
+				}
+				fileURL := fmt.Sprintf("https://github.com/%s/blob/HEAD/%s", repo, filePath)
+				codeCtx.WriteString(fmt.Sprintf("### %s — `%s`\nURL: %s\n```\n%s\n```\n\n", repo, filePath, fileURL, content))
 			}
 		}
 	}
 
-	// 4. Always rewrite the description as a proper technical bug report.
-	//    When codeCtx is empty the LLM uses "A confirmar:" for code-specific
-	//    sections; when codeCtx has real snippets those sections become precise.
-	enriched, err := s.LLM.EnhanceBugWithCodeContext(draft, codeCtx, s.Cfg.OpenAIModel)
+	// Step 5: Always write the technical bug description.
+	// With code context → precise file locations, root cause and fix.
+	// Without code context → reasoned hypotheses with "A confirmar" markers.
+	enriched, err := s.LLM.EnhanceBugWithCodeContext(draft, codeCtx.String(), s.Cfg.OpenAIModel)
 	if err != nil {
 		log.Printf("[GITHUB] EnhanceBugWithCodeContext failed (keeping original): %v", err)
 		return draft
 	}
-	log.Printf("[GITHUB] enrichment done description_len=%d code_context_len=%d", len(enriched.Description), len(codeCtx))
+	log.Printf("[GITHUB] enrichment done description_len=%d code_context_len=%d", len(enriched.Description), codeCtx.Len())
 	return enriched
 }
 

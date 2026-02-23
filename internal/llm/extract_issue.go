@@ -9,6 +9,101 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/jira"
 )
 
+// SelectReposForBug asks the LLM to pick which repositories from the
+// configured list are most likely to contain the code related to the bug.
+// It receives the bug summary, the Jira project key (for context), and the
+// full repo list.  Returns up to 2 repos ordered by relevance.
+func (c *Client) SelectReposForBug(bugSummary, jiraProject string, repos []string, model string) ([]string, error) {
+	if len(repos) == 0 {
+		return nil, nil
+	}
+	prompt := fmt.Sprintf(`Você é um engenheiro de software.
+Dado um bug e um projeto Jira, selecione os 1-2 repositórios GitHub mais relevantes para investigar.
+
+Bug: %s
+Projeto Jira: %s
+
+Repositórios disponíveis:
+%s
+
+Responda com os nomes dos repositórios selecionados, um por linha, exatamente como estão na lista acima.
+Máximo 2 repositórios. Apenas os nomes, nada mais.`, bugSummary, jiraProject, strings.Join(repos, "\n"))
+
+	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}
+	out, err := c.Chat(msgs, model, 0.1, 120)
+	if err != nil {
+		return nil, err
+	}
+
+	var selected []string
+	repoSet := make(map[string]bool)
+	for _, r := range repos {
+		repoSet[r] = true
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if repoSet[line] {
+			selected = append(selected, line)
+		}
+		if len(selected) >= 2 {
+			break
+		}
+	}
+	return selected, nil
+}
+
+// SelectFilesForBug asks the LLM to identify which files from a repository
+// file tree are most likely to contain or be related to the described bug.
+// Returns up to 5 file paths from the tree.
+func (c *Client) SelectFilesForBug(bugSummary, repoName string, fileTree []string, model string) ([]string, error) {
+	if len(fileTree) == 0 {
+		return nil, nil
+	}
+
+	// Limit file tree to 300 entries for the prompt
+	treeForPrompt := fileTree
+	if len(treeForPrompt) > 300 {
+		treeForPrompt = treeForPrompt[:300]
+	}
+
+	prompt := fmt.Sprintf(`Você é um engenheiro de software sênior investigando um bug.
+
+Bug reportado: %s
+Repositório: %s
+
+Arquivos disponíveis no repositório:
+%s
+
+Com base no bug descrito, selecione os 3-5 arquivos mais relevantes para investigar.
+Pense: que módulo/serviço/controller provavelmente implementa a funcionalidade com defeito?
+
+Responda com os caminhos dos arquivos selecionados, um por linha, exatamente como estão na lista acima.
+Apenas os caminhos, nada mais.`, bugSummary, repoName, strings.Join(treeForPrompt, "\n"))
+
+	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}
+	out, err := c.Chat(msgs, model, 0.1, 300)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate returned paths against the real tree
+	fileSet := make(map[string]bool)
+	for _, f := range fileTree {
+		fileSet[f] = true
+	}
+	var selected []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if fileSet[line] {
+			selected = append(selected, line)
+		}
+		if len(selected) >= 5 {
+			break
+		}
+	}
+	return selected, nil
+}
+
 // GenerateGitHubSearchQuery uses the LLM to produce 3-4 focused technical
 // search terms for the GitHub Code Search API.  Instead of extracting words
 // from the user's description (which is often non-technical), the model
