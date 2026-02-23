@@ -232,7 +232,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		}
 		// Enrich bug cards with GitHub code context before saving/creating
 		if isBugType(d.IssueType) {
-			d = s.enrichBugWithGitHub(d)
+			d = s.enrichBugWithGitHub(d, threadHist)
 		}
 		needProject := strings.TrimSpace(d.Project) == ""
 		needType := strings.TrimSpace(d.IssueType) == ""
@@ -311,7 +311,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		}
 		// Enrich bug cards with GitHub code context before saving/creating
 		if isBugType(draft.IssueType) {
-			draft = s.enrichBugWithGitHub(draft)
+			draft = s.enrichBugWithGitHub(draft, threadHist)
 		}
 		needProject := strings.TrimSpace(draft.Project) == ""
 		needType := strings.TrimSpace(draft.IssueType) == ""
@@ -446,51 +446,48 @@ func isBugType(issueType string) bool {
 	return strings.Contains(strings.ToLower(issueType), "bug")
 }
 
-// enrichBugWithGitHub enriches a bug draft with code context from GitHub.
-// It generates a focused search query via LLM, searches GitHub code, builds
-// a code context string and then asks the LLM to enrich the description.
-// If any step fails, or GitHub is not configured, the original draft is
-// returned unchanged (graceful degradation).
-func (s *Service) enrichBugWithGitHub(draft jira.IssueDraft) jira.IssueDraft {
-	if s.GitHub == nil || !s.GitHub.Enabled() {
-		return draft
-	}
+// enrichBugWithGitHub rewrites a bug draft with technical depth.
+// It always produces a structured technical description — even when GitHub
+// finds no code — by asking the LLM to reason about what the bug likely
+// involves.  GitHub code context is used when available to make the
+// description even more specific (exact files, functions, fix proposal).
+// On hard failures the original draft is returned unchanged.
+func (s *Service) enrichBugWithGitHub(draft jira.IssueDraft, threadHistory string) jira.IssueDraft {
 	log.Printf("[GITHUB] enriching bug draft summary=%q", preview(draft.Summary, 80))
 
-	// 1. Generate focused search query
-	query, err := s.LLM.GenerateGitHubSearchQuery(draft.Summary, draft.Description, s.Cfg.OpenAIModel)
-	if err != nil || strings.TrimSpace(query) == "" {
-		log.Printf("[GITHUB] query generation failed (skipping enrichment): %v", err)
-		return draft
-	}
-	log.Printf("[GITHUB] search query=%q", query)
+	// 1. Generate focused search query based on the thread context
+	//    (reasons about code patterns, not just extracts user words)
+	var codeCtx string
+	if s.GitHub != nil && s.GitHub.Enabled() {
+		query, err := s.LLM.GenerateGitHubSearchQuery(draft.Summary, threadHistory, s.Cfg.OpenAIModel)
+		if err != nil || strings.TrimSpace(query) == "" {
+			log.Printf("[GITHUB] query generation failed: %v", err)
+		} else {
+			log.Printf("[GITHUB] search query=%q", query)
 
-	// 2. Search GitHub
-	matches, err := s.GitHub.SearchCode(query, 5)
-	if err != nil {
-		log.Printf("[GITHUB] SearchCode failed (skipping enrichment): %v", err)
-		return draft
-	}
-	if len(matches) == 0 {
-		log.Printf("[GITHUB] no code matches found for query=%q", query)
-		return draft
-	}
-	log.Printf("[GITHUB] found %d code match(es)", len(matches))
-
-	// 3. Build code context string
-	codeCtx := github.BuildCodeContext(matches, s.GitHub, 3, 60)
-	if strings.TrimSpace(codeCtx) == "" {
-		log.Printf("[GITHUB] empty code context after building (skipping enrichment)")
-		return draft
+			// 2. Search GitHub
+			matches, err := s.GitHub.SearchCode(query, 5)
+			if err != nil {
+				log.Printf("[GITHUB] SearchCode failed: %v", err)
+			} else if len(matches) == 0 {
+				log.Printf("[GITHUB] no code matches found for query=%q", query)
+			} else {
+				log.Printf("[GITHUB] found %d code match(es)", len(matches))
+				// 3. Build code context string
+				codeCtx = github.BuildCodeContext(matches, s.GitHub, 3, 60)
+			}
+		}
 	}
 
-	// 4. Enrich bug description
+	// 4. Always rewrite the description as a proper technical bug report.
+	//    When codeCtx is empty the LLM uses "A confirmar:" for code-specific
+	//    sections; when codeCtx has real snippets those sections become precise.
 	enriched, err := s.LLM.EnhanceBugWithCodeContext(draft, codeCtx, s.Cfg.OpenAIModel)
 	if err != nil {
-		log.Printf("[GITHUB] EnhanceBugWithCodeContext failed (skipping enrichment): %v", err)
+		log.Printf("[GITHUB] EnhanceBugWithCodeContext failed (keeping original): %v", err)
 		return draft
 	}
-	log.Printf("[GITHUB] enrichment done description_len=%d", len(enriched.Description))
+	log.Printf("[GITHUB] enrichment done description_len=%d code_context_len=%d", len(enriched.Description), len(codeCtx))
 	return enriched
 }
 

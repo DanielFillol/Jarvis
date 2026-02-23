@@ -9,24 +9,36 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/jira"
 )
 
-// GenerateGitHubSearchQuery uses the LLM to produce 2-3 focused technical
-// search terms suitable for the GitHub Code Search API.  The terms are
-// derived from the bug summary and description so they target function names,
-// class names, identifiers and error messages rather than generic words.
+// GenerateGitHubSearchQuery uses the LLM to produce 3-4 focused technical
+// search terms for the GitHub Code Search API.  Instead of extracting words
+// from the user's description (which is often non-technical), the model
+// reasons about what code patterns, function names and class names would
+// typically implement the broken functionality.
 // The returned string is a space-separated list of terms (no operators).
-func (c *Client) GenerateGitHubSearchQuery(summary, description, model string) (string, error) {
-	prompt := fmt.Sprintf(`Você é um engenheiro de software. Dado um bug report, gere 2-3 termos técnicos de busca para encontrar o código relevante no GitHub Code Search.
+func (c *Client) GenerateGitHubSearchQuery(summary, threadHistory, model string) (string, error) {
+	prompt := fmt.Sprintf(`Você é um engenheiro de software sênior analisando um bug reportado de forma simplória por um usuário.
 
-Regras:
-- Retorne APENAS os termos separados por espaço, sem pontuação extra, sem aspas, sem operadores.
-- Prefira nomes de funções, classes, identificadores, mensagens de erro exatas.
-- Evite palavras genéricas como "erro", "bug", "problema", "sistema".
-- Máximo 4 palavras no total.
+Sua tarefa é identificar 3-4 termos técnicos de código para buscar no GitHub Code Search e encontrar onde esse bug provavelmente está implementado.
 
-Bug summary: %s
-Bug description (início): %s
+Bug reportado:
+%s
 
-Responda com os termos apenas, ex: processPayment timeout RetryHandler`, summary, clip(description, 400))
+Contexto da thread:
+%s
+
+Raciocine sobre o comportamento com defeito:
+1. Que tipo de funcionalidade está quebrada? (busca, filtro, validação, formatação, criação, autenticação…)
+2. Que nomes de funções, classes ou serviços em inglês implementariam isso tipicamente?
+3. Há nomes técnicos mencionados na thread? (componentes, endpoints, campos de banco, serviços)
+
+Retorne APENAS os termos separados por espaço, sem pontuação, sem aspas.
+IGNORE: valores de dados (CPFs, nomes de clientes, datas, números), palavras genéricas em português.
+FOQUE: identificadores de código em inglês, nomes de funções/classes/serviços, comportamentos técnicos.
+
+Exemplos:
+- Bug "CPF não encontrado na busca de motorista" → searchDriver cpfValidation findByDocument
+- Bug "botão de pagamento não responde" → processPayment PaymentController handleSubmit
+- Bug "email de confirmação não chegou" → sendConfirmationEmail EmailService triggerNotification`, summary, clip(threadHistory, 600))
 
 	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}
 	out, err := c.Chat(msgs, model, 0.1, 80)
@@ -39,45 +51,77 @@ Responda com os termos apenas, ex: processPayment timeout RetryHandler`, summary
 	return out, nil
 }
 
-// EnhanceBugWithCodeContext takes an initial Jira bug draft and code context
-// fetched from GitHub and returns an enriched draft whose description includes
-// three additional sections: likely code location, root cause hypothesis and
-// suggested fix.  The original description content is always preserved.
+// EnhanceBugWithCodeContext rewrites the bug description as a proper technical
+// bug report.  It always produces structured output — even when codeContext is
+// empty — by reasoning about what the broken behaviour likely involves.
+// When codeContext contains real GitHub snippets the output becomes more
+// specific: exact files, functions and a concrete fix proposal.
 func (c *Client) EnhanceBugWithCodeContext(draft jira.IssueDraft, codeContext, model string) (jira.IssueDraft, error) {
 	draftJSON, _ := json.Marshal(draft)
 
-	prompt := fmt.Sprintf(`Você é um engenheiro de software sênior especializado em análise de bugs.
+	codeSection := "(nenhum trecho de código encontrado no GitHub)"
+	if strings.TrimSpace(codeContext) != "" {
+		codeSection = codeContext
+	}
 
-Recebeu um rascunho inicial de bug report e trechos de código relevantes encontrados no GitHub.
-Sua tarefa é enriquecer a descrição do bug com análise técnica baseada EXCLUSIVAMENTE no código fornecido.
+	prompt := fmt.Sprintf(`Você é um engenheiro de software sênior e tech lead especializado em análise e documentação de bugs.
+
+Recebeu um rascunho simples de bug report criado por um usuário não-técnico.
+Sua tarefa é reescrever a description como um bug report técnico de alta qualidade, útil para o time de engenharia investigar e corrigir.
 
 Rascunho atual (JSON):
 %s
 
-Trechos de código do GitHub:
+Trechos de código do GitHub relacionados ao bug:
 %s
 
-Retorne o rascunho completo em JSON NO MESMO FORMATO, com a description enriquecida.
-Adicione ao final da description (preservando TUDO que já está nela) estas seções em Markdown:
+Retorne o rascunho completo em JSON NO MESMO FORMATO, com a description completamente reescrita.
+A description deve conter exatamente estas seções em Markdown:
+
+## Contexto
+Descreva o comportamento com defeito de forma clara e objetiva, com terminologia técnica.
+
+## Evidências
+Liste sintomas, mensagens de erro, condições de reprodução. Se não há evidências concretas: "A confirmar: [o que precisa ser coletado]".
+
+## Ambiente / Onde ocorre
+Informe plataforma, versão, ambiente (prod/staging/local). Se desconhecido: "A confirmar".
+
+## Passos para reproduzir
+Liste os passos numerados. Se não foi descrito claramente: escreva os passos mais prováveis baseando-se no comportamento.
+
+## Resultado atual
+O que acontece de errado.
+
+## Resultado esperado
+O que deveria acontecer.
+
+## Impacto
+Descreva o impacto no usuário e no negócio.
 
 ## Localização provável no código
-- Liste os arquivos e funções/métodos que provavelmente contêm o bug, com os URLs do GitHub.
-- Se não for possível determinar com certeza, escreva "A confirmar com o time de engenharia".
+%s
 
 ## Hipótese de causa raiz
-- Descreva em 2-4 linhas o que provavelmente está causando o bug, com base no código visto.
-- Se o código não for suficiente, escreva "A confirmar: [o que precisa ser investigado]".
+%s
 
 ## Sugestão de correção
-- Proponha uma abordagem técnica objetiva para corrigir o bug.
-- Pode incluir pseudo-código, nomes de funções a modificar, ou abordagens arquiteturais.
-- Se incerto, escreva "A confirmar com o time de engenharia".
+%s
 
 Regras CRÍTICAS:
-- NÃO invente código nem comportamentos que não estão nos trechos fornecidos.
+- Reescreva a description completamente — o rascunho original era simplório e não serve para o time técnico.
+- Use linguagem técnica e objetiva. Nunca use frases vagas como "o sistema não funciona".
+- Para "Localização", "Hipótese" e "Sugestão": se tiver trechos de código, baseie-se EXCLUSIVAMENTE neles. Se não tiver, raciocine sobre o que tipicamente implementa esse tipo de funcionalidade e escreva sua hipótese, sempre prefixando com "Hipótese: ".
+- NÃO invente dados concretos (nomes de usuários, CPFs, IDs). Use "[valor informado]" como placeholder.
 - Preserve TODOS os outros campos do JSON exatamente como estão (project, issue_type, summary, priority, labels).
 - Retorne APENAS JSON válido, sem markdown fences.
-`, string(draftJSON), codeContext)
+`,
+		string(draftJSON),
+		codeSection,
+		codeLocationInstruction(codeContext),
+		causeHypothesisInstruction(codeContext),
+		fixSuggestionInstruction(codeContext),
+	)
 
 	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}
 	out, err := c.Chat(msgs, model, 0.2, 2500)
@@ -107,6 +151,33 @@ Regras CRÍTICAS:
 		enriched.Labels = draft.Labels
 	}
 	return enriched, nil
+}
+
+// codeLocationInstruction returns the instruction for the "Localização provável"
+// section depending on whether real code context is available.
+func codeLocationInstruction(codeContext string) string {
+	if strings.TrimSpace(codeContext) != "" {
+		return "Com base nos trechos de código acima, liste os arquivos e funções/métodos que provavelmente contêm o bug, incluindo os URLs do GitHub."
+	}
+	return "Hipótese: descreva os módulos, serviços ou camadas da aplicação que tipicamente implementam esse tipo de funcionalidade. Prefixe com \"Hipótese: \" e indique o que o time deve investigar primeiro."
+}
+
+// causeHypothesisInstruction returns the instruction for the "Hipótese de causa raiz"
+// section depending on whether real code context is available.
+func causeHypothesisInstruction(codeContext string) string {
+	if strings.TrimSpace(codeContext) != "" {
+		return "Com base no código visto, descreva em 2-4 linhas o que provavelmente está causando o bug."
+	}
+	return "Hipótese: com base no comportamento descrito, raciocine sobre as causas mais comuns desse tipo de bug (ex: comparação de string sem normalização, tratamento de caracteres especiais, filtro de query mal construído, cache desatualizado). Prefixe com \"Hipótese: \"."
+}
+
+// fixSuggestionInstruction returns the instruction for the "Sugestão de correção"
+// section depending on whether real code context is available.
+func fixSuggestionInstruction(codeContext string) string {
+	if strings.TrimSpace(codeContext) != "" {
+		return "Com base no código visto, proponha uma abordagem técnica concreta para corrigir o bug. Pode incluir pseudo-código ou nomes de funções a modificar."
+	}
+	return "Hipótese: sugira as verificações e correções mais prováveis para esse tipo de bug, sem inventar código específico. Indique o que o desenvolvedor deve checar primeiro. Prefixe com \"Hipótese: \"."
 }
 
 // ExtractIssueFromThread uses the LLM to parse a Slack thread and
