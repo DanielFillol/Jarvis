@@ -9,6 +9,106 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/jira"
 )
 
+// GenerateGitHubSearchQuery uses the LLM to produce 2-3 focused technical
+// search terms suitable for the GitHub Code Search API.  The terms are
+// derived from the bug summary and description so they target function names,
+// class names, identifiers and error messages rather than generic words.
+// The returned string is a space-separated list of terms (no operators).
+func (c *Client) GenerateGitHubSearchQuery(summary, description, model string) (string, error) {
+	prompt := fmt.Sprintf(`Você é um engenheiro de software. Dado um bug report, gere 2-3 termos técnicos de busca para encontrar o código relevante no GitHub Code Search.
+
+Regras:
+- Retorne APENAS os termos separados por espaço, sem pontuação extra, sem aspas, sem operadores.
+- Prefira nomes de funções, classes, identificadores, mensagens de erro exatas.
+- Evite palavras genéricas como "erro", "bug", "problema", "sistema".
+- Máximo 4 palavras no total.
+
+Bug summary: %s
+Bug description (início): %s
+
+Responda com os termos apenas, ex: processPayment timeout RetryHandler`, summary, clip(description, 400))
+
+	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}
+	out, err := c.Chat(msgs, model, 0.1, 80)
+	if err != nil {
+		return "", err
+	}
+	// Strip any accidental quotes/operators the model might add
+	out = strings.TrimSpace(out)
+	out = strings.Trim(out, `"'`+"`")
+	return out, nil
+}
+
+// EnhanceBugWithCodeContext takes an initial Jira bug draft and code context
+// fetched from GitHub and returns an enriched draft whose description includes
+// three additional sections: likely code location, root cause hypothesis and
+// suggested fix.  The original description content is always preserved.
+func (c *Client) EnhanceBugWithCodeContext(draft jira.IssueDraft, codeContext, model string) (jira.IssueDraft, error) {
+	draftJSON, _ := json.Marshal(draft)
+
+	prompt := fmt.Sprintf(`Você é um engenheiro de software sênior especializado em análise de bugs.
+
+Recebeu um rascunho inicial de bug report e trechos de código relevantes encontrados no GitHub.
+Sua tarefa é enriquecer a descrição do bug com análise técnica baseada EXCLUSIVAMENTE no código fornecido.
+
+Rascunho atual (JSON):
+%s
+
+Trechos de código do GitHub:
+%s
+
+Retorne o rascunho completo em JSON NO MESMO FORMATO, com a description enriquecida.
+Adicione ao final da description (preservando TUDO que já está nela) estas seções em Markdown:
+
+## Localização provável no código
+- Liste os arquivos e funções/métodos que provavelmente contêm o bug, com os URLs do GitHub.
+- Se não for possível determinar com certeza, escreva "A confirmar com o time de engenharia".
+
+## Hipótese de causa raiz
+- Descreva em 2-4 linhas o que provavelmente está causando o bug, com base no código visto.
+- Se o código não for suficiente, escreva "A confirmar: [o que precisa ser investigado]".
+
+## Sugestão de correção
+- Proponha uma abordagem técnica objetiva para corrigir o bug.
+- Pode incluir pseudo-código, nomes de funções a modificar, ou abordagens arquiteturais.
+- Se incerto, escreva "A confirmar com o time de engenharia".
+
+Regras CRÍTICAS:
+- NÃO invente código nem comportamentos que não estão nos trechos fornecidos.
+- Preserve TODOS os outros campos do JSON exatamente como estão (project, issue_type, summary, priority, labels).
+- Retorne APENAS JSON válido, sem markdown fences.
+`, string(draftJSON), codeContext)
+
+	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}
+	out, err := c.Chat(msgs, model, 0.2, 2500)
+	if err != nil {
+		return draft, err
+	}
+	out = strings.TrimSpace(stripCodeFences(out))
+
+	var enriched jira.IssueDraft
+	if err := json.Unmarshal([]byte(out), &enriched); err != nil {
+		return draft, fmt.Errorf("bad enriched bug json: %v raw=%q", err, preview(out, 300))
+	}
+	// Guarantee original critical fields are not lost
+	if strings.TrimSpace(enriched.Project) == "" {
+		enriched.Project = draft.Project
+	}
+	if strings.TrimSpace(enriched.IssueType) == "" {
+		enriched.IssueType = draft.IssueType
+	}
+	if strings.TrimSpace(enriched.Summary) == "" {
+		enriched.Summary = draft.Summary
+	}
+	if strings.TrimSpace(enriched.Priority) == "" && draft.Priority != "" {
+		enriched.Priority = draft.Priority
+	}
+	if len(enriched.Labels) == 0 && len(draft.Labels) > 0 {
+		enriched.Labels = draft.Labels
+	}
+	return enriched, nil
+}
+
 // ExtractIssueFromThread uses the LLM to parse a Slack thread and
 // produce a Jira issue draft.  The userInstruction is the free-form
 // command from the user (e.g. "crie um card no jira…").  The
