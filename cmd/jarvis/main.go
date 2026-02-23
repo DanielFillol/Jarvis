@@ -8,6 +8,7 @@ import (
 
 	"github.com/DanielFillol/Jarvis/internal/app"
 	"github.com/DanielFillol/Jarvis/internal/config"
+	"github.com/DanielFillol/Jarvis/internal/github"
 	httpinternal "github.com/DanielFillol/Jarvis/internal/http"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
@@ -26,6 +27,8 @@ func main() {
 	slackClient := slack.NewClient(cfg)
 	jiraClient := jira.NewClient(cfg)
 	llmClient := llm.NewClient(cfg)
+	githubClient := github.NewClient(cfg)
+	log.Printf("[BOOT] github_enabled=%t org=%q repos=%v", githubClient.Enabled(), cfg.GitHubOrg, cfg.GitHubRepos)
 	// Authenticate Slack bot to get bot user ID
 	if id, err := slackClient.AuthTest(); err != nil {
 		log.Printf("[SLACK] auth.test failed: %v", err)
@@ -36,7 +39,7 @@ func main() {
 	// Create a pending store with 2-hour TTL
 	store := state.NewStore(2 * time.Hour)
 	// Construct core service
-	service := app.NewService(cfg, slackClient, jiraClient, llmClient, store)
+	service := app.NewService(cfg, slackClient, jiraClient, llmClient, githubClient, store)
 	// Register HTTP handlers
 	mux := http.NewServeMux()
 	// Health check endpoint
