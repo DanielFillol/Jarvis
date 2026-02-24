@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/DanielFillol/Jarvis/internal/config"
+	"github.com/DanielFillol/Jarvis/internal/github"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
 	"github.com/DanielFillol/Jarvis/internal/parse"
@@ -22,21 +23,23 @@ import (
 // questions and handle issue creation flows.  The Service does not
 // depend on net/http and is therefore easily testable.
 type Service struct {
-	Slack *slack.Client
-	Jira  *jira.Client
-	LLM   *llm.Client
-	Store *state.Store
-	Cfg   config.Config
+	Slack  *slack.Client
+	Jira   *jira.Client
+	LLM    *llm.Client
+	GitHub *github.Client
+	Store  *state.Store
+	Cfg    config.Config
 }
 
 // NewService constructs a new Jarvis service from its dependencies.
-func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, store *state.Store) *Service {
+func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, githubClient *github.Client, store *state.Store) *Service {
 	return &Service{
-		Slack: slackClient,
-		Jira:  jiraClient,
-		LLM:   llmClient,
-		Store: store,
-		Cfg:   cfg,
+		Slack:  slackClient,
+		Jira:   jiraClient,
+		LLM:    llmClient,
+		GitHub: githubClient,
+		Store:  store,
+		Cfg:    cfg,
 	}
 }
 
@@ -227,6 +230,10 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		if strings.TrimSpace(d.Summary) == "" {
 			d.Summary = "Card criado via Jarvis"
 		}
+		// Enrich bug cards with GitHub code context before saving/creating
+		if isBugType(d.IssueType) {
+			d = s.enrichBugWithGitHub(d, threadHist)
+		}
 		needProject := strings.TrimSpace(d.Project) == ""
 		needType := strings.TrimSpace(d.IssueType) == ""
 		if needProject || needType {
@@ -301,6 +308,10 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		}
 		if strings.TrimSpace(parsedType) != "" {
 			draft.IssueType = parsedType
+		}
+		// Enrich bug cards with GitHub code context before saving/creating
+		if isBugType(draft.IssueType) {
+			draft = s.enrichBugWithGitHub(draft, threadHist)
 		}
 		needProject := strings.TrimSpace(draft.Project) == ""
 		needType := strings.TrimSpace(draft.IssueType) == ""
@@ -428,6 +439,90 @@ func (s *Service) appendSlackOrigin(d *jira.IssueDraft, channel, threadTs, origi
 		b.WriteString(fmt.Sprintf("\n- Comando: %q\n", clip(originalText, 400)))
 	}
 	d.Description = b.String()
+}
+
+// isBugType returns true when the issue type string indicates a bug.
+func isBugType(issueType string) bool {
+	return strings.Contains(strings.ToLower(issueType), "bug")
+}
+
+// enrichBugWithGitHub rewrites a bug draft as a proper technical bug report.
+//
+// When GitHub is configured it follows an exploratory approach:
+//  1. Select which repos (from the configured list) are relevant to the bug
+//  2. Fetch each repo's file tree and let the LLM pick the files to read
+//  3. Read those files to get real code context
+//  4. Ask the LLM to write the technical description using that context
+//
+// When GitHub is not configured (or any step fails) the LLM still produces a
+// structured technical description using hypotheses and "A confirmar" markers.
+// The original draft is returned only on a hard LLM failure.
+func (s *Service) enrichBugWithGitHub(draft jira.IssueDraft, threadHistory string) jira.IssueDraft {
+	log.Printf("[GITHUB] enriching bug draft summary=%q", preview(draft.Summary, 80))
+
+	var codeCtx strings.Builder
+
+	if s.GitHub != nil && s.GitHub.Enabled() {
+		allRepos := s.GitHub.NormalizedRepos()
+		log.Printf("[GITHUB] repos available=%d", len(allRepos))
+
+		// Step 1: LLM selects which repos are relevant for this bug
+		selectedRepos, err := s.LLM.SelectReposForBug(draft.Summary, draft.Project, allRepos, s.Cfg.OpenAIModel)
+		if err != nil || len(selectedRepos) == 0 {
+			log.Printf("[GITHUB] repo selection failed (%v); trying first 2 repos", err)
+			if len(allRepos) > 0 {
+				end := 2
+				if len(allRepos) < end {
+					end = len(allRepos)
+				}
+				selectedRepos = allRepos[:end]
+			}
+		}
+		log.Printf("[GITHUB] selected repos=%v", selectedRepos)
+
+		for _, repo := range selectedRepos {
+			// Step 2: Fetch the repository file tree
+			fileTree, err := s.GitHub.GetRepoTree(repo, 300)
+			if err != nil {
+				log.Printf("[GITHUB] GetRepoTree repo=%s err=%v", repo, err)
+				continue
+			}
+			log.Printf("[GITHUB] repo=%s tree_files=%d", repo, len(fileTree))
+			if len(fileTree) == 0 {
+				continue
+			}
+
+			// Step 3: LLM selects which files to investigate
+			selectedFiles, err := s.LLM.SelectFilesForBug(draft.Summary, repo, fileTree, s.Cfg.OpenAIModel)
+			if err != nil || len(selectedFiles) == 0 {
+				log.Printf("[GITHUB] file selection failed for repo=%s err=%v", repo, err)
+				continue
+			}
+			log.Printf("[GITHUB] repo=%s selected_files=%v", repo, selectedFiles)
+
+			// Step 4: Read each selected file
+			for _, filePath := range selectedFiles {
+				content, err := s.GitHub.GetFileContent(repo, filePath, 120)
+				if err != nil {
+					log.Printf("[GITHUB] GetFileContent repo=%s path=%s err=%v", repo, filePath, err)
+					continue
+				}
+				fileURL := fmt.Sprintf("https://github.com/%s/blob/HEAD/%s", repo, filePath)
+				codeCtx.WriteString(fmt.Sprintf("### %s — `%s`\nURL: %s\n```\n%s\n```\n\n", repo, filePath, fileURL, content))
+			}
+		}
+	}
+
+	// Step 5: Always write the technical bug description.
+	// With code context → precise file locations, root cause and fix.
+	// Without code context → reasoned hypotheses with "A confirmar" markers.
+	enriched, err := s.LLM.EnhanceBugWithCodeContext(draft, codeCtx.String(), s.Cfg.OpenAIModel)
+	if err != nil {
+		log.Printf("[GITHUB] EnhanceBugWithCodeContext failed (keeping original): %v", err)
+		return draft
+	}
+	log.Printf("[GITHUB] enrichment done description_len=%d code_context_len=%d", len(enriched.Description), codeCtx.Len())
+	return enriched
 }
 
 // fetchExampleIssues is a helper that fetches real Jira cards from the same project/type
