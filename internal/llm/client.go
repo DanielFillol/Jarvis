@@ -7,10 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
-	"time"
-
 	"strings"
+	"time"
 
 	"github.com/DanielFillol/Jarvis/internal/config"
 )
@@ -123,6 +123,42 @@ func (c *Client) Chat(messages []OpenAIMessage, model string, temperature float6
 		}
 	}
 	return content, nil
+}
+
+// ConfirmJiraCreateIntent calls the LLM to verify whether the message
+// genuinely intends to create a Jira card.  It tries the fallback model first
+// (cheaper/faster) and falls back to the primary model on failure.
+// Returns true only when the LLM explicitly confirms creation intent.
+// On any error, returns false to avoid creating unwanted cards.
+func (c *Client) ConfirmJiraCreateIntent(question, fallbackModel, primaryModel string) bool {
+	prompt := fmt.Sprintf(`Você é um classificador de intenção. O usuário enviou a mensagem abaixo.
+Ele quer criar um novo card/issue/ticket no Jira agora?
+
+Regras:
+- Responda APENAS "sim" ou "não".
+- "sim" somente se a mensagem pede explicitamente para abrir/criar um card, ticket, issue, história, bug ou épico no Jira.
+- "não" se: a mensagem menciona criar um relatório/reporte; contém "não é pra criar"; usa palavras como "criar" ou "épico" apenas como referência de contexto; pede para buscar, resumir ou analisar algo.
+
+Mensagem: %q`, question)
+
+	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
+
+	model := strings.TrimSpace(fallbackModel)
+	if model == "" {
+		model = primaryModel
+	}
+	out, err := c.Chat(messages, model, 0, 10)
+	if err != nil && model != primaryModel {
+		out, err = c.Chat(messages, primaryModel, 0, 10)
+	}
+	if err != nil {
+		log.Printf("[LLM] confirmJiraCreateIntent error: %v — defaulting false", err)
+		return false
+	}
+	answer := strings.ToLower(strings.TrimSpace(out))
+	confirmed := strings.HasPrefix(answer, "sim")
+	log.Printf("[LLM] confirmJiraCreateIntent=%t raw=%q", confirmed, preview(out, 40))
+	return confirmed
 }
 
 // preview is a helper to truncate long strings for error messages.

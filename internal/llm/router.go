@@ -73,6 +73,8 @@ Regras para jira_jql:
 - Use apenas campos padrão do Jira Cloud: project, issuetype, status, statusCategory, text, assignee, priority, labels, sprint, fixVersion, updated, created.
 - Para busca por texto: text ~ "termo"
 - Para bugs abertos: issuetype = Bug AND statusCategory != Done
+- Para busca por sprint: sprint = "Sprint N" (ex: sprint = "Sprint 7") ou sprint in openSprints() para sprints ativas
+- SEMPRE agrupe condições OR com parênteses quando combinadas com AND: project = X AND (text ~ "a" OR text ~ "b") — NUNCA escreva: project = X AND text ~ "a" OR text ~ "b"
 
 Regras para slack_query (IMPORTANTE):
 - Use apenas 2–4 palavras-chave do tema, sem filtros extras.
@@ -81,7 +83,7 @@ Regras para slack_query (IMPORTANTE):
 - Prefira termos sem aspas; use aspas apenas para frases exatas críticas.
 - Exemplo ruim: "deploy produção in:#deploys has:thread"
 - Exemplo bom: "deploy produção"
-- Se a pergunta menciona um usuário Slack (<@USERID>), inclua o identificador EXATO na query: ex. "<@U09FJSKP407>" — NUNCA converta para "menção USERID" ou similar.
+- Se a pergunta menciona um usuário Slack (<@USERID>), inclua o identificador EXATO na query: ex. "<@U09FJSKP407>" — NUNCA adicione palavras como "menção", "mencionado" junto com o identificador; use só o identificador.
 
 Thread (contexto recente):
 %s
@@ -124,17 +126,11 @@ func applyDeterministicOverrides(question string, d *RetrievalDecision) {
 		return
 	}
 
-	// 1. Jira creation intent → no external retrieval needed.
-	if parse.LooksLikeJiraCreateIntent(question) ||
-		strings.Contains(qLower, "crie um card") ||
-		strings.Contains(qLower, "criar um card") {
-		d.NeedSlack = false
-		d.SlackQuery = ""
-		d.NeedJira = false
-		d.JiraIntent = "default"
-		d.JiraJQL = ""
-		return
-	}
+	// Note: Jira creation intent suppression was removed from here.
+	// The LLM prompt already contains rule 6 ("criar card → need_slack=false,
+	// need_jira=false"). Using a heuristic override here caused context
+	// suppression on Q&A fallbacks when the create intent was rejected by
+	// ConfirmJiraCreateIntent in the create flow.
 
 	// 2. Very short questions (≤ 2 words) are likely answered by thread history alone.
 	if len(strings.Fields(qLower)) <= 2 {
@@ -230,6 +226,13 @@ func normalizeSlackQuery(q string) string {
 	// Convert "menção/mencao/mencionado USERID" (LLM hallucination) to <@USERID>
 	reMentionWord := regexp.MustCompile(`(?i)\b(?:menção|mencao|mencionado|mencionada|mentioned)\s+((U|W)[A-Z0-9]+)\b`)
 	q = reMentionWord.ReplaceAllString(q, "<@$1>")
+
+	// Strip leftover mention words when a <@USERID> is already present.
+	// e.g. "<@U09FJSKP407> menção" → "<@U09FJSKP407>"
+	if strings.Contains(q, "<@") {
+		reMentionLeftover := regexp.MustCompile(`(?i)\s*\b(?:menção|mencao|mencionado|mencionada|mentioned)\b\s*`)
+		q = strings.TrimSpace(reMentionLeftover.ReplaceAllString(q, " "))
+	}
 
 	q = strings.ReplaceAll(q, "to:@", "to:")
 

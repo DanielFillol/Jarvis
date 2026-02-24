@@ -200,7 +200,12 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		return true, s.createIssueAndReply(channel, threadTs, draft)
 	}
 	// 2) Natural language creation: "crie um card...", "crie essa história no JIRA", etc.
+	// The heuristic is a fast pre-filter; the LLM confirms to avoid false positives.
 	if strings.Contains(low, "crie um card") || strings.Contains(low, "criar um card") || parse.LooksLikeJiraCreateIntent(low) {
+		if !s.LLM.ConfirmJiraCreateIntent(q, s.Cfg.OpenAIFallbackModel, s.Cfg.OpenAIModel) {
+			log.Printf("[JARVIS] LLM rejected create intent — falling through to Q&A")
+			return false, nil
+		}
 		d := jira.IssueDraft{}
 		d.Project = parse.ParseProjectKeyFromText(q)
 		d.IssueType = parse.ParseIssueTypeFromText(q)
@@ -248,7 +253,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		return true, s.createIssueAndReply(channel, threadTs, d)
 	}
 	// 3) Thread-based creation: "com base nessa thread crie um card..."
-	if parse.IsThreadBasedCreate(q) {
+	if parse.IsThreadBasedCreate(q) && s.LLM.ConfirmJiraCreateIntent(q, s.Cfg.OpenAIFallbackModel, s.Cfg.OpenAIModel) {
 		// 3a) Multi-card variant: "crie dois cards", "um sobre X e outro Y"
 		if parse.IsMultiCardCreate(q) {
 			drafts, derr := s.LLM.ExtractMultipleIssuesFromThread(threadHist, q, s.Cfg.OpenAIModel, s.Cfg.JiraProjectNameMap)
@@ -631,11 +636,72 @@ func defaultJQLForIntent(intent, question string, projects []string) string {
 	}
 }
 
+// fixJQLPrecedence fixes operator precedence when AND and OR are mixed without
+// explicit parentheses. Converts:
+//
+//	project in (X) AND text ~ "a" OR text ~ "b" OR text ~ "c"
+//
+// into:
+//
+//	project in (X) AND (text ~ "a" OR text ~ "b" OR text ~ "c")
+//
+// It is a no-op when the JQL already contains proper grouping (AND (...)) or
+// when there is no mixing of AND and OR.
+func fixJQLPrecedence(jql string) string {
+	upper := strings.ToUpper(jql)
+	if !strings.Contains(upper, " AND ") || !strings.Contains(upper, " OR ") {
+		return jql
+	}
+	// Already grouped — nothing to fix.
+	if strings.Contains(upper, "AND (") || strings.Contains(upper, "AND(") {
+		return jql
+	}
+
+	// Preserve ORDER BY so it stays outside the parentheses.
+	orderBy := ""
+	if idx := strings.Index(upper, " ORDER BY "); idx >= 0 {
+		orderBy = " " + strings.TrimSpace(jql[idx:])
+		jql = strings.TrimSpace(jql[:idx])
+		upper = strings.ToUpper(jql)
+		if !strings.Contains(upper, " AND ") || !strings.Contains(upper, " OR ") {
+			return jql + orderBy
+		}
+	}
+
+	orParts := reSplitOR.Split(jql, -1)
+	if len(orParts) <= 1 {
+		return jql + orderBy
+	}
+
+	// Only apply when the first segment has a project filter AND other conditions.
+	firstUpper := strings.ToUpper(orParts[0])
+	if !strings.Contains(firstUpper, "PROJECT") || !strings.Contains(firstUpper, " AND ") {
+		return jql + orderBy
+	}
+
+	// Split off the last AND in the first segment to get prefix + first condition.
+	m := reLastAND.FindStringSubmatch(orParts[0])
+	if m == nil {
+		return jql + orderBy
+	}
+	prefix := strings.TrimSpace(m[1])
+	firstCond := strings.TrimSpace(m[2])
+
+	allConds := make([]string, 0, len(orParts))
+	allConds = append(allConds, firstCond)
+	for _, p := range orParts[1:] {
+		allConds = append(allConds, strings.TrimSpace(p))
+	}
+
+	return prefix + " AND (" + strings.Join(allConds, " OR ") + ")" + orderBy
+}
+
 func sanitizeJQL(jql string) string {
 	j := strings.TrimSpace(jql)
 	if j == "" {
 		return j
 	}
+	j = fixJQLPrecedence(j)
 	j = strings.Join(strings.Fields(j), " ")
 	j = strings.ReplaceAll(j, "description ~", "text ~")
 	j = strings.ReplaceAll(j, "Description ~", "text ~")
@@ -756,6 +822,8 @@ func clip(s string, n int) string {
 
 var reHTML = regexp.MustCompile(`<[^>]+>`)
 var reSpaces = regexp.MustCompile(`\s+`)
+var reSplitOR = regexp.MustCompile(`(?i)\s+OR\s+`)
+var reLastAND = regexp.MustCompile(`(?i)^(.*)\s+AND\s+(.+)$`)
 
 func stripHTML(s string) string {
 	s = strings.ReplaceAll(s, "<br>", "\n")
