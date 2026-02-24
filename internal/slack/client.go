@@ -851,6 +851,26 @@ func (c *Client) rewriteFromToUserIDs(q string) string {
 		}
 	}
 
+	// Also resolve bare <@USERID> and <@USERID|name> mentions to @username
+	reBare := regexp.MustCompile(`<@((U|W)[A-Z0-9]+)(?:\|[^>]+)?>`)
+	bareMentions := reBare.FindAllStringSubmatch(out, -1)
+	for _, m := range bareMentions {
+		if len(m) < 2 {
+			continue
+		}
+		userID := m[1]
+		full := m[0]
+		if _, already := idToName[userID]; !already {
+			name, err := c.GetUsernameByID(userID)
+			if err == nil && name != "" {
+				idToName[userID] = name
+			}
+		}
+		if name := idToName[userID]; name != "" {
+			out = strings.ReplaceAll(out, full, "@"+name)
+		}
+	}
+
 	// clean up double spaces and trim
 	out = strings.Join(strings.Fields(out), " ")
 	return strings.TrimSpace(out)

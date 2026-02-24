@@ -132,10 +132,10 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[BOT] handling question=%q channel=%q thread=%q originTs=%q", preview(question, 220), msg.Channel, threadTs, originTs)
+	log.Printf("[BOT] handling question=%q channel=%q thread=%q originTs=%q user=%q", preview(question, 220), msg.Channel, threadTs, originTs, msg.User)
 
 	go func() {
-		if err := h.Service.HandleMessage(msg.Channel, threadTs, originTs, text, question); err != nil {
+		if err := h.Service.HandleMessage(msg.Channel, threadTs, originTs, text, question, msg.User); err != nil {
 			log.Printf("[ERR] handleQuestion: %v", err)
 			_ = h.Slack.PostMessage(msg.Channel, threadTs, "Não consegui gerar a resposta (erro interno).")
 		}

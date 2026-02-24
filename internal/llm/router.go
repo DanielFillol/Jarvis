@@ -29,15 +29,19 @@ type RetrievalDecision struct {
 // configured Jira project keys.  The returned JSON is unmarshalled
 // into a RetrievalDecision.  If the JSON is invalid or the API call
 // fails, a non-nil error is returned.
-func (c *Client) DecideRetrieval(question, threadHistory, model string, projectKeys []string) (RetrievalDecision, error) {
+func (c *Client) DecideRetrieval(question, threadHistory, model string, projectKeys []string, senderUserID string) (RetrievalDecision, error) {
 	projectsCtx := ""
 	if len(projectKeys) > 0 {
 		projectsCtx = fmt.Sprintf("\nProjetos Jira configurados: %s\n", strings.Join(projectKeys, ", "))
 	}
+	senderCtx := ""
+	if strings.TrimSpace(senderUserID) != "" {
+		senderCtx = fmt.Sprintf("\nUsuário que está perguntando: <@%s> — quando a pergunta usar \"eu\", \"meu\", \"minha\", \"minhas\", \"me\" refira-se a este usuário.\n", senderUserID)
+	}
 
 	prompt := fmt.Sprintf(`Você é um roteador de contexto de um assistente Slack+Jira.
 Decida quais fontes buscar para responder a pergunta.
-%s
+%s%s
 Retorne APENAS JSON válido:
 {
   "need_slack": true/false,
@@ -77,13 +81,14 @@ Regras para slack_query (IMPORTANTE):
 - Prefira termos sem aspas; use aspas apenas para frases exatas críticas.
 - Exemplo ruim: "deploy produção in:#deploys has:thread"
 - Exemplo bom: "deploy produção"
+- Se a pergunta menciona um usuário Slack (<@USERID>), inclua o identificador EXATO na query: ex. "<@U09FJSKP407>" — NUNCA converta para "menção USERID" ou similar.
 
 Thread (contexto recente):
 %s
 
 Pergunta:
 %s
-`, projectsCtx, clip(threadHistory, 1200), question)
+`, projectsCtx, senderCtx, clip(threadHistory, 1200), question)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
 	out, err := c.Chat(messages, model, 0.2, 600)
@@ -214,13 +219,17 @@ func topicQuery(question string) string {
 }
 
 // normalizeSlackQuery fixes common formatting mistakes for Slack search.
-// (3) Example fix: from:@U02EC... -> from:U02EC...
-// Also normalizes from:<@U...> -> from:U...
+// It converts LLM-generated "menção USERID" patterns to <@USERID> and
+// normalizes from:/to: user ID filters.
 func normalizeSlackQuery(q string) string {
 	q = strings.TrimSpace(q)
 	if q == "" {
 		return q
 	}
+
+	// Convert "menção/mencao/mencionado USERID" (LLM hallucination) to <@USERID>
+	reMentionWord := regexp.MustCompile(`(?i)\b(?:menção|mencao|mencionado|mencionada|mentioned)\s+((U|W)[A-Z0-9]+)\b`)
+	q = reMentionWord.ReplaceAllString(q, "<@$1>")
 
 	q = strings.ReplaceAll(q, "to:@", "to:")
 

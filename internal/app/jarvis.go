@@ -44,9 +44,9 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 // delegates to the appropriate flows: Jira creation, issue lookup,
 // context retrieval and answer generation.  On error, a fallback
 // answer is posted to Slack to provide user feedback.
-func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, question string) error {
+func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, question, senderUserID string) error {
 	start := time.Now()
-	log.Printf("[JARVIS] start question=%q originTs=%q", preview(question, 180), originTs)
+	log.Printf("[JARVIS] start question=%q originTs=%q senderUserID=%q", preview(question, 180), originTs, senderUserID)
 	// 1) Decide which thread to use as context (current vs permalink)
 	contextChannel := channel
 	contextThreadTs := threadTs
@@ -88,7 +88,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	}
 	// 5) Decide Slack/Jira search (LLM)
 	questionForLLM := parse.StripSlackPermalinks(question)
-	decision, err := s.LLM.DecideRetrieval(questionForLLM, threadHist, s.Cfg.OpenAIModel, s.Cfg.JiraProjectKeys)
+	decision, err := s.LLM.DecideRetrieval(questionForLLM, threadHist, s.Cfg.OpenAIModel, s.Cfg.JiraProjectKeys, senderUserID)
 	if err != nil {
 		log.Printf("[WARN] decideRetrieval failed: %v", err)
 		if hasThreadPermalink {
