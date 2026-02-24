@@ -1,1 +1,4 @@
 .idea/
+.env
+go.mod
+go.sum
