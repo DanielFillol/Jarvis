@@ -93,6 +93,30 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[SLACK] ignoring non-message event")
 		return
 	}
+
+	// When a user deletes their message, delete the bot's reply too.
+	// Slack sends message_deleted (channels) or message_changed+tombstone (DMs).
+	deletedTs := ""
+	switch {
+	case msg.Subtype == "message_deleted" && msg.DeletedTs != "":
+		deletedTs = msg.DeletedTs
+	case msg.Subtype == "message_changed" && msg.Message != nil &&
+		(msg.Message.Subtype == "tombstone" || (msg.Message.Hidden && msg.Message.Text == "")):
+		deletedTs = msg.Message.Ts
+	}
+	if deletedTs != "" {
+		if botTs := h.Service.Tracker.Get(msg.Channel, deletedTs); botTs != "" {
+			log.Printf("[SLACK] user deleted origin=%q — deleting bot reply ts=%q", deletedTs, botTs)
+			go func() {
+				if err := h.Slack.DeleteMessage(msg.Channel, botTs); err != nil {
+					log.Printf("[WARN] delete bot reply failed: %v", err)
+				}
+				h.Service.Tracker.Delete(msg.Channel, deletedTs)
+			}()
+		}
+		return
+	}
+
 	if msg.Subtype != "" || msg.BotID != "" {
 		log.Printf("[SLACK] ignoring bot/subtype message subtype=%q bot_id_present=%t", msg.Subtype, msg.BotID != "")
 		return

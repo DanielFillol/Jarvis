@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/DanielFillol/Jarvis/internal/parse"
 )
@@ -39,9 +40,21 @@ func (c *Client) DecideRetrieval(question, threadHistory, model string, projectK
 		senderCtx = fmt.Sprintf("\nUsuário que está perguntando: <@%s> — quando a pergunta usar \"eu\", \"meu\", \"minha\", \"minhas\", \"me\" refira-se a este usuário.\n", senderUserID)
 	}
 
+	now := time.Now()
+	// Monday of current week (ISO: Monday = first day)
+	weekday := int(now.Weekday())
+	if weekday == 0 {
+		weekday = 7
+	}
+	monday := now.AddDate(0, 0, -(weekday - 1))
+	dateCtx := fmt.Sprintf("\nData atual: %s (segunda-feira desta semana: %s)\n",
+		now.Format("2006-01-02"),
+		monday.Format("2006-01-02"),
+	)
+
 	prompt := fmt.Sprintf(`Você é um roteador de contexto de um assistente Slack+Jira.
 Decida quais fontes buscar para responder a pergunta.
-%s%s
+%s%s%s
 Retorne APENAS JSON válido:
 {
   "need_slack": true/false,
@@ -77,23 +90,35 @@ Regras para jira_jql:
 - SEMPRE agrupe condições OR com parênteses quando combinadas com AND: project = X AND (text ~ "a" OR text ~ "b") — NUNCA escreva: project = X AND text ~ "a" OR text ~ "b"
 
 Regras para slack_query (IMPORTANTE):
+- slack_query NUNCA pode ficar vazio quando need_slack=true — sempre gere uma query útil.
+- Se a pergunta mencionar canais (ex: #prod-coletas, #prod-musa-hub), inclua in:#nome-do-canal na query.
 - Use apenas 2–4 palavras-chave do tema, sem filtros extras.
 - NÃO use has:thread, has:link, has:reaction — reduzem o recall drasticamente.
-- Só use in:#canal se o usuário mencionar explicitamente um canal.
 - Prefira termos sem aspas; use aspas apenas para frases exatas críticas.
-- Exemplo ruim: "deploy produção in:#deploys has:thread"
-- Exemplo bom: "deploy produção"
-- Se a pergunta menciona um usuário Slack (<@USERID>), inclua o identificador EXATO na query: ex. "<@U09FJSKP407>" — NUNCA adicione palavras como "menção", "mencionado" junto com o identificador; use só o identificador.
+- Quando a pergunta é "o que X falou/disse/escreveu/postou", use from:@username (NÃO apenas a menção @username). Ex: "o que o @fillol falou" → from:@fillol
+- Se a pergunta menciona um usuário Slack (<@USERID>) em contexto de busca geral (não "o que falou"), inclua o identificador EXATO: ex. "<@U09FJSKP407>"
+
+Regras para datas na slack_query:
+- NÃO inclua expressões como "essa semana" ou "esta semana" como termos de busca — a API do Slack não as interpreta.
+- Converta expressões de tempo em filtros de data:
+  - "essa semana" / "esta semana" → after:SEGUNDA-DESTA-SEMANA (use a data de segunda calculada acima)
+  - "essa semana" como período exato → after:SEGUNDA-DESTA-SEMANA
+  - "entre dia X e Y de mês" → after:ANO-MÊS-X before:ANO-MÊS-Y
+  - "ontem" → after:DATA-ONTEM before:DATA-HOJE
+  - "mês passado" → after:ANO-MÊS-01 before:ANO-MÊS-01 do mês atual
+- Exemplo: "o que foi dito essa semana" → slack_query: "termo-relevante after:2026-02-17"
 
 Thread (contexto recente):
 %s
 
 Pergunta:
 %s
-`, projectsCtx, senderCtx, clip(threadHistory, 1200), question)
+`, projectsCtx, senderCtx, dateCtx, clip(threadHistory, 1200), question)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
-	out, err := c.Chat(messages, model, 0.2, 600)
+	// Use 4000 tokens: reasoning models (e.g. gpt-5-mini) consume invisible thinking
+	// tokens before producing output; 600 was insufficient and caused empty responses.
+	out, err := c.Chat(messages, model, 0.2, 4000)
 	if err != nil {
 		return RetrievalDecision{}, err
 	}
@@ -241,6 +266,18 @@ func normalizeSlackQuery(q string) string {
 
 	reTo := regexp.MustCompile(`\bto:\s*(?:<@)?@?(U[A-Z0-9]+)(?:\|[^>]+)?>?`)
 	q = reTo.ReplaceAllString(q, "to:$1")
+
+	// Strip unresolved channel ID filters: in:#C09H8S8A0VD
+	// These are raw Slack channel IDs (start with C/G, all uppercase alphanumeric, 9+ chars)
+	// that were never resolved to a human-readable name.  Slack search ignores them,
+	// producing 0 results; better to search without the in: filter.
+	reRawChannelFilter := regexp.MustCompile(`\bin:#[CG][A-Z0-9]{8,}\b`)
+	q = strings.TrimSpace(reRawChannelFilter.ReplaceAllString(q, ""))
+	// Also strip leftover <#CHANID> tokens the LLM might have included verbatim.
+	reRawChannelMention := regexp.MustCompile(`<#[CG][A-Z0-9]{8,}(?:\|[^>]*)?>`)
+	q = strings.TrimSpace(reRawChannelMention.ReplaceAllString(q, ""))
+	// Collapse multiple spaces left by removals.
+	q = strings.Join(strings.Fields(q), " ")
 
 	return strings.TrimSpace(q)
 }

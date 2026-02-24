@@ -89,7 +89,7 @@ func (c *Client) FetchAll(jql string, maxTotal int) ([]JiraSearchJQLRespIssue, e
 	startAt := 0
 	pageSize := 50
 	for {
-		resp, err := c.SearchJQL(jql, startAt, pageSize, []string{"summary", "status", "issuetype", "updated", "project", "priority", "assignee"})
+		resp, err := c.SearchJQL(jql, startAt, pageSize, []string{"summary", "status", "issuetype", "updated", "project", "priority", "assignee", "customfield_10020"})
 		if err != nil {
 			if startAt > 0 {
 				// If a further page fails, return what we've accumulated so far
@@ -102,6 +102,15 @@ func (c *Client) FetchAll(jql string, maxTotal int) ([]JiraSearchJQLRespIssue, e
 			if it.Fields.Assignee != nil && it.Fields.Assignee.DisplayName != "" {
 				assignee = it.Fields.Assignee.DisplayName
 			}
+			// Pick the active sprint if available, otherwise the last one.
+			sprint := ""
+			for _, sp := range it.Fields.Sprint {
+				if sp.State == "active" {
+					sprint = sp.Name
+					break
+				}
+				sprint = sp.Name // keep overwriting; last entry is most recent
+			}
 			all = append(all, JiraSearchJQLRespIssue{
 				Key:      it.Key,
 				Project:  it.Fields.Project.Key,
@@ -111,6 +120,7 @@ func (c *Client) FetchAll(jql string, maxTotal int) ([]JiraSearchJQLRespIssue, e
 				Assignee: assignee,
 				Summary:  it.Fields.Summary,
 				Updated:  it.Fields.Updated,
+				Sprint:   sprint,
 			})
 			if len(all) >= maxTotal {
 				return all, nil

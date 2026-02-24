@@ -16,14 +16,25 @@ type SlackEventEnvelope struct {
 // SlackMessageEvent represents a Slack message event.  It omits fields
 // that are not currently used by this application.
 type SlackMessageEvent struct {
-	Type     string `json:"type"`
-	Subtype  string `json:"subtype,omitempty"`
-	Text     string `json:"text"`
-	User     string `json:"user,omitempty"`
-	BotID    string `json:"bot_id,omitempty"`
-	Channel  string `json:"channel"`
-	Ts       string `json:"ts"`
-	ThreadTs string `json:"thread_ts,omitempty"`
+	Type      string `json:"type"`
+	Subtype   string `json:"subtype,omitempty"`
+	Text      string `json:"text"`
+	User      string `json:"user,omitempty"`
+	BotID     string `json:"bot_id,omitempty"`
+	Channel   string `json:"channel"`
+	Ts        string `json:"ts"`
+	ThreadTs  string `json:"thread_ts,omitempty"`
+	DeletedTs string `json:"deleted_ts,omitempty"`
+	// Message is populated for message_changed events (e.g. edits and tombstone deletions in DMs).
+	Message *SlackInnerMessage `json:"message,omitempty"`
+}
+
+// SlackInnerMessage is the nested "message" object inside message_changed events.
+type SlackInnerMessage struct {
+	Ts      string `json:"ts"`
+	Subtype string `json:"subtype,omitempty"`
+	Text    string `json:"text"`
+	Hidden  bool   `json:"hidden,omitempty"`
 }
 
 // SlackPostMessageRequest encapsulates the body of a chat.postMessage call.

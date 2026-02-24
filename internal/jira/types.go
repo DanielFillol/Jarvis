@@ -34,6 +34,12 @@ type JiraSearchJQLResp struct {
 			Project struct {
 				Key string `json:"key"`
 			} `json:"project"`
+			// customfield_10020 is the standard Jira Cloud sprint field.
+			// It is an array; the last active (or most recent) entry is used.
+			Sprint []struct {
+				Name  string `json:"name"`
+				State string `json:"state"`
+			} `json:"customfield_10020"`
 		} `json:"fields"`
 	} `json:"issues"`
 }
@@ -49,6 +55,7 @@ type JiraSearchJQLRespIssue struct {
 	Assignee string
 	Summary  string
 	Updated  string
+	Sprint   string
 }
 
 // JiraIssueResp models the response from Jira's GET issue endpoint.  It

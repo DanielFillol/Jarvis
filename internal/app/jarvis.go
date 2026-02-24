@@ -22,21 +22,23 @@ import (
 // questions and handle issue creation flows.  The Service does not
 // depend on net/http and is therefore easily testable.
 type Service struct {
-	Slack *slack.Client
-	Jira  *jira.Client
-	LLM   *llm.Client
-	Store *state.Store
-	Cfg   config.Config
+	Slack   *slack.Client
+	Jira    *jira.Client
+	LLM     *llm.Client
+	Store   *state.Store
+	Tracker *state.MessageTracker
+	Cfg     config.Config
 }
 
 // NewService constructs a new Jarvis service from its dependencies.
 func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, store *state.Store) *Service {
 	return &Service{
-		Slack: slackClient,
-		Jira:  jiraClient,
-		LLM:   llmClient,
-		Store: store,
-		Cfg:   cfg,
+		Slack:   slackClient,
+		Jira:    jiraClient,
+		LLM:     llmClient,
+		Store:   store,
+		Tracker: state.NewMessageTracker(),
+		Cfg:     cfg,
 	}
 }
 
@@ -74,7 +76,27 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		log.Printf("[JARVIS] jiraCreateFlow handled dur=%s", time.Since(start))
 		return err
 	}
-	// 4) Deterministic: issue key in text
+	// 4) Post an immediate "searching…" indicator so the user knows Jarvis is working.
+	//    We'll update it in-place once the answer is ready.
+	busyTs, busyErr := s.Slack.PostMessageAndGetTS(channel, threadTs, "_buscando..._")
+	if busyErr != nil {
+		log.Printf("[WARN] could not post busy indicator: %v", busyErr)
+	}
+
+	// Helper to deliver the final answer: update the placeholder when possible,
+	// fall back to a new message if the update fails or no placeholder was posted.
+	replyFn := func(text string) error {
+		if busyTs != "" {
+			if err := s.Slack.UpdateMessage(channel, busyTs, text); err != nil {
+				log.Printf("[WARN] UpdateMessage failed, falling back to PostMessage: %v", err)
+				return s.Slack.PostMessage(channel, threadTs, text)
+			}
+			return nil
+		}
+		return s.Slack.PostMessage(channel, threadTs, text)
+	}
+
+	// 5) Deterministic: issue key in text
 	var jiraIssueCtx string
 	issueKey := parse.ExtractIssueKey(question)
 	if issueKey != "" {
@@ -86,8 +108,9 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			log.Printf("[JARVIS] jiraIssueContext key=%s chars=%d", issueKey, len(jiraIssueCtx))
 		}
 	}
-	// 5) Decide Slack/Jira search (LLM)
-	questionForLLM := parse.StripSlackPermalinks(question)
+	// 6) Decide Slack/Jira search (LLM)
+	// Resolve <#CHANID> → #channel-name so the router generates correct in:#channel filters.
+	questionForLLM := s.Slack.ResolveChannelMentions(parse.StripSlackPermalinks(question))
 	decision, err := s.LLM.DecideRetrieval(questionForLLM, threadHist, s.Cfg.OpenAIModel, s.Cfg.JiraProjectKeys, senderUserID)
 	if err != nil {
 		log.Printf("[WARN] decideRetrieval failed: %v", err)
@@ -108,21 +131,23 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		decision.JiraJQL = ""
 	}
 	log.Printf("[JARVIS] needSlack=%t slackQuery=%q needJira=%t jiraIntent=%q jiraJQL=%q issueKey=%q", decision.NeedSlack, preview(decision.SlackQuery, 120), decision.NeedJira, decision.JiraIntent, preview(decision.JiraJQL, 120), issueKey)
-	// 5) Slack context
+	// 7) Slack context
 	var slackCtx string
 	var slackMatches int
 	if decision.NeedSlack && strings.TrimSpace(decision.SlackQuery) != "" && s.Cfg.SlackUserToken != "" {
+		// Resolve from:USERID → from:@username so Slack search filters correctly.
+		decision.SlackQuery = s.Slack.ResolveUserIDsInQuery(decision.SlackQuery)
 		log.Printf("[JARVIS] slackSearch query=%q", decision.SlackQuery)
 		matches, err := s.Slack.SearchMessagesAll(decision.SlackQuery)
 		if err != nil {
 			log.Printf("[WARN] slack search failed: %v", err)
 		} else {
 			slackMatches = len(matches)
-			slackCtx = buildSlackContext(matches, 12)
+			slackCtx = buildSlackContext(matches, 25)
 			log.Printf("[JARVIS] slackContext matches=%d chars=%d", slackMatches, len(slackCtx))
 		}
 	}
-	// 6) Jira context via JQL
+	// 8) Jira context via JQL
 	var jiraCtx string
 	var jiraIssuesFound int
 	if decision.NeedJira {
@@ -145,7 +170,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	if finalJiraCtx == "" {
 		finalJiraCtx = jiraCtx
 	}
-	// 7) Answer with LLM (with retry for transient errors)
+	// 9) Answer with LLM (with retry for transient errors)
 	answer, err := s.LLM.AnswerWithRetry(questionForLLM, threadHist, slackCtx, finalJiraCtx, s.Cfg.OpenAIModel, s.Cfg.OpenAIFallbackModel, 2, 0)
 	if err != nil || strings.TrimSpace(answer) == "" {
 		log.Printf("[ERR] llmAnswer failed: %v", err)
@@ -155,9 +180,13 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	if answer == "" {
 		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, (jiraIssueCtx != "" || decision.NeedJira), jiraIssuesFound, issueKey)
 	}
-	if err := s.Slack.PostMessage(channel, threadTs, answer); err != nil {
+	if err := replyFn(answer); err != nil {
 		log.Printf("[ERR] postSlackMessage failed: %v", err)
 		return err
+	}
+	// Track origin → bot reply so we can delete the reply if the user deletes their message.
+	if busyTs != "" {
+		s.Tracker.Track(channel, originTs, busyTs)
 	}
 	log.Printf("[JARVIS] done dur=%s answer_len=%d", time.Since(start), len(answer))
 	return nil
@@ -548,7 +577,11 @@ func buildJiraContext(issues []jira.JiraSearchJQLRespIssue, limit int) string {
 func buildJiraContextSimple(issues []jira.JiraSearchJQLRespIssue) string {
 	var b strings.Builder
 	for i, it := range issues {
-		b.WriteString(fmt.Sprintf("%s [%s] (%s) %s — %s | assignee=%s | updated=%s\n", it.Key, it.Status, it.Type, it.Priority, it.Summary, it.Assignee, it.Updated))
+		sprint := ""
+		if it.Sprint != "" {
+			sprint = " | sprint=" + it.Sprint
+		}
+		b.WriteString(fmt.Sprintf("%s [%s] (%s) %s — %s | assignee=%s | updated=%s%s\n", it.Key, it.Status, it.Type, it.Priority, it.Summary, it.Assignee, it.Updated, sprint))
 		if i >= 39 {
 			remaining := len(issues) - 40
 			if remaining > 0 {

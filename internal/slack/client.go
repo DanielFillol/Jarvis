@@ -603,6 +603,107 @@ func (c *Client) GetPermalink(channel, messageTs string) (string, error) {
 	return out.Permalink, nil
 }
 
+// PostMessageAndGetTS posts a message to Slack and returns the timestamp
+// of the posted message.  It is used to obtain a handle for later updates.
+func (c *Client) PostMessageAndGetTS(channel, threadTs, text string) (string, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", errors.New("no_text")
+	}
+	if c.BotToken == "" {
+		return "", errors.New("missing Slack bot token")
+	}
+	payload := SlackPostMessageRequest{
+		Channel:  channel,
+		Text:     text,
+		ThreadTs: threadTs,
+	}
+	b, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", c.apiBase()+"/chat.postMessage", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer "+c.BotToken)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := c.do(req, 15*time.Second)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	var slackResp struct {
+		OK      bool   `json:"ok"`
+		Error   string `json:"error,omitempty"`
+		Ts      string `json:"ts"`
+		Channel string `json:"channel"`
+	}
+	_ = json.Unmarshal(rb, &slackResp)
+	if !slackResp.OK {
+		return "", fmt.Errorf("slack api error: %s", slackResp.Error)
+	}
+	return slackResp.Ts, nil
+}
+
+// UpdateMessage updates an existing Slack message in-place.  It is used
+// to replace a "buscando..." placeholder with the actual answer.
+func (c *Client) UpdateMessage(channel, ts, text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" || ts == "" {
+		return errors.New("missing text or ts")
+	}
+	if c.BotToken == "" {
+		return errors.New("missing Slack bot token")
+	}
+	payload := map[string]string{
+		"channel": channel,
+		"ts":      ts,
+		"text":    text,
+	}
+	b, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", c.apiBase()+"/chat.update", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer "+c.BotToken)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := c.do(req, 15*time.Second)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	var slackResp struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error,omitempty"`
+	}
+	_ = json.Unmarshal(rb, &slackResp)
+	if !slackResp.OK {
+		return fmt.Errorf("slack update error: %s", slackResp.Error)
+	}
+	return nil
+}
+
+// DeleteMessage deletes a message the bot posted via chat.delete.
+func (c *Client) DeleteMessage(channel, ts string) error {
+	if c.BotToken == "" {
+		return errors.New("missing Slack bot token")
+	}
+	payload := map[string]string{"channel": channel, "ts": ts}
+	b, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", c.apiBase()+"/chat.delete", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer "+c.BotToken)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := c.do(req, 10*time.Second)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	var slackResp struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error,omitempty"`
+	}
+	_ = json.Unmarshal(rb, &slackResp)
+	if !slackResp.OK {
+		return fmt.Errorf("slack delete error: %s", slackResp.Error)
+	}
+	return nil
+}
+
 // VerifySignature verifies the Slack signing signature on the incoming
 // request.  It returns an error if the signature is invalid or the
 // timestamp is stale.  The raw body bytes must be the exact bytes used
@@ -743,6 +844,91 @@ func normalizeSlackMarkup(s string) string {
 // We alias it here to make the dependency explicit.
 var _ = sort.Strings
 
+// GetChannelName resolves a Slack channel ID to its display name via
+// conversations.info.  Returns an empty string on failure so callers
+// can fall back gracefully.
+func (c *Client) GetChannelName(channelID string) string {
+	channelID = strings.TrimSpace(channelID)
+	if channelID == "" {
+		return ""
+	}
+	// Prefer user token: broader channel access (bot may not be a member).
+	// Fall back to bot token if user token is unavailable.
+	tokens := []string{}
+	if c.UserToken != "" {
+		tokens = append(tokens, c.UserToken)
+	}
+	if c.BotToken != "" {
+		tokens = append(tokens, c.BotToken)
+	}
+	if len(tokens) == 0 {
+		return ""
+	}
+	u := fmt.Sprintf("%s/conversations.info?channel=%s", c.apiBase(), url.QueryEscape(channelID))
+	var out struct {
+		OK      bool   `json:"ok"`
+		Error   string `json:"error"`
+		Channel struct {
+			Name string `json:"name"`
+		} `json:"channel"`
+	}
+	for _, token := range tokens {
+		req, _ := http.NewRequest("GET", u, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := c.do(req, 10*time.Second)
+		if err != nil {
+			continue
+		}
+		rb, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		out = struct {
+			OK      bool   `json:"ok"`
+			Error   string `json:"error"`
+			Channel struct {
+				Name string `json:"name"`
+			} `json:"channel"`
+		}{}
+		if err := json.Unmarshal(rb, &out); err != nil {
+			log.Printf("[SLACK] GetChannelName %s: json unmarshal error: %v", channelID, err)
+			continue
+		}
+		if out.OK && out.Channel.Name != "" {
+			return out.Channel.Name
+		}
+		log.Printf("[SLACK] GetChannelName %s: api error=%q", channelID, out.Error)
+		// channel_not_found is definitive — no token will help.
+		// not_in_channel only means this token's user isn't in the channel; try next token.
+		if out.Error == "channel_not_found" {
+			break
+		}
+	}
+	return ""
+}
+
+// ResolveChannelMentions replaces <#CHANID> and <#CHANID|name> patterns
+// in text with #channel-name, fetching the name from the Slack API when
+// the name is not embedded in the mention.  This allows the router LLM
+// to generate correct in:#channel-name search filters.
+func (c *Client) ResolveChannelMentions(text string) string {
+	return reSlackChannelMention.ReplaceAllStringFunc(text, func(m string) string {
+		sub := reSlackChannelMention.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		id := sub[1]
+		name := strings.TrimSpace(sub[2])
+		if name != "" {
+			return "#" + name
+		}
+		if resolved := c.GetChannelName(id); resolved != "" {
+			log.Printf("[SLACK] resolved channel %s → #%s", id, resolved)
+			return "#" + resolved
+		}
+		log.Printf("[SLACK] could not resolve channel %s — keeping raw ID for query stripping", id)
+		return "<#" + id + ">"
+	})
+}
+
 // GetUsernameByID calls users.info and returns the Slack "name" (handle)
 // e.g. "daniel.fillol". It prefers the user token when available.
 func (c *Client) GetUsernameByID(userID string) (string, error) {
@@ -791,6 +977,30 @@ func (c *Client) GetUsernameByID(userID string) (string, error) {
 		return "", errors.New("users.info returned empty name")
 	}
 	return out.User.Name, nil
+}
+
+// reFromUserID matches "from:USERID" patterns in a Slack search query where
+// USERID is a raw Slack user ID (starts with U or W, all caps alphanumeric).
+var reFromUserID = regexp.MustCompile(`\bfrom:([UW][A-Z0-9]+)\b`)
+
+// ResolveUserIDsInQuery replaces from:USERID tokens with from:@username so
+// that the Slack search API filters messages by the correct user.
+// Unresolvable IDs are left unchanged so the search still runs.
+func (c *Client) ResolveUserIDsInQuery(q string) string {
+	return reFromUserID.ReplaceAllStringFunc(q, func(match string) string {
+		sub := reFromUserID.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		userID := sub[1]
+		name, err := c.GetUsernameByID(userID)
+		if err != nil {
+			log.Printf("[SLACK] ResolveUserIDsInQuery: could not resolve %s: %v", userID, err)
+			return match
+		}
+		log.Printf("[SLACK] resolved from:%s → from:@%s", userID, name)
+		return "from:@" + name
+	})
 }
 
 func (c *Client) rewriteFromToUserIDs(q string) string {

@@ -80,6 +80,13 @@ func (c *Client) Chat(messages []OpenAIMessage, model string, temperature float6
 	if strings.TrimSpace(model) == "" {
 		model = "gpt-4o-mini"
 	}
+	return c.chatWithTemperature(messages, model, temperature, maxTokens)
+}
+
+// chatWithTemperature performs the actual HTTP call.  If the model rejects
+// the requested temperature (e.g. gpt-5-mini only accepts the default),
+// it retries once without a custom temperature.
+func (c *Client) chatWithTemperature(messages []OpenAIMessage, model string, temperature float64, maxTokens int) (string, error) {
 	reqBody := openAIChatRequest{
 		Model:               model,
 		Messages:            messages,
@@ -98,7 +105,13 @@ func (c *Client) Chat(messages []OpenAIMessage, model string, temperature float6
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("openai status=%d body=%s", resp.StatusCode, preview(string(rb), 400))
+		bodyStr := string(rb)
+		// Retry without temperature when the model doesn't support a custom value.
+		if resp.StatusCode == 400 && strings.Contains(bodyStr, "\"temperature\"") && temperature != 0 {
+			log.Printf("[LLM] model %s rejected temperature=%.1f — retrying with default", model, temperature)
+			return c.chatWithTemperature(messages, model, 0, maxTokens)
+		}
+		return "", fmt.Errorf("openai status=%d body=%s", resp.StatusCode, preview(bodyStr, 400))
 	}
 	var out openAIChatResponse
 	if err := json.Unmarshal(rb, &out); err != nil {
@@ -132,12 +145,20 @@ func (c *Client) Chat(messages []OpenAIMessage, model string, temperature float6
 // On any error, returns false to avoid creating unwanted cards.
 func (c *Client) ConfirmJiraCreateIntent(question, fallbackModel, primaryModel string) bool {
 	prompt := fmt.Sprintf(`Você é um classificador de intenção. O usuário enviou a mensagem abaixo.
-Ele quer criar um novo card/issue/ticket no Jira agora?
+Ele quer criar um novo card/issue/ticket no Jira AGORA, neste momento?
 
-Regras:
-- Responda APENAS "sim" ou "não".
-- "sim" somente se a mensagem pede explicitamente para abrir/criar um card, ticket, issue, história, bug ou épico no Jira.
-- "não" se: a mensagem menciona criar um relatório/reporte; contém "não é pra criar"; usa palavras como "criar" ou "épico" apenas como referência de contexto; pede para buscar, resumir ou analisar algo.
+Responda APENAS "sim" ou "não".
+
+Responda "sim" somente quando a mensagem for um pedido direto e imediato de criação:
+- "crie um card", "abre um bug", "cria uma história", "criar um ticket no Jira"
+
+Responda "não" em todos os outros casos, incluindo:
+- Hipótese / cogitação: "estou pensando em abrir", "acho que deveria criar", "talvez valha criar"
+- Dúvida / pesquisa primeiro: "não sei se já tem um card", "tem uma thread sobre isso?"
+- Menciona criar apenas como contexto ou referência: "criar um serviço dedicado", "criação de demandas"
+- Pede para buscar, resumir, analisar ou verificar algo
+- Menciona criar um relatório, reporte ou documento
+- Contém negação: "não é pra criar", "não quero criar"
 
 Mensagem: %q`, question)
 
