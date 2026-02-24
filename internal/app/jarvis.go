@@ -208,7 +208,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		// Fetch real Jira examples to inspire the LLM
 		exampleIssues := s.fetchExampleIssues(d.Project, d.IssueType)
 
-		dd, derr := s.LLM.ExtractIssueFromThread(threadHist, q, s.Cfg.OpenAIModel, exampleIssues)
+		dd, derr := s.LLM.ExtractIssueFromThread(threadHist, q, s.Cfg.OpenAIModel, exampleIssues, s.Cfg.JiraProjectNameMap)
 		if derr == nil {
 			// Fields explicitly provided by the user take absolute priority
 			if strings.TrimSpace(d.Project) != "" {
@@ -251,7 +251,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 	if parse.IsThreadBasedCreate(q) {
 		// 3a) Multi-card variant: "crie dois cards", "um sobre X e outro Y"
 		if parse.IsMultiCardCreate(q) {
-			drafts, derr := s.LLM.ExtractMultipleIssuesFromThread(threadHist, q, s.Cfg.OpenAIModel)
+			drafts, derr := s.LLM.ExtractMultipleIssuesFromThread(threadHist, q, s.Cfg.OpenAIModel, s.Cfg.JiraProjectNameMap)
 			if derr != nil {
 				_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Não consegui montar os rascunhos dos cards a partir da thread: %v", derr))
 				return true, nil
@@ -290,7 +290,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		// Fetch real Jira examples to inspire the LLM
 		exampleIssues := s.fetchExampleIssues(parsedProject, parsedType)
 
-		draft, derr := s.LLM.ExtractIssueFromThread(threadHist, q, s.Cfg.OpenAIModel, exampleIssues)
+		draft, derr := s.LLM.ExtractIssueFromThread(threadHist, q, s.Cfg.OpenAIModel, exampleIssues, s.Cfg.JiraProjectNameMap)
 		if derr != nil {
 			_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Não consegui montar o rascunho do card a partir da thread: %v", derr))
 			return true, nil

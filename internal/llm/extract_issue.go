@@ -16,10 +16,23 @@ import (
 // parameter allows specifying the LLM model; callers typically pass
 // the primary model from configuration.  If the call or JSON parse
 // fails, an error is returned.
-func (c *Client) ExtractIssueFromThread(threadHistory, userInstruction, model string, exampleIssues []string) (jira.IssueDraft, error) {
+func (c *Client) ExtractIssueFromThread(threadHistory, userInstruction, model string, exampleIssues []string, projectNameMap map[string]string) (jira.IssueDraft, error) {
 	system := `Você é um Product Manager sênior especializado em escrever issues Jira de alta qualidade.
 Sua tarefa é extrair um rascunho de issue a partir de uma conversa no Slack.
 Retorne SOMENTE JSON válido, sem markdown fences.`
+
+	// Build project name→key mapping block
+	projectMapBlock := ""
+	if len(projectNameMap) > 0 {
+		var lines []string
+		for name, key := range projectNameMap {
+			lines = append(lines, fmt.Sprintf("- %s → %s", name, key))
+		}
+		projectMapBlock = fmt.Sprintf(`
+Mapeamento de nomes de projeto para chaves Jira (use para identificar o campo "project"):
+%s
+`, strings.Join(lines, "\n"))
+	}
 
 	// Build real Jira examples for inspiration
 	examplesBlock := ""
@@ -33,7 +46,7 @@ Exemplos de cards bem escritos do mesmo projeto (use como referência de estilo 
 	user := fmt.Sprintf(`
 Instrução do usuário (respeite SEMPRE os campos informados explicitamente — projeto, tipo, título, prioridade, labels):
 %s
-%s
+%s%s
 Thread do Slack:
 %s
 
@@ -58,7 +71,7 @@ Estrutura da description por tipo:
 - História (Story): ## Contexto\n## Objetivo\n## Escopo (MVP)\n## Critérios de aceitação (lista "- [ ] ...")
 - Epic: ## Contexto\n## Objetivo\n## Escopo (MVP)\n## Fora de escopo\n## KPIs\n## Fluxos-chave\n## Requisitos não-funcionais\n## Riscos\n## DoD
 - Tipo desconhecido: ## Contexto\n## Problema\n## Impacto\n## Critérios de aceite\n## Links da thread
-`, userInstruction, examplesBlock, clip(threadHistory, 4500))
+`, userInstruction, projectMapBlock, examplesBlock, clip(threadHistory, 4500))
 
 	messages := []OpenAIMessage{
 		{Role: "system", Content: system},
@@ -91,15 +104,28 @@ Estrutura da description por tipo:
 // drafts at once from a Slack thread.  userInstruction must describe all cards
 // to be created (e.g. "crie dois cards: um bug sobre X e uma história sobre Y").
 // The function returns one IssueDraft per card mentioned in the instruction.
-func (c *Client) ExtractMultipleIssuesFromThread(threadHistory, userInstruction, model string) ([]jira.IssueDraft, error) {
+func (c *Client) ExtractMultipleIssuesFromThread(threadHistory, userInstruction, model string, projectNameMap map[string]string) ([]jira.IssueDraft, error) {
 	system := `Você é um Product Manager sênior especializado em escrever issues Jira de alta qualidade.
 Sua tarefa é extrair MÚLTIPLOS rascunhos de issues a partir de uma conversa no Slack.
 Retorne SOMENTE um array JSON válido, sem markdown fences.`
 
+	// Build project name→key mapping block
+	projectMapBlock := ""
+	if len(projectNameMap) > 0 {
+		var lines []string
+		for name, key := range projectNameMap {
+			lines = append(lines, fmt.Sprintf("- %s → %s", name, key))
+		}
+		projectMapBlock = fmt.Sprintf(`
+Mapeamento de nomes de projeto para chaves Jira (use para identificar o campo "project"):
+%s
+`, strings.Join(lines, "\n"))
+	}
+
 	user := fmt.Sprintf(`
 Instrução do usuário (respeite SEMPRE os campos informados explicitamente — projeto, tipo, título, prioridade, labels):
 %s
-
+%s
 Thread do Slack:
 %s
 
@@ -127,7 +153,7 @@ Estrutura da description por tipo:
 - História (Story): ## Contexto\n## Objetivo\n## Escopo (MVP)\n## Critérios de aceitação (lista "- [ ] ...")
 - Epic: ## Contexto\n## Objetivo\n## Escopo (MVP)\n## Fora de escopo\n## KPIs\n## Fluxos-chave\n## Requisitos não-funcionais\n## Riscos\n## DoD
 - Tipo desconhecido: ## Contexto\n## Problema\n## Impacto\n## Critérios de aceite\n## Links da thread
-`, userInstruction, clip(threadHistory, 4500))
+`, userInstruction, projectMapBlock, clip(threadHistory, 4500))
 
 	messages := []OpenAIMessage{
 		{Role: "system", Content: system},
