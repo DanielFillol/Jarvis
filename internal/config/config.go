@@ -35,17 +35,6 @@ type Config struct {
 	// BotName is the display name of the bot used in messages and prompts.
 	// Defaults to "Jarvis".  Set via BOT_NAME=MyBot.
 	BotName string
-
-	// GitHub integration — used to enrich Bug cards with code context.
-	// GitHubToken is a Personal Access Token (classic or fine-grained) with
-	// at least read access to the repositories you want to search.
-	GitHubToken string
-	// GitHubOrg scopes code searches to a specific GitHub organisation
-	// (org:VALUE).  Used when GITHUB_REPOS is not set.
-	GitHubOrg string
-	// GitHubRepos is an optional list of "owner/repo" pairs that further
-	// restrict code searches.  Takes precedence over GitHubOrg.
-	GitHubRepos []string
 }
 
 // Load reads configuration from environment variables.  If a .env file
@@ -74,9 +63,6 @@ func Load() Config {
 	cfg.JiraProjectKeys = parseCSV(getEnv("JIRA_PROJECT_KEYS", ""))
 	cfg.JiraProjectNameMap = parseProjectNameMap(os.Getenv("JIRA_PROJECT_NAME_MAP"))
 	cfg.BotName = getEnv("BOT_NAME", "Jarvis")
-	cfg.GitHubToken = os.Getenv("GITHUB_TOKEN")
-	cfg.GitHubOrg = os.Getenv("GITHUB_ORG")
-	cfg.GitHubRepos = parseCSV(os.Getenv("GITHUB_REPOS"))
 	pages := getEnv("SLACK_SEARCH_MAX_PAGES", "10")
 	if n, err := strconv.Atoi(pages); err == nil {
 		cfg.SlackSearchMaxPages = n

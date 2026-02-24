@@ -72,9 +72,6 @@ Crie um `.env` baseado no `Example.env`:
 | `JIRA_PROJECT_NAME_MAP` | Mapeamento nome→chave para linguagem natural (ex: `backend:BE,ops:OPS`) | — |
 | `JIRA_CREATE_ENABLED` | Habilita criação de issues via bot | `false` |
 | `BOT_NAME` | Nome do bot exibido nas mensagens | `Jarvis` |
-| `GITHUB_TOKEN` | Personal Access Token do GitHub (`github_pat_...`) para enriquecer Bug cards | — |
-| `GITHUB_ORG` | Organização GitHub para escopo das buscas de código | — |
-| `GITHUB_REPOS` | Lista CSV de `owner/repo` para restringir buscas (prioridade sobre `GITHUB_ORG`) | — |
 
 ### JIRA_PROJECT_NAME_MAP
 
@@ -88,23 +85,6 @@ JIRA_PROJECT_NAME_MAP=backend:BE,frontend:FE,infraestrutura:INFRA,mobile:MOB
 ```
 
 Com isso, o usuário pode dizer `"crie um bug no backend"` e o bot resolverá automaticamente para o projeto `BE`.
-
----
-
-### Integração GitHub — Enriquecimento de Bug Cards
-
-Quando `GITHUB_TOKEN` está configurado, ao criar um card do tipo **Bug** o bot executa automaticamente:
-
-1. **Gera query técnica** — LLM extrai 2-3 termos técnicos do resumo/descrição do bug (nomes de funções, classes, mensagens de erro)
-2. **Busca código** — GitHub Code Search retorna arquivos relevantes com fragmentos de texto
-3. **Enriquece a descrição** — segundo passo de LLM adiciona à descrição do card:
-   - `## Localização provável no código` — arquivos e funções suspeitas com links GitHub
-   - `## Hipótese de causa raiz` — análise baseada no código encontrado
-   - `## Sugestão de correção` — proposta técnica de fix
-
-Se o GitHub não estiver configurado, ou se a busca não retornar resultados, o card é criado normalmente sem enriquecimento.
-
-**Permissões necessárias no PAT:** `repo` (para repos privados) ou `public_repo` (para repos públicos).
 
 ---
 
