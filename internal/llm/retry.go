@@ -18,7 +18,7 @@ func (c *Client) CallOpenAIWithModel(messages []OpenAIMessage, model string, tem
 // AnswerWithModel is a compatibility wrapper around the internal answerWithModel.
 // Useful when you want to force a specific model (as in the monolith).
 func (c *Client) AnswerWithModel(question, threadHistory, slackCtx, jiraCtx, model string) (string, error) {
-	return c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, model, "")
+	return c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, model)
 }
 
 // AnswerWithRetry attempts to answer using primaryModel, retrying transient failures,
@@ -29,7 +29,6 @@ func (c *Client) AnswerWithRetry(
 	primaryModel, fallbackModel string,
 	maxAttempts int,
 	baseDelay time.Duration,
-	fileCtx string,
 ) (string, error) {
 	if maxAttempts <= 0 {
 		maxAttempts = 3
@@ -39,14 +38,14 @@ func (c *Client) AnswerWithRetry(
 	}
 
 	// Try primary first.
-	out, err := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, primaryModel, maxAttempts, baseDelay, fileCtx)
+	out, err := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, primaryModel, maxAttempts, baseDelay)
 	if err == nil && strings.TrimSpace(out) != "" {
 		return out, nil
 	}
 
 	// Fall back if configured and different.
 	if fallbackModel != "" && fallbackModel != primaryModel {
-		out2, err2 := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, fallbackModel, maxAttempts, baseDelay, fileCtx)
+		out2, err2 := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, fallbackModel, maxAttempts, baseDelay)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
 			return out2, nil
 		}
@@ -66,11 +65,10 @@ func (c *Client) answerWithRetrySingleModel(
 	question, threadHistory, slackCtx, jiraCtx, model string,
 	maxAttempts int,
 	baseDelay time.Duration,
-	fileCtx string,
 ) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, model, fileCtx)
+		out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, model)
 		if err == nil && strings.TrimSpace(out) != "" {
 			return out, nil
 		}

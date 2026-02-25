@@ -47,7 +47,7 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 // delegates to the appropriate flows: Jira creation, issue lookup,
 // context retrieval and answer generation.  On error, a fallback
 // answer is posted to Slack to provide user feedback.
-func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, question, senderUserID string, files []slack.SlackFile) error {
+func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, question, senderUserID string) error {
 	start := time.Now()
 	log.Printf("[JARVIS] start question=%q originTs=%q senderUserID=%q", preview(question, 180), originTs, senderUserID)
 	// 0) Early check: bot introduction / capabilities overview
@@ -175,13 +175,8 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	if finalJiraCtx == "" {
 		finalJiraCtx = jiraCtx
 	}
-	// 9) Build file context from any attachments the user included.
-	fileCtx := s.buildFileContext(files)
-	if fileCtx != "" {
-		log.Printf("[JARVIS] fileContext files=%d chars=%d", len(files), len(fileCtx))
-	}
-	// 10) Answer with LLM (with retry for transient errors)
-	answer, err := s.LLM.AnswerWithRetry(questionForLLM, threadHist, slackCtx, finalJiraCtx, s.Cfg.OpenAIModel, s.Cfg.OpenAIFallbackModel, 2, 0, fileCtx)
+	// 9) Answer with LLM (with retry for transient errors)
+	answer, err := s.LLM.AnswerWithRetry(questionForLLM, threadHist, slackCtx, finalJiraCtx, s.Cfg.OpenAIModel, s.Cfg.OpenAIFallbackModel, 2, 0)
 	if err != nil || strings.TrimSpace(answer) == "" {
 		log.Printf("[ERR] llmAnswer failed: %v", err)
 		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, (jiraIssueCtx != "" || decision.NeedJira), jiraIssuesFound, issueKey)
