@@ -52,7 +52,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	log.Printf("[JARVIS] start question=%q originTs=%q senderUserID=%q", preview(question, 180), originTs, senderUserID)
 	// 0) Early check: bot introduction / capabilities overview
 	if isIntroRequest(question) {
-		return s.handleIntroRequest(channel, threadTs)
+		return s.handleIntroRequest(channel, threadTs, originTs)
 	}
 	// 1) Decide which thread to use as context (current vs permalink)
 	contextChannel := channel
@@ -880,7 +880,7 @@ func stripHTML(s string) string {
 // handleIntroRequest fetches real Jira projects and Slack channels in parallel,
 // then asks the LLM to generate a rich, contextualized self-introduction.
 // Falls back to a static message if data fetching or the LLM fails.
-func (s *Service) handleIntroRequest(channel, threadTs string) error {
+func (s *Service) handleIntroRequest(channel, threadTs, originTs string) error {
 	busyTs, busyErr := s.Slack.PostMessageAndGetTS(channel, threadTs, "_preparando apresentação..._")
 	if busyErr != nil {
 		log.Printf("[JARVIS] intro: could not post busy indicator: %v", busyErr)
@@ -925,23 +925,50 @@ func (s *Service) handleIntroRequest(channel, threadTs string) error {
 
 	log.Printf("[JARVIS] intro: jiraProjects=%d slackChannels=%d", len(jiraProjects), len(slackChannels))
 
-	// Build formatted project list: "KEY — Name"
-	projList := make([]string, 0, len(jiraProjects))
+	// Build project list prioritizing configured keys, capped at 15 entries.
+	// This keeps the LLM context focused and examples concrete.
+	projByKey := make(map[string]string, len(jiraProjects))
 	for _, p := range jiraProjects {
+		projByKey[p.Key] = p.Name
+	}
+	seen := make(map[string]bool)
+	var projList []string
+	// 1) Configured keys first (always included, with names when available)
+	for _, k := range s.Cfg.JiraProjectKeys {
+		name := projByKey[k]
+		entry := k
+		if name != "" && name != k {
+			entry = k + " — " + name
+		}
+		projList = append(projList, entry)
+		seen[k] = true
+	}
+	// 2) Fill up to 15 with remaining projects from API
+	for _, p := range jiraProjects {
+		if len(projList) >= 15 {
+			break
+		}
+		if seen[p.Key] {
+			continue
+		}
 		entry := p.Key
 		if p.Name != "" && p.Name != p.Key {
 			entry = p.Key + " — " + p.Name
 		}
 		projList = append(projList, entry)
+		seen[p.Key] = true
 	}
 	// Fall back to configured keys if API returned nothing
 	if len(projList) == 0 {
 		projList = s.Cfg.JiraProjectKeys
 	}
 
-	// Build formatted channel list: "#name"
+	// Build formatted channel list: "#name", capped at 20
 	chanList := make([]string, 0, len(slackChannels))
-	for _, ch := range slackChannels {
+	for i, ch := range slackChannels {
+		if i >= 20 {
+			break
+		}
 		chanList = append(chanList, "#"+ch.Name)
 	}
 
@@ -961,7 +988,14 @@ func (s *Service) handleIntroRequest(channel, threadTs string) error {
 		answer = buildIntroMessage(s.Cfg.BotName, s.Cfg.JiraCreateEnabled, projList)
 	}
 
-	return replyFn(answer)
+	if err := replyFn(answer); err != nil {
+		return err
+	}
+	// Track so the reply is deleted if the user deletes their message.
+	if busyTs != "" {
+		s.Tracker.Track(channel, originTs, busyTs)
+	}
+	return nil
 }
 
 // isIntroRequest returns true when the question looks like the user

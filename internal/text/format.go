@@ -3,26 +3,50 @@ package text
 
 import (
 	"regexp"
+	"strings"
 )
 
-// MarkdownToMarkdown converts a subset of GitHub-flavored Markdown into
-// Slack's Markdown syntax.  It currently handles bold, italic,
-// strikethrough and headings.  Additional conversions can be added
-// as needed.
+// Pre-compiled regexes for MarkdownToMarkdown.
+var (
+	reMDBold      = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	reMDUnderBold = regexp.MustCompile(`__(.+?)__`)
+	reMDTilde     = regexp.MustCompile(`~~(.+?)~~`)
+	reMDHeading   = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
+	// Ordered list items: "1. " at the start of a line → "1. " (already valid in Slack, just ensure no conversion needed)
+	// Code blocks (```) pass through as-is — Slack renders them natively.
+	// Blockquotes (>) pass through as-is — Slack renders them natively.
+)
+
+// MarkdownToMarkdown converts GitHub-flavored Markdown into Slack mrkdwn.
+// Code blocks and blockquotes are preserved unchanged since Slack renders
+// them natively. Bold, italic and heading markers are converted.
 func MarkdownToMarkdown(s string) string {
+	// Protect code blocks from being modified: extract them, convert the rest,
+	// then reinsert. This prevents bold/heading regexes from mangling code.
+	var blocks []string
+	s = reMDCodeBlock.ReplaceAllStringFunc(s, func(m string) string {
+		idx := len(blocks)
+		blocks = append(blocks, m)
+		return "\x00CODEBLOCK" + string(rune('0'+idx)) + "\x00"
+	})
+
 	// **text** or __text__ → *text*
-	reBold := regexp.MustCompile(`\*\*(.+?)\*\*`)
-	s = reBold.ReplaceAllString(s, "*$1*")
-	reUnderBold := regexp.MustCompile(`__(.+?)__`)
-	s = reUnderBold.ReplaceAllString(s, "*$1*")
-	// ~~texto~~ → ~texto~
-	reTilde := regexp.MustCompile(`~~(.+?)~~`)
-	s = reTilde.ReplaceAllString(s, "~$1~")
+	s = reMDBold.ReplaceAllString(s, "*$1*")
+	s = reMDUnderBold.ReplaceAllString(s, "*$1*")
+	// ~~text~~ → ~text~
+	s = reMDTilde.ReplaceAllString(s, "~$1~")
 	// ### Title / ## Title / # Title → *Title*
-	reH := regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
-	s = reH.ReplaceAllString(s, "*$1*")
+	s = reMDHeading.ReplaceAllString(s, "*$1*")
+
+	// Reinsert code blocks
+	for i, block := range blocks {
+		s = strings.ReplaceAll(s, "\x00CODEBLOCK"+string(rune('0'+i))+"\x00", block)
+	}
 	return s
 }
+
+// reMDCodeBlock matches fenced code blocks (``` ... ```) across multiple lines.
+var reMDCodeBlock = regexp.MustCompile("(?s)```[^`]*```")
 
 // MarkdownToMrkdwn is a compatibility alias for the monolith naming.
 func MarkdownToMrkdwn(s string) string {

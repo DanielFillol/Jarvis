@@ -980,20 +980,21 @@ func (c *Client) GetUsernameByID(userID string) (string, error) {
 }
 
 // ListChannels returns the public channels the bot is a member of (up to 200).
+// It tries the bot token first; if that fails with missing_scope, retries with
+// the user token which typically has broader channel access.
 func (c *Client) ListChannels() ([]SlackChannelInfo, error) {
-	if c.BotToken == "" {
-		return nil, errors.New("missing Slack bot token")
+	tokens := []string{}
+	if c.BotToken != "" {
+		tokens = append(tokens, c.BotToken)
 	}
-	u := fmt.Sprintf("%s/conversations.list?types=public_channel&exclude_archived=true&limit=200", c.apiBase())
-	req, _ := http.NewRequest("GET", u, nil)
-	req.Header.Set("Authorization", "Bearer "+c.BotToken)
-	resp, err := c.do(req, 10*time.Second)
-	if err != nil {
-		return nil, err
+	if c.UserToken != "" {
+		tokens = append(tokens, c.UserToken)
 	}
-	defer resp.Body.Close()
-	rb, _ := io.ReadAll(resp.Body)
-	var data struct {
+	if len(tokens) == 0 {
+		return nil, errors.New("missing Slack token")
+	}
+
+	type chanResp struct {
 		OK       bool   `json:"ok"`
 		Error    string `json:"error"`
 		Channels []struct {
@@ -1002,19 +1003,39 @@ func (c *Client) ListChannels() ([]SlackChannelInfo, error) {
 			IsMember bool   `json:"is_member"`
 		} `json:"channels"`
 	}
-	if err := json.Unmarshal(rb, &data); err != nil {
-		return nil, err
-	}
-	if !data.OK {
-		return nil, fmt.Errorf("conversations.list error: %s", data.Error)
-	}
-	var out []SlackChannelInfo
-	for _, ch := range data.Channels {
-		if ch.IsMember && ch.Name != "" {
-			out = append(out, SlackChannelInfo{ID: ch.ID, Name: ch.Name})
+
+	u := fmt.Sprintf("%s/conversations.list?types=public_channel&exclude_archived=true&limit=200", c.apiBase())
+	for _, token := range tokens {
+		req, _ := http.NewRequest("GET", u, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := c.do(req, 10*time.Second)
+		if err != nil {
+			return nil, err
 		}
+		rb, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var data chanResp
+		if err := json.Unmarshal(rb, &data); err != nil {
+			return nil, err
+		}
+		if !data.OK {
+			// missing_scope: try next token
+			if data.Error == "missing_scope" {
+				log.Printf("[SLACK] ListChannels: token missing_scope, trying next token")
+				continue
+			}
+			return nil, fmt.Errorf("conversations.list error: %s", data.Error)
+		}
+		var out []SlackChannelInfo
+		for _, ch := range data.Channels {
+			if ch.IsMember && ch.Name != "" {
+				out = append(out, SlackChannelInfo{ID: ch.ID, Name: ch.Name})
+			}
+		}
+		return out, nil
 	}
-	return out, nil
+	return nil, errors.New("conversations.list: no token with required scope")
 }
 
 // reFromUserID matches "from:USERID" patterns in a Slack search query where
