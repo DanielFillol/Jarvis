@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DanielFillol/Jarvis/internal/config"
@@ -49,6 +50,10 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, question, senderUserID string) error {
 	start := time.Now()
 	log.Printf("[JARVIS] start question=%q originTs=%q senderUserID=%q", preview(question, 180), originTs, senderUserID)
+	// 0) Early check: bot introduction / capabilities overview
+	if isIntroRequest(question) {
+		return s.handleIntroRequest(channel, threadTs)
+	}
 	// 1) Decide which thread to use as context (current vs permalink)
 	contextChannel := channel
 	contextThreadTs := threadTs
@@ -870,4 +875,177 @@ func stripHTML(s string) string {
 	s = strings.ReplaceAll(s, "&gt;", ">")
 	s = reSpaces.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
+}
+
+// handleIntroRequest fetches real Jira projects and Slack channels in parallel,
+// then asks the LLM to generate a rich, contextualized self-introduction.
+// Falls back to a static message if data fetching or the LLM fails.
+func (s *Service) handleIntroRequest(channel, threadTs string) error {
+	busyTs, busyErr := s.Slack.PostMessageAndGetTS(channel, threadTs, "_preparando apresentação..._")
+	if busyErr != nil {
+		log.Printf("[JARVIS] intro: could not post busy indicator: %v", busyErr)
+	}
+
+	replyFn := func(text string) error {
+		if busyTs != "" {
+			if err := s.Slack.UpdateMessage(channel, busyTs, text); err != nil {
+				return s.Slack.PostMessage(channel, threadTs, text)
+			}
+			return nil
+		}
+		return s.Slack.PostMessage(channel, threadTs, text)
+	}
+
+	// Fetch Jira projects and Slack channels in parallel.
+	var (
+		jiraProjects  []jira.JiraProjectInfo
+		slackChannels []slack.SlackChannelInfo
+		wg            sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ps, err := s.Jira.ListProjects()
+		if err != nil {
+			log.Printf("[JARVIS] intro: ListProjects: %v", err)
+			return
+		}
+		jiraProjects = ps
+	}()
+	go func() {
+		defer wg.Done()
+		chs, err := s.Slack.ListChannels()
+		if err != nil {
+			log.Printf("[JARVIS] intro: ListChannels: %v", err)
+			return
+		}
+		slackChannels = chs
+	}()
+	wg.Wait()
+
+	log.Printf("[JARVIS] intro: jiraProjects=%d slackChannels=%d", len(jiraProjects), len(slackChannels))
+
+	// Build formatted project list: "KEY — Name"
+	projList := make([]string, 0, len(jiraProjects))
+	for _, p := range jiraProjects {
+		entry := p.Key
+		if p.Name != "" && p.Name != p.Key {
+			entry = p.Key + " — " + p.Name
+		}
+		projList = append(projList, entry)
+	}
+	// Fall back to configured keys if API returned nothing
+	if len(projList) == 0 {
+		projList = s.Cfg.JiraProjectKeys
+	}
+
+	// Build formatted channel list: "#name"
+	chanList := make([]string, 0, len(slackChannels))
+	for _, ch := range slackChannels {
+		chanList = append(chanList, "#"+ch.Name)
+	}
+
+	ctx := llm.IntroContext{
+		BotName:           s.Cfg.BotName,
+		PrimaryModel:      s.Cfg.OpenAIModel,
+		FallbackModel:     s.Cfg.OpenAIFallbackModel,
+		JiraBaseURL:       s.Cfg.JiraBaseURL,
+		JiraProjects:      projList,
+		SlackChannels:     chanList,
+		JiraCreateEnabled: s.Cfg.JiraCreateEnabled,
+	}
+
+	answer, err := s.LLM.GenerateIntroduction(ctx, s.Cfg.OpenAIModel, s.Cfg.OpenAIFallbackModel)
+	if err != nil || strings.TrimSpace(answer) == "" {
+		log.Printf("[JARVIS] intro: LLM failed (%v), using static fallback", err)
+		answer = buildIntroMessage(s.Cfg.BotName, s.Cfg.JiraCreateEnabled, projList)
+	}
+
+	return replyFn(answer)
+}
+
+// isIntroRequest returns true when the question looks like the user
+// is asking the bot to introduce itself or describe its capabilities.
+func isIntroRequest(q string) bool {
+	low := strings.ToLower(strings.TrimSpace(q))
+	if low == "" {
+		return false
+	}
+	triggers := []string{
+		"o que você faz", "o que voce faz",
+		"se apresente", "se apresenta",
+		"quais suas funcionalidades", "quais são suas funcionalidades", "quais sao suas funcionalidades",
+		"o que é o jarvis", "o que e o jarvis",
+		"me fala sobre você", "me conta sobre você", "me fala sobre voce", "me conta sobre voce",
+		"o que sabe fazer", "o que você sabe fazer", "o que voce sabe fazer",
+		"como você pode me ajudar", "como voce pode me ajudar",
+		"como posso usar você", "como posso usar voce",
+		"suas capacidades", "suas funções", "suas funcoes",
+		"me apresente", "me apresenta",
+		"quem é você", "quem e voce", "quem é vc", "quem e vc",
+		"o que pode fazer", "o que você pode fazer", "o que voce pode fazer",
+		"quais são seus recursos", "quais sao seus recursos",
+		"como funciona",
+	}
+	for _, t := range triggers {
+		if strings.Contains(low, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildIntroMessage returns a Slack mrkdwn-formatted presentation of
+// the bot's capabilities, adapted to the current configuration.
+func buildIntroMessage(botName string, jiraCreateEnabled bool, jiraProjectKeys []string) string {
+	if botName == "" {
+		botName = "Jarvis"
+	}
+	projCtx := ""
+	if len(jiraProjectKeys) > 0 {
+		projCtx = " (projetos configurados: " + strings.Join(jiraProjectKeys, ", ") + ")"
+	}
+
+	createSection := ""
+	if jiraCreateEnabled {
+		createSection = `*Criação de cards no Jira* ✏️
+• _"crie um bug no backend com título X"_ — criação por linguagem natural
+• _"com base nessa thread crie um card no projeto PROJ"_ — extrai da conversa
+• _"com base nessa thread crie dois cards"_ — criação de múltiplos cards de uma vez
+• _"jira criar | PROJ | Bug | Título | Descrição"_ — formato explícito e detalhado
+• _confirmar_ — confirma o rascunho pendente e cria o card
+• _cancelar card_ — descarta o rascunho atual
+
+`
+	}
+
+	return fmt.Sprintf(`Oi! Sou o *%s*, seu assistente operacional no Slack. 👋
+
+Aqui está o que posso fazer por você:
+
+*Consultas no Jira* 🎯%s
+• _"roadmap do projeto PROJ"_ — veja o planejamento do projeto
+• _"quais bugs estão abertos?"_ — lista bugs em aberto
+• _"me mostre as issues da sprint 7"_ — issues filtradas por sprint
+• _"quem está trabalhando em pagamentos?"_ — busca por assignee ou tema
+• _"o que é o PROJ-123?"_ — detalhes completos de uma issue específica
+
+*Busca no Slack* 🔍
+• _"onde falamos sobre integração de pagamentos?"_ — encontra threads e discussões
+• _"o que foi decidido sobre autenticação?"_ — recupera contexto de decisões passadas
+• _"o que o @fulano falou essa semana?"_ — filtra por usuário e período
+• _"me acha discussões sobre deploy no #canal"_ — busca direcionada por canal
+
+%s*Contexto da conversa* 💬
+• Entendo o histórico da thread onde estou — pode perguntar em sequência sem repetir contexto
+• Se você colar um link de thread do Slack, busco e resumo o contexto daquela conversa
+
+*Conversas gerais* 🧠
+• Posso conversar sobre qualquer assunto, responder dúvidas técnicas, ajudar a redigir textos, explicar conceitos e muito mais!
+
+*Como me chamar:*
+• Mencione _@%s_ em qualquer canal ou DM
+• Use o prefixo _jarvis:_ no início da mensagem
+
+Pode perguntar à vontade! 🚀`, botName, projCtx, createSection, botName)
 }

@@ -979,6 +979,44 @@ func (c *Client) GetUsernameByID(userID string) (string, error) {
 	return out.User.Name, nil
 }
 
+// ListChannels returns the public channels the bot is a member of (up to 200).
+func (c *Client) ListChannels() ([]SlackChannelInfo, error) {
+	if c.BotToken == "" {
+		return nil, errors.New("missing Slack bot token")
+	}
+	u := fmt.Sprintf("%s/conversations.list?types=public_channel&exclude_archived=true&limit=200", c.apiBase())
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("Authorization", "Bearer "+c.BotToken)
+	resp, err := c.do(req, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	var data struct {
+		OK       bool   `json:"ok"`
+		Error    string `json:"error"`
+		Channels []struct {
+			ID       string `json:"id"`
+			Name     string `json:"name"`
+			IsMember bool   `json:"is_member"`
+		} `json:"channels"`
+	}
+	if err := json.Unmarshal(rb, &data); err != nil {
+		return nil, err
+	}
+	if !data.OK {
+		return nil, fmt.Errorf("conversations.list error: %s", data.Error)
+	}
+	var out []SlackChannelInfo
+	for _, ch := range data.Channels {
+		if ch.IsMember && ch.Name != "" {
+			out = append(out, SlackChannelInfo{ID: ch.ID, Name: ch.Name})
+		}
+	}
+	return out, nil
+}
+
 // reFromUserID matches "from:USERID" patterns in a Slack search query where
 // USERID is a raw Slack user ID (starts with U or W, all caps alphanumeric).
 var reFromUserID = regexp.MustCompile(`\bfrom:([UW][A-Z0-9]+)\b`)

@@ -292,6 +292,46 @@ func (c *Client) FetchExampleIssues(project, issueType string, limit int) ([]str
 	return examples, nil
 }
 
+// ListProjects fetches all accessible Jira projects and returns up to 50,
+// each as a JiraProjectInfo with key and name.
+func (c *Client) ListProjects() ([]JiraProjectInfo, error) {
+	if c.BaseURL == "" {
+		return nil, errors.New("missing Jira base URL")
+	}
+	if c.Email == "" || c.Token == "" {
+		return nil, errors.New("missing Jira credentials")
+	}
+	u := c.BaseURL + "/rest/api/3/project?maxResults=50"
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("Accept", "application/json")
+	cred := base64.StdEncoding.EncodeToString([]byte(c.Email + ":" + c.Token))
+	req.Header.Set("Authorization", "Basic "+cred)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("jira projects status=%d body=%s", resp.StatusCode, preview(string(rb), 400))
+	}
+	var raw []struct {
+		Key  string `json:"key"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(rb, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]JiraProjectInfo, 0, len(raw))
+	for _, p := range raw {
+		if p.Key != "" {
+			out = append(out, JiraProjectInfo{Key: p.Key, Name: p.Name})
+		}
+	}
+	return out, nil
+}
+
 var jiraReHTML = regexp.MustCompile(`<[^>]+>`)
 var jiraReSpaces = regexp.MustCompile(`\s+`)
 

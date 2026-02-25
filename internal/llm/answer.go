@@ -3,9 +3,109 @@ package llm
 
 import (
 	"errors"
-	"github.com/DanielFillol/Jarvis/internal/text"
+	"fmt"
 	"strings"
+
+	"github.com/DanielFillol/Jarvis/internal/text"
 )
+
+// IntroContext holds all runtime data used to generate the bot introduction.
+type IntroContext struct {
+	BotName           string
+	PrimaryModel      string
+	FallbackModel     string
+	JiraBaseURL       string
+	JiraProjects      []string // formatted as "KEY — Nome"
+	SlackChannels     []string // formatted as "#canal"
+	JiraCreateEnabled bool
+}
+
+// GenerateIntroduction calls the LLM to produce a rich, contextual
+// self-introduction in Slack mrkdwn format using real configuration data.
+func (c *Client) GenerateIntroduction(ctx IntroContext, model, fallbackModel string) (string, error) {
+	botName := ctx.BotName
+	if strings.TrimSpace(botName) == "" {
+		botName = "Jarvis"
+	}
+
+	projText := "(nenhum projeto configurado)"
+	if len(ctx.JiraProjects) > 0 {
+		projText = strings.Join(ctx.JiraProjects, ", ")
+	}
+
+	chanText := "(nenhum canal listado)"
+	if len(ctx.SlackChannels) > 0 {
+		chanText = strings.Join(ctx.SlackChannels, ", ")
+	}
+
+	createStatus := "desabilitada"
+	if ctx.JiraCreateEnabled {
+		createStatus = "habilitada"
+	}
+
+	// Pick sample values to anchor examples
+	sampleKey := "PROJ"
+	if len(ctx.JiraProjects) > 0 {
+		sampleKey = strings.SplitN(ctx.JiraProjects[0], " — ", 2)[0]
+	}
+	sampleChan := "geral"
+	if len(ctx.SlackChannels) > 0 {
+		sampleChan = strings.TrimPrefix(ctx.SlackChannels[0], "#")
+	}
+	sampleChan2 := "tech"
+	if len(ctx.SlackChannels) > 1 {
+		sampleChan2 = strings.TrimPrefix(ctx.SlackChannels[1], "#")
+	}
+
+	prompt := fmt.Sprintf(`Você é o %s, assistente operacional do Slack, integrado com Jira e IA.
+Escreva uma apresentação das suas funcionalidades para a equipe, em português brasileiro.
+
+Configuração real atual:
+- Modelo de IA principal: %s
+- Modelo de IA secundário (fallback): %s
+- Projetos Jira disponíveis: %s
+- Canais Slack onde estou presente: %s
+- Criação de cards no Jira: %s
+
+Escreva a apresentação com 4 seções distintas de casos de uso, usando exemplos REAIS baseados na configuração acima.
+Use "%s" como exemplo de projeto Jira e "#%s" / "#%s" como exemplos de canais Slack.
+
+As 4 seções são:
+1. *Consultas no Jira* — roadmap, bugs abertos, issues por status/sprint/assignee, detalhes de cards específicos (use chaves reais dos projetos nos exemplos)
+2. *Busca no Slack* — encontrar threads, decisões passadas, mensagens de usuários específicos, filtros por canal e data (use nomes de canais reais nos exemplos)
+3. *Criação de cards no Jira* — se habilitada: linguagem natural, baseado em thread, multi-card, formato explícito; se desabilitada: mencione brevemente que está desabilitada
+4. *Contexto de conversa e perguntas gerais* — o bot entende o histórico da thread, responde perguntas técnicas, ajuda a redigir textos, explica conceitos, conversa sobre qualquer assunto
+
+Formatação OBRIGATÓRIA — Slack mrkdwn:
+- *negrito* com asterisco simples (NUNCA **negrito**)
+- _itálico_
+- Listas com • ou -
+- NUNCA use # ## ### — use *Título:* em vez disso
+- Exemplos de comandos em _itálico_
+- Máximo de 3000 caracteres no total
+
+Comece com uma saudação curta e simpática mencionando o nome %s. Seja direto e mostre exemplos concretos que a equipe possa usar agora.`,
+		botName,
+		ctx.PrimaryModel, ctx.FallbackModel,
+		projText, chanText, createStatus,
+		sampleKey, sampleChan, sampleChan2,
+		botName,
+	)
+
+	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
+	out, err := c.Chat(messages, model, 0.7, 2000)
+	if err != nil && strings.TrimSpace(fallbackModel) != "" && fallbackModel != model {
+		out, err = c.Chat(messages, fallbackModel, 0.7, 2000)
+	}
+	if err != nil {
+		return "", err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "", errors.New("empty intro from llm")
+	}
+	return out, nil
+}
 
 // Compat aliases to keep parity with the monolith.
 // They allow other packages (or future refactors) to refer to the same

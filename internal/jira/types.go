@@ -122,3 +122,9 @@ type JiraCreateIssueResp struct {
 	Key  string `json:"key"`
 	Self string `json:"self"`
 }
+
+// JiraProjectInfo holds a minimal project summary returned by ListProjects.
+type JiraProjectInfo struct {
+	Key  string
+	Name string
+}
