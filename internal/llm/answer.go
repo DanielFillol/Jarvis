@@ -159,13 +159,13 @@ type OpenAIChatResponse = openAIChatResponse
 // designates the preferred model; fallbackModel is used if the
 // primary fails or returns an empty response.  The returned answer
 // uses Slack Markdown formatting.
-func (c *Client) Answer(question, threadHistory, slackCtx, jiraCtx, primaryModel, fallbackModel string) (string, error) {
-	out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, primaryModel)
+func (c *Client) Answer(question, threadHistory, slackCtx, jiraCtx, primaryModel, fallbackModel string, fileCtx string) (string, error) {
+	out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, primaryModel, fileCtx)
 	if err == nil && strings.TrimSpace(out) != "" {
 		return out, nil
 	}
 	if fallbackModel != "" && fallbackModel != primaryModel {
-		out2, err2 := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, fallbackModel)
+		out2, err2 := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, fallbackModel, fileCtx)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
 			return out2, nil
 		}
@@ -183,7 +183,7 @@ func (c *Client) Answer(question, threadHistory, slackCtx, jiraCtx, primaryModel
 // answerWithModel assembles the prompt and calls the Chat API with the
 // specified model.  It converts Markdown into Slack Markdown before
 // returning the result.
-func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, model string) (string, error) {
+func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, model, fileCtx string) (string, error) {
 	botName := c.BotName
 	if strings.TrimSpace(botName) == "" {
 		botName = "Jarvis"
@@ -236,6 +236,11 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, mod
 	if jiraCtx != "" {
 		u.WriteString("CONTEXTO DO JIRA:\n")
 		u.WriteString(jiraCtx)
+		u.WriteString("\n\n")
+	}
+	if fileCtx != "" {
+		u.WriteString("ARQUIVOS ANEXADOS:\n")
+		u.WriteString(fileCtx)
 		u.WriteString("\n\n")
 	}
 	u.WriteString("PERGUNTA:\n")

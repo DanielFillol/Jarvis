@@ -979,6 +979,33 @@ func (c *Client) GetUsernameByID(userID string) (string, error) {
 	return out.User.Name, nil
 }
 
+// DownloadFile fetches a private Slack file into memory using the bot token.
+// The caller is responsible for enforcing size limits before calling this.
+func (c *Client) DownloadFile(urlPrivate string) ([]byte, error) {
+	urlPrivate = strings.TrimSpace(urlPrivate)
+	if urlPrivate == "" {
+		return nil, errors.New("empty file URL")
+	}
+	if c.BotToken == "" {
+		return nil, errors.New("missing Slack bot token")
+	}
+	req, err := http.NewRequest("GET", urlPrivate, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build download request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.BotToken)
+	resp, err := c.do(req, 30*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("download file: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("slack file download status=%d body=%s", resp.StatusCode, string(b))
+	}
+	return io.ReadAll(resp.Body)
+}
+
 // ListChannels returns the public channels the bot is a member of (up to 200).
 // It tries the bot token first; if that fails with missing_scope, retries with
 // the user token which typically has broader channel access.
