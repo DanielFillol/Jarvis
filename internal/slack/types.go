@@ -82,3 +82,9 @@ type SlackSearchMessage struct {
 	Ts        string
 	Score     float64
 }
+
+// SlackChannelInfo holds a minimal channel summary returned by ListChannels.
+type SlackChannelInfo struct {
+	ID   string
+	Name string
+}
