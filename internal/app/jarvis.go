@@ -20,6 +20,7 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/parse"
 	"github.com/DanielFillol/Jarvis/internal/slack"
 	"github.com/DanielFillol/Jarvis/internal/state"
+	pdflib "github.com/ledongthuc/pdf"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -633,6 +634,29 @@ func isXLSXMimetype(mimetype string) bool {
 		mimetype == "application/vnd.ms-excel"
 }
 
+// isPdfMimetype reports whether the MIME type is a PDF document.
+func isPdfMimetype(mimetype string) bool {
+	mimetype = strings.ToLower(strings.TrimSpace(mimetype))
+	return strings.Contains(mimetype, "pdf")
+}
+
+// pdfBytesToText extracts plain text from a PDF file using the ledongthuc/pdf library.
+func pdfBytesToText(data []byte) (string, error) {
+	r, err := pdflib.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", fmt.Errorf("open pdf: %w", err)
+	}
+	plain, err := r.GetPlainText()
+	if err != nil {
+		return "", fmt.Errorf("read pdf text: %w", err)
+	}
+	b, err := io.ReadAll(plain)
+	if err != nil {
+		return "", fmt.Errorf("read pdf content: %w", err)
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
 // isDocxMimetype reports whether the MIME type is a Word document.
 func isDocxMimetype(mimetype string) bool {
 	mimetype = strings.ToLower(strings.TrimSpace(mimetype))
@@ -743,7 +767,8 @@ func (s *Service) buildFileContext(files []slack.SlackFile) string {
 		isText := isTextMimetype(f.Mimetype)
 		isXLSX := isXLSXMimetype(f.Mimetype)
 		isDocx := isDocxMimetype(f.Mimetype)
-		if !isText && !isXLSX && !isDocx {
+		isPDF := isPdfMimetype(f.Mimetype)
+		if !isText && !isXLSX && !isDocx && !isPDF {
 			log.Printf("[JARVIS] skipping unsupported file %q mimetype=%q", f.Name, f.Mimetype)
 			continue
 		}
@@ -773,6 +798,12 @@ func (s *Service) buildFileContext(files []slack.SlackFile) string {
 			content, err = docxBytesToText(data)
 			if err != nil {
 				log.Printf("[JARVIS] failed to parse docx %q: %v", f.Name, err)
+				continue
+			}
+		case isPDF:
+			content, err = pdfBytesToText(data)
+			if err != nil {
+				log.Printf("[JARVIS] failed to parse pdf %q: %v", f.Name, err)
 				continue
 			}
 		default:
