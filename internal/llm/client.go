@@ -3,6 +3,7 @@ package llm
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,12 +16,54 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/config"
 )
 
+// ContentPart is a single element in a multi-part message content array,
+// used for vision API calls that mix text and images.
+type ContentPart struct {
+	Type     string        `json:"type"`
+	Text     string        `json:"text,omitempty"`
+	ImageURL *ImageURLPart `json:"image_url,omitempty"`
+}
+
+// ImageURLPart holds the URL (or base64 data URL) and optional detail level
+// for an image in a vision message.
+type ImageURLPart struct {
+	URL    string `json:"url"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// ImageAttachment holds a raw image downloaded from Slack for vision API calls.
+type ImageAttachment struct {
+	MimeType string // e.g. "image/jpeg"
+	Name     string
+	Data     []byte
+}
+
+// DataURL returns the base64-encoded data URL for the image.
+func (a ImageAttachment) DataURL() string {
+	return "data:" + a.MimeType + ";base64," + base64.StdEncoding.EncodeToString(a.Data)
+}
+
 // OpenAIMessage defines the role and content for a message in the
-// Chat Completions API.  Both system and user/assistant roles are
-// supported.
+// Chat Completions API.  When ContentParts is non-empty (vision messages),
+// the content is serialised as an array; otherwise Content is used as a string.
 type OpenAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role         string
+	Content      string        // used for plain-text messages
+	ContentParts []ContentPart // used for vision messages
+}
+
+// MarshalJSON serialises the message as either a string or array content.
+func (m OpenAIMessage) MarshalJSON() ([]byte, error) {
+	if len(m.ContentParts) > 0 {
+		return json.Marshal(struct {
+			Role    string        `json:"role"`
+			Content []ContentPart `json:"content"`
+		}{m.Role, m.ContentParts})
+	}
+	return json.Marshal(struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}{m.Role, m.Content})
 }
 
 // openAIChatRequest is the request payload for OpenAI's chat
