@@ -1043,6 +1043,61 @@ func (c *Client) GetUsernameByID(userID string) (string, error) {
 	return out.User.Name, nil
 }
 
+// DownloadFile fetches a private Slack file into memory.
+// It tries the user token first (broader file access), then falls back to
+// the bot token. If the response is HTML (Slack login redirect), the token
+// lacks files:read scope and an error is returned.
+// The caller is responsible for enforcing size limits.
+func (c *Client) DownloadFile(urlPrivate string) ([]byte, error) {
+	urlPrivate = strings.TrimSpace(urlPrivate)
+	if urlPrivate == "" {
+		return nil, errors.New("empty file URL")
+	}
+
+	tokens := []string{}
+	if c.UserToken != "" {
+		tokens = append(tokens, c.UserToken)
+	}
+	if c.BotToken != "" {
+		tokens = append(tokens, c.BotToken)
+	}
+	if len(tokens) == 0 {
+		return nil, errors.New("missing Slack token")
+	}
+
+	var lastErr error
+	for _, token := range tokens {
+		req, err := http.NewRequest("GET", urlPrivate, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build download request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := c.do(req, 30*time.Second)
+		if err != nil {
+			lastErr = fmt.Errorf("download file: %w", err)
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("read file body: %w", err)
+			continue
+		}
+		if resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("slack file download status=%d body=%s", resp.StatusCode, preview(string(body), 300))
+			continue
+		}
+		// If Slack returned an HTML page, the token lacks files:read scope.
+		ct := resp.Header.Get("Content-Type")
+		if strings.Contains(ct, "text/html") || (len(body) > 0 && body[0] == '<') {
+			lastErr = fmt.Errorf("received HTML instead of file content (token missing files:read scope?)")
+			continue
+		}
+		return body, nil
+	}
+	return nil, lastErr
+}
+
 // GetChannelHistoryForPeriod fetches up to limit messages from a channel
 // between oldest and latest.  It requires channels:history (or groups:history)
 // scope.  The user token is tried first (broader public-channel access), then
