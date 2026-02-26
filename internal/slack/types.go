@@ -13,18 +13,29 @@ type SlackEventEnvelope struct {
 	Event     json.RawMessage `json:"event,omitempty"`
 }
 
+// SlackFile represents a file attached to a Slack message.
+type SlackFile struct {
+	ID                 string `json:"id"`
+	Name               string `json:"name"`
+	Mimetype           string `json:"mimetype"`
+	Filetype           string `json:"filetype"`
+	Size               int64  `json:"size"`
+	URLPrivateDownload string `json:"url_private_download"`
+}
+
 // SlackMessageEvent represents a Slack message event.  It omits fields
 // that are not currently used by this application.
 type SlackMessageEvent struct {
-	Type      string `json:"type"`
-	Subtype   string `json:"subtype,omitempty"`
-	Text      string `json:"text"`
-	User      string `json:"user,omitempty"`
-	BotID     string `json:"bot_id,omitempty"`
-	Channel   string `json:"channel"`
-	Ts        string `json:"ts"`
-	ThreadTs  string `json:"thread_ts,omitempty"`
-	DeletedTs string `json:"deleted_ts,omitempty"`
+	Type      string      `json:"type"`
+	Subtype   string      `json:"subtype,omitempty"`
+	Text      string      `json:"text"`
+	User      string      `json:"user,omitempty"`
+	BotID     string      `json:"bot_id,omitempty"`
+	Channel   string      `json:"channel"`
+	Ts        string      `json:"ts"`
+	ThreadTs  string      `json:"thread_ts,omitempty"`
+	DeletedTs string      `json:"deleted_ts,omitempty"`
+	Files     []SlackFile `json:"files,omitempty"`
 	// Message is populated for message_changed events (e.g. edits and tombstone deletions in DMs).
 	Message *SlackInnerMessage `json:"message,omitempty"`
 }
