@@ -107,6 +107,7 @@ Escopos necessários para o token do bot (`xoxb-`):
 | `links:read` | Ver URLs em mensagens |
 | `links:write` | Exibir previews de URLs em mensagens |
 | `mpim:history` | Ver mensagens em group DMs em que o Jarvis foi adicionado |
+| `files:read` | Baixar arquivos de texto anexados a mensagens para análise pelo LLM |
 
 ### User Token Scopes
 
@@ -128,8 +129,11 @@ Escopos necessários para o token de usuário (`xoxp-`), usado para buscas com c
 | `search:read.private` | Buscar conteúdo privado no workspace |
 | `search:read.public` | Buscar conteúdo público no workspace |
 | `users:read` | Ver pessoas no workspace (necessário para resolver `<@USERID>` → username em buscas `from:`) |
+| `files:read` | Baixar arquivos de texto anexados a mensagens para análise pelo LLM |
 
-> **Nota:** O scope `users:read` no User Token é necessário para que o bot consiga filtrar mensagens por autor quando o usuário menciona alguém com `<@USERID>`. Sem ele, a busca `from:` não consegue resolver o ID para o username e opera de forma mais ampla.
+> **Notas:**
+> - `users:read` é necessário para filtrar mensagens por autor quando o usuário menciona alguém com `<@USERID>`. Sem ele, a busca `from:` não consegue resolver o ID para o username.
+> - `files:read` é necessário em ambos os tokens (bot e user) para que o Jarvis consiga baixar arquivos privados anexados às mensagens.
 
 Após adicionar os escopos, clique em **Reinstall App** para aplicar as permissões.
 
