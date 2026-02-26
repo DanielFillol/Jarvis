@@ -117,14 +117,16 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if msg.Subtype != "" || msg.BotID != "" {
+	// Allow file_share subtype (user attached a file); block everything else.
+	isFileShare := msg.Subtype == "file_share"
+	if (msg.Subtype != "" && !isFileShare) || msg.BotID != "" {
 		log.Printf("[SLACK] ignoring bot/subtype message subtype=%q bot_id_present=%t", msg.Subtype, msg.BotID != "")
 		return
 	}
 
 	text := strings.TrimSpace(msg.Text)
-	if text == "" {
-		log.Printf("[BOT] empty text; ignoring")
+	if text == "" && len(msg.Files) == 0 {
+		log.Printf("[BOT] empty text and no files; ignoring")
 		return
 	}
 
@@ -151,15 +153,19 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	question := parse.StripSummon(text, h.Slack.BotUserID)
-	if question == "" {
-		log.Printf("[BOT] summoned but empty after strip; ignoring")
+	if question == "" && len(msg.Files) == 0 {
+		log.Printf("[BOT] summoned but empty after strip and no files; ignoring")
 		return
 	}
+	// When user sends only files without any text, generate a default prompt.
+	if question == "" {
+		question = "Analise o(s) arquivo(s) anexado(s) e me dê um resumo."
+	}
 
-	log.Printf("[BOT] handling question=%q channel=%q thread=%q originTs=%q user=%q", preview(question, 220), msg.Channel, threadTs, originTs, msg.User)
+	log.Printf("[BOT] handling question=%q files=%d channel=%q thread=%q originTs=%q user=%q", preview(question, 220), len(msg.Files), msg.Channel, threadTs, originTs, msg.User)
 
 	go func() {
-		if err := h.Service.HandleMessage(msg.Channel, threadTs, originTs, text, question, msg.User); err != nil {
+		if err := h.Service.HandleMessage(msg.Channel, threadTs, originTs, text, question, msg.User, msg.Files); err != nil {
 			log.Printf("[ERR] handleQuestion: %v", err)
 			_ = h.Slack.PostMessage(msg.Channel, threadTs, "Não consegui gerar a resposta (erro interno).")
 		}
