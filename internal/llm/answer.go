@@ -159,13 +159,13 @@ type OpenAIChatResponse = openAIChatResponse
 // designates the preferred model; fallbackModel is used if the
 // primary fails or returns an empty response.  The returned answer
 // uses Slack Markdown formatting.
-func (c *Client) Answer(question, threadHistory, slackCtx, jiraCtx, primaryModel, fallbackModel string) (string, error) {
-	out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, primaryModel)
+func (c *Client) Answer(question, threadHistory, slackCtx, jiraCtx, fileCtx string, images []ImageAttachment, primaryModel, fallbackModel string) (string, error) {
+	out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, fileCtx, images, primaryModel)
 	if err == nil && strings.TrimSpace(out) != "" {
 		return out, nil
 	}
 	if fallbackModel != "" && fallbackModel != primaryModel {
-		out2, err2 := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, fallbackModel)
+		out2, err2 := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, fileCtx, images, fallbackModel)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
 			return out2, nil
 		}
@@ -183,7 +183,7 @@ func (c *Client) Answer(question, threadHistory, slackCtx, jiraCtx, primaryModel
 // answerWithModel assembles the prompt and calls the Chat API with the
 // specified model.  It converts Markdown into Slack Markdown before
 // returning the result.
-func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, model string) (string, error) {
+func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, fileCtx string, images []ImageAttachment, model string) (string, error) {
 	botName := c.BotName
 	if strings.TrimSpace(botName) == "" {
 		botName = "Jarvis"
@@ -240,13 +240,32 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, mod
 		u.WriteString(jiraCtx)
 		u.WriteString("\n\n")
 	}
+	if fileCtx != "" {
+		u.WriteString("ARQUIVOS ANEXADOS:\n")
+		u.WriteString(fileCtx)
+		u.WriteString("\n\n")
+	}
 	u.WriteString("PERGUNTA:\n")
 	u.WriteString(question)
 	u.WriteString("\n\n")
 	u.WriteString("Use formatação variada e contextual. Issue keys sempre em `código inline` (ex: `PROJ-123`). JQL em bloco de código. Passos numerados quando relevante. Blockquotes para avisos ou notas importantes.")
+	var userMsg OpenAIMessage
+	if len(images) > 0 {
+		// Vision message: text + images as content parts array.
+		parts := []ContentPart{{Type: "text", Text: u.String()}}
+		for _, img := range images {
+			parts = append(parts, ContentPart{
+				Type:     "image_url",
+				ImageURL: &ImageURLPart{URL: img.DataURL(), Detail: "auto"},
+			})
+		}
+		userMsg = OpenAIMessage{Role: "user", ContentParts: parts}
+	} else {
+		userMsg = OpenAIMessage{Role: "user", Content: u.String()}
+	}
 	msgs := []OpenAIMessage{
 		{Role: "system", Content: system},
-		{Role: "user", Content: u.String()},
+		userMsg,
 	}
 	out, err := c.Chat(msgs, model, 0.7, 2500)
 	if err != nil {
