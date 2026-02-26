@@ -2,7 +2,11 @@
 package app
 
 import (
+	"archive/zip"
+	"bytes"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"log"
 	"regexp"
 	"sort"
@@ -16,6 +20,7 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/parse"
 	"github.com/DanielFillol/Jarvis/internal/slack"
 	"github.com/DanielFillol/Jarvis/internal/state"
+	"github.com/xuri/excelize/v2"
 )
 
 // Service encapsulates the core orchestration logic of Jarvis.  It
@@ -47,7 +52,7 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 // delegates to the appropriate flows: Jira creation, issue lookup,
 // context retrieval and answer generation.  On error, a fallback
 // answer is posted to Slack to provide user feedback.
-func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, question, senderUserID string) error {
+func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, question, senderUserID string, files []slack.SlackFile) error {
 	start := time.Now()
 	log.Printf("[JARVIS] start question=%q originTs=%q senderUserID=%q", preview(question, 180), originTs, senderUserID)
 	// 0) Early check: bot introduction / capabilities overview
@@ -226,8 +231,17 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	if finalJiraCtx == "" {
 		finalJiraCtx = jiraCtx
 	}
-	// 9) Answer with LLM (with retry for transient errors)
-	answer, err := s.LLM.AnswerWithRetry(questionForLLM, threadHist, slackCtx, finalJiraCtx, s.Cfg.OpenAIModel, s.Cfg.OpenAIFallbackModel, 2, 0)
+	// 9) File context from attachments
+	fileCtx := s.buildFileContext(files)
+	if fileCtx != "" {
+		log.Printf("[JARVIS] fileContext files=%d chars=%d", len(files), len(fileCtx))
+	}
+	images := s.buildImageAttachments(files)
+	if len(images) > 0 {
+		log.Printf("[JARVIS] imageAttachments count=%d", len(images))
+	}
+	// 10) Answer with LLM (with retry for transient errors)
+	answer, err := s.LLM.AnswerWithRetry(questionForLLM, threadHist, slackCtx, finalJiraCtx, fileCtx, images, s.Cfg.OpenAIModel, s.Cfg.OpenAIFallbackModel, 2, 0)
 	if err != nil || strings.TrimSpace(answer) == "" {
 		log.Printf("[ERR] llmAnswer failed: %v", err)
 		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, (jiraIssueCtx != "" || decision.NeedJira), jiraIssuesFound, issueKey)
@@ -555,6 +569,238 @@ func (s *Service) createIssueAndReply(channel, threadTs string, d jira.IssueDraf
 	link := base + "/browse/" + created.Key
 	_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Card criado ✅ *%s*\n%s", created.Key, link))
 	return nil
+}
+
+// isTextMimetype reports whether a file MIME type is a supported text format
+// that can be safely included in the LLM prompt as raw bytes.
+func isTextMimetype(mimetype string) bool {
+	mimetype = strings.ToLower(strings.TrimSpace(mimetype))
+	if strings.HasPrefix(mimetype, "text/") {
+		return true
+	}
+	switch mimetype {
+	case "application/json", "application/xml",
+		"application/yaml", "application/x-yaml",
+		"application/javascript", "application/typescript":
+		return true
+	}
+	return false
+}
+
+// isImageMimetype reports whether the MIME type is a supported image format
+// for the OpenAI Vision API (JPEG, PNG, GIF, WebP).
+func isImageMimetype(mimetype string) bool {
+	switch strings.ToLower(strings.TrimSpace(mimetype)) {
+	case "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp":
+		return true
+	}
+	return false
+}
+
+// buildImageAttachments downloads image files and returns them as vision
+// attachments for the LLM. Images larger than 5 MB are skipped (OpenAI
+// base64 limit).
+func (s *Service) buildImageAttachments(files []slack.SlackFile) []llm.ImageAttachment {
+	const maxImageBytes = 5 * 1024 * 1024 // 5 MB (OpenAI base64 limit)
+	var out []llm.ImageAttachment
+	for _, f := range files {
+		if !isImageMimetype(f.Mimetype) {
+			continue
+		}
+		if f.Size > maxImageBytes {
+			log.Printf("[JARVIS] skipping oversized image %q size=%d", f.Name, f.Size)
+			continue
+		}
+		if f.URLPrivateDownload == "" {
+			log.Printf("[JARVIS] skipping image %q: no download URL", f.Name)
+			continue
+		}
+		data, err := s.Slack.DownloadFile(f.URLPrivateDownload)
+		if err != nil {
+			log.Printf("[JARVIS] failed to download image %q: %v", f.Name, err)
+			continue
+		}
+		log.Printf("[JARVIS] image downloaded %q bytes=%d", f.Name, len(data))
+		out = append(out, llm.ImageAttachment{MimeType: f.Mimetype, Name: f.Name, Data: data})
+	}
+	return out
+}
+
+// isXLSXMimetype reports whether the MIME type is an Excel spreadsheet.
+func isXLSXMimetype(mimetype string) bool {
+	mimetype = strings.ToLower(strings.TrimSpace(mimetype))
+	return mimetype == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+		mimetype == "application/vnd.ms-excel"
+}
+
+// isDocxMimetype reports whether the MIME type is a Word document.
+func isDocxMimetype(mimetype string) bool {
+	mimetype = strings.ToLower(strings.TrimSpace(mimetype))
+	return strings.Contains(mimetype, "wordprocessingml") ||
+		strings.Contains(mimetype, "msword") ||
+		strings.HasSuffix(mimetype, ".docx")
+}
+
+// docxBytesToText extracts plain text from a DOCX file (which is a ZIP
+// containing word/document.xml). It preserves paragraph breaks.
+// Uses only the standard library — no external dependency required.
+func docxBytesToText(data []byte) (string, error) {
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", fmt.Errorf("open docx zip: %w", err)
+	}
+	for _, f := range r.File {
+		if f.Name != "word/document.xml" {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return "", fmt.Errorf("open document.xml: %w", err)
+		}
+		defer rc.Close()
+		xmlData, err := io.ReadAll(rc)
+		if err != nil {
+			return "", fmt.Errorf("read document.xml: %w", err)
+		}
+		return extractDocxText(xmlData), nil
+	}
+	return "", fmt.Errorf("word/document.xml not found in docx")
+}
+
+// extractDocxText walks the XML token stream of word/document.xml and
+// collects text from <w:t> elements, inserting newlines at <w:p> boundaries.
+func extractDocxText(data []byte) string {
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	var b strings.Builder
+	inText := false
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "p": // paragraph start — add blank line between paragraphs
+				if b.Len() > 0 {
+					b.WriteByte('\n')
+				}
+			case "t": // text run
+				inText = true
+			}
+		case xml.EndElement:
+			if t.Name.Local == "t" {
+				inText = false
+			}
+		case xml.CharData:
+			if inText {
+				b.Write([]byte(t))
+			}
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// xlsxBytesToText converts raw XLSX bytes into a plain-text table representation
+// suitable for inclusion in an LLM prompt.  Each sheet is rendered as a
+// tab-separated grid with its name as a header.
+func xlsxBytesToText(data []byte) (string, error) {
+	f, err := excelize.OpenReader(bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("parse xlsx: %w", err)
+	}
+	defer f.Close()
+
+	var b strings.Builder
+	for _, sheet := range f.GetSheetList() {
+		rows, err := f.GetRows(sheet)
+		if err != nil {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("=== aba: %s ===\n", sheet))
+		for _, row := range rows {
+			b.WriteString(strings.Join(row, "\t"))
+			b.WriteByte('\n')
+		}
+		b.WriteByte('\n')
+	}
+	return strings.TrimSpace(b.String()), nil
+}
+
+// buildFileContext downloads files attached to the message and formats their
+// contents for inclusion in the LLM prompt.
+// Supported: text/*, JSON, YAML, XML, JS, TS (raw bytes) and XLSX (parsed as table).
+// Files larger than 20 MB are skipped. Total output is capped at 8 M chars to
+// stay safely under the OpenAI API limit of ~10 M chars per message.
+func (s *Service) buildFileContext(files []slack.SlackFile) string {
+	const maxFileBytes = 20 * 1024 * 1024 // 20 MB per file
+	const maxTotalChars = 100_000         // ~100 k chars — safe for 128k-token models
+	if len(files) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, f := range files {
+		isText := isTextMimetype(f.Mimetype)
+		isXLSX := isXLSXMimetype(f.Mimetype)
+		isDocx := isDocxMimetype(f.Mimetype)
+		if !isText && !isXLSX && !isDocx {
+			log.Printf("[JARVIS] skipping unsupported file %q mimetype=%q", f.Name, f.Mimetype)
+			continue
+		}
+		if f.Size > maxFileBytes {
+			log.Printf("[JARVIS] skipping oversized file %q size=%d", f.Name, f.Size)
+			continue
+		}
+		if f.URLPrivateDownload == "" {
+			log.Printf("[JARVIS] skipping file %q: no download URL", f.Name)
+			continue
+		}
+		data, err := s.Slack.DownloadFile(f.URLPrivateDownload)
+		if err != nil {
+			log.Printf("[JARVIS] failed to download file %q: %v", f.Name, err)
+			continue
+		}
+
+		var content string
+		switch {
+		case isXLSX:
+			content, err = xlsxBytesToText(data)
+			if err != nil {
+				log.Printf("[JARVIS] failed to parse xlsx %q: %v", f.Name, err)
+				continue
+			}
+		case isDocx:
+			content, err = docxBytesToText(data)
+			if err != nil {
+				log.Printf("[JARVIS] failed to parse docx %q: %v", f.Name, err)
+				continue
+			}
+		default:
+			content = string(data)
+		}
+
+		// Enforce total character cap — truncate current file if needed.
+		remaining := maxTotalChars - b.Len()
+		if remaining <= 0 {
+			log.Printf("[JARVIS] fileContext cap reached, skipping file %q", f.Name)
+			break
+		}
+		header := fmt.Sprintf("--- arquivo: %s (tipo: %s, tamanho: %d bytes) ---\n", f.Name, f.Mimetype, f.Size)
+		available := remaining - len(header) - 2 // 2 for trailing \n\n
+		if available <= 0 {
+			break
+		}
+		b.WriteString(header)
+		if len(content) > available {
+			log.Printf("[JARVIS] truncating file %q: %d → %d chars", f.Name, len(content), available)
+			b.WriteString(content[:available])
+			b.WriteString("\n[AVISO: conteúdo truncado por exceder o limite de contexto]\n")
+		} else {
+			b.WriteString(content)
+		}
+		b.WriteString("\n\n")
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // buildSlackContext builds a textual summary of Slack search results.
