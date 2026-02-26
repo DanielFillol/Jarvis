@@ -48,7 +48,7 @@ func MarkdownToMarkdown(s string) string {
 // reMDCodeBlock matches fenced code blocks (``` ... ```) across multiple lines.
 var reMDCodeBlock = regexp.MustCompile("(?s)```[^`]*```")
 
-// MarkdownToMrkdwn is a compatibility alias for the monolith naming.
+// MarkdownToMrkdwn is an alias for MarkdownToMarkdown.
 func MarkdownToMrkdwn(s string) string {
 	return MarkdownToMarkdown(s)
 }

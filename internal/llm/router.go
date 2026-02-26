@@ -295,8 +295,7 @@ func clip(s string, n int) string {
 }
 
 // stripCodeFences removes optional backtick fences (``` or ```json)
-// around a JSON payload.  It trims whitespace on both ends.  This
-// replicates the behavior from the monolithic helper.
+// around a JSON payload and trims surrounding whitespace.
 func stripCodeFences(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "```json")

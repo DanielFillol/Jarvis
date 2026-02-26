@@ -350,7 +350,7 @@ func jiraStripHTML(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// jiraClip trunca a string em n bytes, preservando o conteúdo útil.
+// jiraClip truncates s to at most n bytes, appending an ellipsis when truncated.
 func jiraClip(s string, n int) string {
 	if n <= 0 {
 		return ""
@@ -362,7 +362,7 @@ func jiraClip(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// preview trunca strings longas para mensagens de erro.
+// preview truncates long strings for use in error messages.
 func preview(s string, n int) string {
 	s = strings.TrimSpace(s)
 	if len(s) > n {

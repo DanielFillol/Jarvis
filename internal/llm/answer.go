@@ -94,8 +94,14 @@ Oi! Sou o *%s* :wave: — [1 frase direta e com personalidade descrevendo o que 
 :slack: *Slack*
 %s
 
-%s:speech_balloon: *Conversa livre*
-[2-3 exemplos de uso livre em itálico: resumir thread, tirar dúvida técnica, redigir texto]
+%s:paperclip: *Arquivos*
+• _"analise este relatório PDF"_ — lê e interpreta o conteúdo do documento
+• _"o que está nessa planilha?"_ — extrai dados de XLSX/DOCX
+• _"descreva a imagem anexada"_ — visão de IA para imagens (PNG, JPG, GIF, WEBP)
+• Formatos: PDF, DOCX, XLSX, TXT, JSON e imagens
+
+:speech_balloon: *Conversa livre*
+[2-3 exemplos de uso livre em itálico: resumir thread, tirar dúvida técnica, analisar arquivo ou redigir texto]
 
 > :robot_face: Modelo: *%s* — fallback: _%s_
 > Me chame com _@%s_ ou _jarvis:_ em qualquer canal :rocket:
@@ -146,10 +152,9 @@ func fixIntroTitles(s string) string {
 	return r.Replace(s)
 }
 
-// Compat aliases to keep parity with the monolith.
-// They allow other packages (or future refactors) to refer to the same
-// types names that existed before, without changing the new design.
-
+// OpenAIChatRequest and OpenAIChatResponse are exported aliases for the
+// internal request and response types, allowing external packages to
+// reference them without importing internal symbols directly.
 type OpenAIChatRequest = openAIChatRequest
 type OpenAIChatResponse = openAIChatResponse
 

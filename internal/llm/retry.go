@@ -9,14 +9,14 @@ import (
 	"time"
 )
 
-// CallOpenAIWithModel is a compatibility wrapper around Client.Chat.
-// It mirrors the old monolith naming, but uses the new Client.
+// CallOpenAIWithModel delegates to Client.Chat with the same signature.
+// It exists as a named alias for callers that want an explicit model parameter.
 func (c *Client) CallOpenAIWithModel(messages []OpenAIMessage, model string, temperature float64, maxTokens int) (string, error) {
 	return c.Chat(messages, model, temperature, maxTokens)
 }
 
-// AnswerWithModel is a compatibility wrapper around the internal answerWithModel.
-// Useful when you want to force a specific model (as in the monolith).
+// AnswerWithModel generates an answer using a specific model, bypassing the
+// primary/fallback selection in AnswerWithRetry.
 func (c *Client) AnswerWithModel(question, threadHistory, slackCtx, jiraCtx, model string) (string, error) {
 	return c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, "", nil, model)
 }

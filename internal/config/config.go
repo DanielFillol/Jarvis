@@ -44,8 +44,7 @@ type Config struct {
 // partially populated; validation should be performed by the caller.
 func Load() Config {
 	// Attempt to load .env if present; ignore errors since variables may
-	// already be set in the process environment.  This mirrors the
-	// behavior in the original monolith.
+	// already be set in the process environment.
 	_ = godotenv.Load()
 
 	cfg := Config{}
