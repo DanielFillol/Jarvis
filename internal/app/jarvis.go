@@ -114,8 +114,8 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		}
 	}
 	// 6) Decide Slack/Jira search (LLM)
-	// Resolve <#CHANID> → #channel-name so the router generates correct in:#channel filters.
-	questionForLLM := s.Slack.ResolveChannelMentions(parse.StripSlackPermalinks(question))
+	// Resolve <#CHANID> → #channel-name and <@USERID> → @username for the router and answer LLM.
+	questionForLLM := s.Slack.ResolveUserMentions(s.Slack.ResolveChannelMentions(parse.StripSlackPermalinks(question)))
 	decision, err := s.LLM.DecideRetrieval(questionForLLM, threadHist, s.Cfg.OpenAIModel, s.Cfg.JiraProjectKeys, senderUserID)
 	if err != nil {
 		log.Printf("[WARN] decideRetrieval failed: %v", err)
@@ -140,6 +140,10 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	var slackCtx string
 	var slackMatches int
 	if decision.NeedSlack && strings.TrimSpace(decision.SlackQuery) != "" && s.Cfg.SlackUserToken != "" {
+		// Capture any from:USERID filters before resolution; if users:read scope is
+		// missing, ResolveUserIDsInQuery strips them and we fall back to client-side
+		// filtering by user ID after the search.
+		unresolvedUserIDs := extractFromUserIDs(decision.SlackQuery)
 		// Resolve from:USERID → from:@username so Slack search filters correctly.
 		decision.SlackQuery = s.Slack.ResolveUserIDsInQuery(decision.SlackQuery)
 		log.Printf("[JARVIS] slackSearch query=%q", decision.SlackQuery)
@@ -147,9 +151,56 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		if err != nil {
 			log.Printf("[WARN] slack search failed: %v", err)
 		} else {
+			// If from:USERID filters were stripped (couldn't resolve username), filter
+			// client-side by user ID using the UserID field from the search results.
+			if len(unresolvedUserIDs) > 0 {
+				filtered := matches[:0]
+				for _, m := range matches {
+					for _, uid := range unresolvedUserIDs {
+						if m.UserID == uid {
+							filtered = append(filtered, m)
+							break
+						}
+					}
+				}
+				log.Printf("[JARVIS] clientSideUserFilter from=%v reduced %d→%d matches", unresolvedUserIDs, len(matches), len(filtered))
+				matches = filtered
+			}
 			slackMatches = len(matches)
 			slackCtx = buildSlackContext(matches, 25)
+			if slackMatches == 0 {
+				slackCtx = "[AVISO: A busca no Slack não retornou mensagens. NÃO invente conteúdo de canais ou mensagens. Informe ao usuário que não foram encontrados dados para a busca realizada e sugira alternativas.]"
+			}
 			log.Printf("[JARVIS] slackContext matches=%d chars=%d", slackMatches, len(slackCtx))
+		}
+	}
+	// 7b) Direct channel history fallback for unresolved <#CHANID> mentions.
+	// When channels:read is missing we can't resolve IDs to names for search,
+	// but conversations.history (channels:history scope) can fetch by ID directly.
+	if decision.NeedSlack {
+		if chanIDs := extractChannelIDsFromText(question); len(chanIDs) > 0 {
+			// Monday of current week as the oldest boundary.
+			now := time.Now()
+			weekday := int(now.Weekday())
+			if weekday == 0 {
+				weekday = 7
+			}
+			weekStart := now.AddDate(0, 0, -(weekday - 1)).Truncate(24 * time.Hour)
+			var directMsgs []slack.SlackSearchMessage
+			for _, cid := range chanIDs {
+				msgs, err := s.Slack.GetChannelHistoryForPeriod(cid, weekStart, now, 80)
+				if err != nil {
+					log.Printf("[JARVIS] channelHistory %s failed: %v", cid, err)
+					continue
+				}
+				log.Printf("[JARVIS] channelHistory %s messages=%d", cid, len(msgs))
+				directMsgs = append(directMsgs, msgs...)
+			}
+			if len(directMsgs) > 0 {
+				slackCtx = buildSlackContext(directMsgs, 40)
+				slackMatches = len(directMsgs)
+				log.Printf("[JARVIS] channelHistory total=%d chars=%d", slackMatches, len(slackCtx))
+			}
 		}
 	}
 	// 8) Jira context via JQL
@@ -862,6 +913,45 @@ var reHTML = regexp.MustCompile(`<[^>]+>`)
 var reSpaces = regexp.MustCompile(`\s+`)
 var reSplitOR = regexp.MustCompile(`(?i)\s+OR\s+`)
 var reLastAND = regexp.MustCompile(`(?i)^(.*)\s+AND\s+(.+)$`)
+var reChannelIDInText = regexp.MustCompile(`<#([CG][A-Z0-9]{8,})(?:\|[^>]*)?>`)
+var reFromUserIDQuery = regexp.MustCompile(`\bfrom:([UW][A-Z0-9]+)\b`)
+
+// extractFromUserIDs returns unique Slack user IDs referenced by from:USERID
+// filters in the query (e.g. "from:U067UM4LRGB" → ["U067UM4LRGB"]).
+func extractFromUserIDs(q string) []string {
+	ms := reFromUserIDQuery.FindAllStringSubmatch(q, -1)
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range ms {
+		if len(m) < 2 {
+			continue
+		}
+		if !seen[m[1]] {
+			seen[m[1]] = true
+			out = append(out, m[1])
+		}
+	}
+	return out
+}
+
+// extractChannelIDsFromText returns the unique channel IDs embedded in
+// Slack <#CHANID> mentions within text.
+func extractChannelIDsFromText(text string) []string {
+	matches := reChannelIDInText.FindAllStringSubmatch(text, -1)
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		id := m[1]
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
 
 func stripHTML(s string) string {
 	s = strings.ReplaceAll(s, "<br>", "\n")

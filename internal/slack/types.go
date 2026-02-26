@@ -64,6 +64,7 @@ type SlackSearchMessagesResp struct {
 			Channel   struct {
 				Name string `json:"name"`
 			} `json:"channel"`
+			User     string  `json:"user"`
 			Username string  `json:"username"`
 			Ts       string  `json:"ts"`
 			Score    float64 `json:"score"`
@@ -78,6 +79,7 @@ type SlackSearchMessage struct {
 	Text      string
 	Permalink string
 	Channel   string
+	UserID    string // Slack user ID, e.g. "U067UM4LRGB"
 	Username  string
 	Ts        string
 	Score     float64

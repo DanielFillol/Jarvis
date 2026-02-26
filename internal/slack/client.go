@@ -26,13 +26,15 @@ import (
 // Jarvis.  It encapsulates configuration details such as tokens and
 // signing secrets.
 type Client struct {
-	BotToken       string
-	UserToken      string
-	SigningSecret  string
-	SearchMaxPages int
-	BotUserID      string
-	APIBaseURL     string
-	HTTPClient     *http.Client
+	BotToken          string
+	UserToken         string
+	SigningSecret     string
+	SearchMaxPages    int
+	BotUserID         string
+	APIBaseURL        string
+	HTTPClient        *http.Client
+	UserTokenUserID   string // user ID of the xoxp token owner (populated by AuthTestUserToken)
+	UserTokenUsername string // username handle of the xoxp token owner
 }
 
 // NewClient constructs a Slack client from the supplied configuration.  The
@@ -228,6 +230,7 @@ func (c *Client) searchMessagesPages(query string) ([]SlackSearchMessage, error)
 				Text:      cleanSlackText(m.Text),
 				Permalink: m.Permalink,
 				Channel:   m.Channel.Name,
+				UserID:    m.User,
 				Username:  m.Username,
 				Ts:        m.Ts,
 				Score:     m.Score,
@@ -905,6 +908,29 @@ func (c *Client) GetChannelName(channelID string) string {
 	return ""
 }
 
+// ResolveUserMentions replaces <@USERID> and <@USERID|name> patterns in text
+// with @username. When the display name is already embedded after |, it is used
+// directly. Otherwise GetUsernameByID is called (which fast-paths via the cached
+// user token owner, avoiding the need for users:read scope in that case).
+func (c *Client) ResolveUserMentions(text string) string {
+	return reSlackUserMention.ReplaceAllStringFunc(text, func(m string) string {
+		sub := reSlackUserMention.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		id := sub[1]
+		name := strings.TrimSpace(sub[2])
+		if name != "" {
+			return "@" + name
+		}
+		username, err := c.GetUsernameByID(id)
+		if err != nil {
+			return m // keep original if can't resolve
+		}
+		return "@" + username
+	})
+}
+
 // ResolveChannelMentions replaces <#CHANID> and <#CHANID|name> patterns
 // in text with #channel-name, fetching the name from the Slack API when
 // the name is not embedded in the mention.  This allows the router LLM
@@ -929,12 +955,50 @@ func (c *Client) ResolveChannelMentions(text string) string {
 	})
 }
 
+// AuthTestUserToken calls Slack's auth.test API with the user token to retrieve
+// the user token owner's user ID and username handle (e.g. "user.name").
+// On success the UserTokenUserID and UserTokenUsername fields are updated.
+func (c *Client) AuthTestUserToken() (string, string, error) {
+	if c.UserToken == "" {
+		return "", "", errors.New("missing Slack user token")
+	}
+	req, _ := http.NewRequest("POST", c.apiBase()+"/auth.test", nil)
+	req.Header.Set("Authorization", "Bearer "+c.UserToken)
+	resp, err := c.do(req, 10*time.Second)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	var out struct {
+		OK     bool   `json:"ok"`
+		UserID string `json:"user_id"`
+		User   string `json:"user"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return "", "", err
+	}
+	if !out.OK {
+		return "", "", fmt.Errorf("auth.test (user token) error: %s", out.Error)
+	}
+	c.UserTokenUserID = out.UserID
+	c.UserTokenUsername = out.User
+	return out.UserID, out.User, nil
+}
+
 // GetUsernameByID calls users.info and returns the Slack "name" (handle)
-// e.g. "daniel.fillol". It prefers the user token when available.
+// e.g. "user.name". It prefers the user token when available.
 func (c *Client) GetUsernameByID(userID string) (string, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
 		return "", errors.New("empty user id")
+	}
+
+	// Fast path: if this is the user token owner, we already know the username
+	// without needing users:read scope.
+	if userID == c.UserTokenUserID && c.UserTokenUsername != "" {
+		return c.UserTokenUsername, nil
 	}
 
 	token := c.UserToken
@@ -977,6 +1041,88 @@ func (c *Client) GetUsernameByID(userID string) (string, error) {
 		return "", errors.New("users.info returned empty name")
 	}
 	return out.User.Name, nil
+}
+
+// GetChannelHistoryForPeriod fetches up to limit messages from a channel
+// between oldest and latest.  It requires channels:history (or groups:history)
+// scope.  The user token is tried first (broader public-channel access), then
+// the bot token.  The channel name in the returned messages is set to channelID
+// since we may not have channels:read to resolve it.
+func (c *Client) GetChannelHistoryForPeriod(channelID string, oldest, latest time.Time, limit int) ([]SlackSearchMessage, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	tokens := []string{}
+	if c.UserToken != "" {
+		tokens = append(tokens, c.UserToken)
+	}
+	if c.BotToken != "" {
+		tokens = append(tokens, c.BotToken)
+	}
+	if len(tokens) == 0 {
+		return nil, errors.New("missing Slack token")
+	}
+
+	oldestTs := fmt.Sprintf("%.6f", float64(oldest.UnixNano())/1e9)
+	latestTs := fmt.Sprintf("%.6f", float64(latest.UnixNano())/1e9)
+	u := fmt.Sprintf("%s/conversations.history?channel=%s&oldest=%s&latest=%s&limit=%d",
+		c.apiBase(), url.QueryEscape(channelID), oldestTs, latestTs, limit)
+
+	for _, token := range tokens {
+		req, _ := http.NewRequest("GET", u, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := c.do(req, 20*time.Second)
+		if err != nil {
+			continue
+		}
+		rb, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var data struct {
+			OK       bool   `json:"ok"`
+			Error    string `json:"error"`
+			Messages []struct {
+				Type    string `json:"type"`
+				Subtype string `json:"subtype,omitempty"`
+				User    string `json:"user,omitempty"`
+				Text    string `json:"text"`
+				Ts      string `json:"ts"`
+				BotID   string `json:"bot_id,omitempty"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(rb, &data); err != nil {
+			continue
+		}
+		if !data.OK {
+			log.Printf("[SLACK] GetChannelHistoryForPeriod %s: api error=%q", channelID, data.Error)
+			if data.Error == "missing_scope" || data.Error == "not_in_channel" {
+				continue // try next token
+			}
+			return nil, fmt.Errorf("conversations.history error: %s", data.Error)
+		}
+
+		var out []SlackSearchMessage
+		for _, m := range data.Messages {
+			if m.BotID != "" || m.Subtype != "" {
+				continue
+			}
+			txt := cleanSlackText(m.Text)
+			if txt == "" {
+				continue
+			}
+			out = append(out, SlackSearchMessage{
+				Text:     txt,
+				Channel:  channelID,
+				Username: m.User,
+				Ts:       m.Ts,
+			})
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("GetChannelHistoryForPeriod %s: no token succeeded (missing channels:history scope?)", channelID)
 }
 
 // ListChannels returns the public channels the bot is a member of (up to 200).
@@ -1044,9 +1190,12 @@ var reFromUserID = regexp.MustCompile(`\bfrom:([UW][A-Z0-9]+)\b`)
 
 // ResolveUserIDsInQuery replaces from:USERID tokens with from:@username so
 // that the Slack search API filters messages by the correct user.
-// Unresolvable IDs are left unchanged so the search still runs.
+// If the user ID cannot be resolved (e.g. missing users:read scope), the
+// from:USERID token is removed from the query — the Slack search API does not
+// understand raw user IDs as a from: filter, so leaving it would silently
+// break user filtering. The search runs more broadly in that case.
 func (c *Client) ResolveUserIDsInQuery(q string) string {
-	return reFromUserID.ReplaceAllStringFunc(q, func(match string) string {
+	result := reFromUserID.ReplaceAllStringFunc(q, func(match string) string {
 		sub := reFromUserID.FindStringSubmatch(match)
 		if len(sub) < 2 {
 			return match
@@ -1054,12 +1203,16 @@ func (c *Client) ResolveUserIDsInQuery(q string) string {
 		userID := sub[1]
 		name, err := c.GetUsernameByID(userID)
 		if err != nil {
-			log.Printf("[SLACK] ResolveUserIDsInQuery: could not resolve %s: %v", userID, err)
-			return match
+			log.Printf("[SLACK] ResolveUserIDsInQuery: could not resolve %s (add users:read scope to fix): %v", userID, err)
+			// Return empty string to remove the broken filter; the Slack search
+			// API ignores from:USERID and would return unfiltered results anyway.
+			return ""
 		}
 		log.Printf("[SLACK] resolved from:%s → from:@%s", userID, name)
 		return "from:@" + name
 	})
+	// Collapse any extra spaces left by removals.
+	return strings.Join(strings.Fields(result), " ")
 }
 
 func (c *Client) rewriteFromToUserIDs(q string) string {
@@ -1115,8 +1268,8 @@ func (c *Client) rewriteFromToUserIDs(q string) string {
 		if name := idToName[r.userID]; name != "" {
 			out = strings.ReplaceAll(out, r.full, fmt.Sprintf("%s:@%s", r.which, name))
 		} else {
-			// safe fallback: remove the invalid filter to avoid zeroing the search
-			out = strings.ReplaceAll(out, r.full, "")
+			// fallback: use <@USERID> format which Slack search accepts even without users:read scope
+			out = strings.ReplaceAll(out, r.full, fmt.Sprintf("%s:<@%s>", r.which, r.userID))
 		}
 	}
 

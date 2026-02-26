@@ -33,6 +33,12 @@ func main() {
 		slackClient.BotUserID = id
 		log.Printf("[SLACK] bot_user_id=%s", id)
 	}
+	// Identify user token owner so we can resolve their user ID without users:read scope
+	if uid, uname, err := slackClient.AuthTestUserToken(); err != nil {
+		log.Printf("[SLACK] auth.test (user token) failed: %v", err)
+	} else {
+		log.Printf("[SLACK] user_token_owner=%s username=%s", uid, uname)
+	}
 	// Create a pending store with 2-hour TTL
 	store := state.NewStore(2 * time.Hour)
 	// Construct core service

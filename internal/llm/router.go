@@ -268,9 +268,8 @@ func normalizeSlackQuery(q string) string {
 	q = reTo.ReplaceAllString(q, "to:$1")
 
 	// Strip unresolved channel ID filters: in:#C09H8S8A0VD
-	// These are raw Slack channel IDs (start with C/G, all uppercase alphanumeric, 9+ chars)
-	// that were never resolved to a human-readable name.  Slack search ignores them,
-	// producing 0 results; better to search without the in: filter.
+	// Raw Slack channel IDs are not supported in the in: search filter;
+	// keeping them returns 0 results. Better to search without channel filter.
 	reRawChannelFilter := regexp.MustCompile(`\bin:#[CG][A-Z0-9]{8,}\b`)
 	q = strings.TrimSpace(reRawChannelFilter.ReplaceAllString(q, ""))
 	// Also strip leftover <#CHANID> tokens the LLM might have included verbatim.

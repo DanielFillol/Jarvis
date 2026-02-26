@@ -193,6 +193,8 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, mod
 		"Responda em português brasileiro, direto, sem enrolação, usando o contexto quando existir.",
 		"Se o contexto não for suficiente, diga o que falta e sugira como achar (JQL/links).",
 		"Não invente fatos.",
+		"MENÇÕES DE USUÁRIOS SLACK: Ao mencionar um usuário pelo ID (ex: U067UM4LRGB), SEMPRE use o formato de mention <@USERID> (ex: <@U067UM4LRGB>). O Slack renderiza automaticamente como o nome de exibição. NUNCA escreva @U067UM4LRGB ou o ID puro — use sempre <@ID>.",
+		"CAPACIDADES: Você consegue ler e resumir threads do Slack quando o usuário fornece um link direto (permalink). Ao receber um link como https://empresa.slack.com/archives/CHANID/pTIMESTAMP, você recupera e resume o conteúdo da thread automaticamente. Nunca diga que não consegue acessar links de thread do Slack.",
 		"",
 		"FORMATAÇÃO — use Slack mrkdwn com variedade visual. Recursos disponíveis e quando usar cada um:",
 		"",
