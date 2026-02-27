@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,25 +13,23 @@ import (
 )
 
 // RetrievalDecision encodes the high-level retrieval routing decision
-// returned by the LLM. It indicates whether Slack and/or Jira
-// context should be fetched and contains any queries supplied by the
-// model.
+// returned by the LLM. It indicates whether Slack, Jira, and/or Metabase
+// context should be fetched and contains any queries supplied by the model.
 type RetrievalDecision struct {
-	NeedSlack  bool   `json:"need_slack"`
-	SlackQuery string `json:"slack_query"`
-	NeedJira   bool   `json:"need_jira"`
-	JiraIntent string `json:"jira_intent"`
-	JiraJQL    string `json:"jira_jql"`
+	NeedSlack          bool   `json:"need_slack"`
+	SlackQuery         string `json:"slack_query"`
+	NeedJira           bool   `json:"need_jira"`
+	JiraIntent         string `json:"jira_intent"`
+	JiraJQL            string `json:"jira_jql"`
+	NeedMetabase       bool   `json:"need_metabase"`
+	MetabaseDatabaseID int    `json:"metabase_database_id"`
 }
 
-// DecideRetrieval consults the language model to determine which
-// contexts (Slack, Jira) should be retrieved for a given question.
-// It passes a prompt describing the routing task along with the
-// recent thread history, the user's question and the list of
-// configured Jira project keys.  The returned JSON is unmarshalled
-// into a RetrievalDecision.  If the JSON is invalid or the API call
-// fails, a non-nil error is returned.
-func (c *Client) DecideRetrieval(question, threadHistory, model string, projectKeys []string, senderUserID string) (RetrievalDecision, error) {
+// DecideRetrieval consults the language model to determine which contexts
+// (Slack, Jira, Metabase) should be retrieved for a given question.
+// metabaseDatabases is a list of available Metabase databases formatted as
+// "ID: Name (engine)".  Pass an empty slice to disable Metabase routing.
+func (c *Client) DecideRetrieval(question, threadHistory, model string, projectKeys []string, senderUserID string, metabaseDatabases []string) (RetrievalDecision, error) {
 	projectsCtx := ""
 	if len(projectKeys) > 0 {
 		projectsCtx = fmt.Sprintf("\nProjetos Jira configurados: %s\n", strings.Join(projectKeys, ", "))
@@ -52,21 +51,34 @@ func (c *Client) DecideRetrieval(question, threadHistory, model string, projectK
 		monday.Format("2006-01-02"),
 	)
 
-	prompt := fmt.Sprintf(`Você é um roteador de contexto de um assistente Slack+Jira.
+	metabaseCtx := ""
+	if len(metabaseDatabases) > 0 {
+		metabaseCtx = fmt.Sprintf("\nBancos de dados Metabase disponíveis:\n- %s\n", strings.Join(metabaseDatabases, "\n- "))
+	}
+
+	metabaseJSON := ""
+	if len(metabaseDatabases) > 0 {
+		metabaseJSON = `
+  "need_metabase": true/false,
+  "metabase_database_id": <ID do banco acima ou 0>,`
+	}
+
+	prompt := fmt.Sprintf(`Você é um roteador de contexto de um assistente Slack+Jira+Metabase.
 Decida quais fontes buscar para responder a pergunta.
-%s%s%s
+%s%s%s%s
 Retorne APENAS JSON válido:
 {
   "need_slack": true/false,
   "slack_query": "...",
   "need_jira": true/false,
   "jira_intent": "listar_bugs_abertos|busca_texto|default",
-  "jira_jql": ""
+  "jira_jql": ""%s
 }
 
 Fontes disponíveis:
 - Jira: tickets, status, roadmap, bugs, histórias, épicos, progresso de tarefas.
 - Slack: discussões, decisões, links de threads, contexto operacional, conversas sobre um tema.
+- Metabase (banco de dados): métricas, contagens, totais, médias, relatórios de dados, KPIs, análises de negócio que requerem agregações SQL (ex: "quantos pedidos hoje?", "receita do mês", "top 10 clientes", "usuários ativos"). Use need_metabase=true apenas se a pergunta claramente necessita de dados do banco.
 
 Regras de roteamento:
 1. Roadmap, escopo, "o que foi feito", "está no ar", bugs abertos → need_jira=true.
@@ -75,6 +87,9 @@ Regras de roteamento:
 4. Se need_jira=true para pergunta substantiva (não apenas listagem de tickets), considere need_slack=true também — discussões no Slack enriquecem a resposta com contexto que o Jira não tem.
 5. Perguntas curtas (≤ 2 palavras) ou que já têm resposta no histórico da thread → need_slack=false, need_jira=false.
 6. Criar card no Jira → need_slack=false, need_jira=false.
+7. Se o histórico da thread mostra resultados de banco de dados (linhas como "Query executada (db=N):" ou "Resultado:") E o usuário pede para: executar/rodar a consulta, modificar um filtro, adicionar/remover uma condição, tentar com outro parâmetro, ou faz uma pergunta de follow-up sobre os mesmos dados (ex: "e dessas quantas têm rota?", "filtre por data X") → need_metabase=true com o metabase_database_id=N extraído da linha "Query executada (db=N):".
+8. Se o usuário pergunta sobre a query/SQL que o bot usou ("qual query você usou", "me da o SQL", "qual é a consulta", "que query é essa") → need_slack=false, need_jira=false, need_metabase=false (a resposta está no histórico da thread, não precisa de nova consulta).
+9. Perguntas de follow-up de dados no mesmo contexto (pronomes como "dessas", "desses", "deles", referindo a entidades já consultadas) → need_metabase=true com o mesmo database_id do turno anterior.
 
 Valores de jira_intent:
 - "listar_bugs_abertos": perguntas sobre bugs em aberto, falhas, erros.
@@ -113,7 +128,7 @@ Thread (contexto recente):
 
 Pergunta:
 %s
-`, projectsCtx, senderCtx, dateCtx, clip(threadHistory, 1200), question)
+`, projectsCtx, senderCtx, dateCtx, metabaseCtx, metabaseJSON, clip(threadHistory, 1200), question)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
 	// Use 4000 tokens: reasoning models (e.g. gpt-5-mini) consume invisible thinking
@@ -134,18 +149,24 @@ Pergunta:
 	d.JiraIntent = strings.TrimSpace(d.JiraIntent)
 	d.JiraJQL = strings.TrimSpace(d.JiraJQL)
 
+	// Disable Metabase if no databases were provided.
+	if len(metabaseDatabases) == 0 {
+		d.NeedMetabase = false
+		d.MetabaseDatabaseID = 0
+	}
+
 	// (3) normalize Slack query quirks
 	d.SlackQuery = normalizeSlackQuery(d.SlackQuery)
 
 	// (2) deterministic overrides
-	applyDeterministicOverrides(question, &d)
+	applyDeterministicOverrides(question, threadHistory, &d)
 
 	return d, nil
 }
 
 // applyDeterministicOverrides enforces deterministic routing rules that should
 // not depend on the LLM being perfect.
-func applyDeterministicOverrides(question string, d *RetrievalDecision) {
+func applyDeterministicOverrides(question, threadHistory string, d *RetrievalDecision) {
 	qLower := strings.ToLower(strings.TrimSpace(question))
 	if qLower == "" {
 		return
@@ -156,6 +177,18 @@ func applyDeterministicOverrides(question string, d *RetrievalDecision) {
 	// need_jira=false"). Using a heuristic override here caused context
 	// suppression on Q&A fallbacks when the create intent was rejected by
 	// ConfirmJiraCreateIntent in the create flow.
+
+	// 1. SQL re-execution/modification intent: if the thread has a prior
+	// Metabase result and the question looks like a modification or follow-up,
+	// force Metabase routing to the same database.
+	if !d.NeedMetabase {
+		if dbID := detectMetabaseFollowUp(qLower, threadHistory); dbID > 0 {
+			d.NeedMetabase = true
+			d.MetabaseDatabaseID = dbID
+			d.NeedSlack = false
+			d.SlackQuery = ""
+		}
+	}
 
 	// 2. Very short questions (≤ 2 words) are likely answered by thread history alone.
 	if len(strings.Fields(qLower)) <= 2 {
@@ -200,6 +233,46 @@ func applyDeterministicOverrides(question string, d *RetrievalDecision) {
 			d.SlackQuery = topic
 		}
 	}
+}
+
+// reMetabaseResult matches "Query executada (db=N):" or "Query tentada (db=N):"
+// in thread history, allowing the deterministic override to extract the db ID.
+var reMetabaseResult = regexp.MustCompile(`Query (?:executada|tentada) \(db=(\d+)\):`)
+
+// detectMetabaseFollowUp returns a positive database ID when the thread
+// contains a prior Metabase query result and the (lower-cased) question looks
+// like a SQL modification, re-execution, or data follow-up request.
+// Returns 0 when neither condition is met.
+func detectMetabaseFollowUp(qLower, threadHistory string) int {
+	if threadHistory == "" {
+		return 0
+	}
+	m := reMetabaseResult.FindStringSubmatch(threadHistory)
+	if m == nil {
+		return 0
+	}
+	dbID, _ := strconv.Atoi(m[1])
+	if dbID <= 0 {
+		return 0
+	}
+
+	// Explicit re-execution / modification keywords.
+	// These unambiguously mean "run/change the SQL query", so it is safe to
+	// force Metabase routing regardless of what other sources the LLM picked.
+	reExecKeywords := []string{
+		"execute", "executar", "rode", "rodar", "re-execute", "re-executar",
+		"tente", "tentar", "adicione", "adicionar", "remova", "remover",
+		"altere", "alterar", "mude", "mudar", "modifique", "modificar",
+		"filtre", "filtrar", "inclua", "incluir", "exclua", "excluir",
+		"mesma query", "mesma consulta", "a query", "o sql", "a consulta",
+	}
+	for _, kw := range reExecKeywords {
+		if strings.Contains(qLower, kw) {
+			return dbID
+		}
+	}
+
+	return 0
 }
 
 // ptStopWords is the set of Portuguese stopwords and intent verbs to strip

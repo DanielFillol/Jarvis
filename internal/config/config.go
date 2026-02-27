@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -35,6 +36,20 @@ type Config struct {
 	// BotName is the display name of the bot used in messages and prompts.
 	// Defaults to "Jarvis".  Set via BOT_NAME=MyBot.
 	BotName string
+	// Metabase connection settings.  Authentication uses an API key
+	// (Admin → Settings → Authentication → API Keys in Metabase ≥ 0.47).
+	MetabaseBaseURL string
+	MetabaseAPIKey  string
+	// MetabaseSchemaPath is the output path for the generated schema
+	// Markdown file.  Defaults to "./docs/metabase_schema.md".
+	MetabaseSchemaPath string
+	// MetabaseEnv is a free-form label included in the generated file
+	// header (e.g. "production", "staging").  Defaults to "production".
+	MetabaseEnv string
+	// MetabaseQueryTimeout is the HTTP timeout for SQL execution via
+	// /api/dataset.  Analytical databases like Redshift can be slow.
+	// Defaults to 5 minutes.  Set via METABASE_QUERY_TIMEOUT=300s.
+	MetabaseQueryTimeout time.Duration
 }
 
 // Load reads configuration from environment variables.  If a .env file
@@ -62,6 +77,15 @@ func Load() Config {
 	cfg.JiraProjectKeys = parseCSV(getEnv("JIRA_PROJECT_KEYS", ""))
 	cfg.JiraProjectNameMap = parseProjectNameMap(os.Getenv("JIRA_PROJECT_NAME_MAP"))
 	cfg.BotName = getEnv("BOT_NAME", "Jarvis")
+	cfg.MetabaseBaseURL = os.Getenv("METABASE_BASE_URL")
+	cfg.MetabaseAPIKey = os.Getenv("METABASE_API_KEY")
+	cfg.MetabaseSchemaPath = getEnv("METABASE_SCHEMA_PATH", "./docs/metabase_schema.md")
+	cfg.MetabaseEnv = getEnv("METABASE_ENV", "production")
+	if qt, err := time.ParseDuration(getEnv("METABASE_QUERY_TIMEOUT", "5m")); err == nil {
+		cfg.MetabaseQueryTimeout = qt
+	} else {
+		cfg.MetabaseQueryTimeout = 5 * time.Minute
+	}
 	pages := getEnv("SLACK_SEARCH_MAX_PAGES", "10")
 	if n, err := strconv.Atoi(pages); err == nil {
 		cfg.SlackSearchMaxPages = n

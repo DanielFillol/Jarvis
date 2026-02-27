@@ -11,10 +11,64 @@ import (
 	httpinternal "github.com/DanielFillol/Jarvis/internal/http"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
+	"github.com/DanielFillol/Jarvis/internal/metabase"
 	"github.com/DanielFillol/Jarvis/internal/parse"
 	"github.com/DanielFillol/Jarvis/internal/slack"
 	"github.com/DanielFillol/Jarvis/internal/state"
 )
+
+// initMetabase creates the Metabase client, lists available databases and
+// saved questions, discovers accessible schemas per database, and starts
+// schema generation in the background.
+// Returns a nil client when Metabase is not configured or credentials are missing.
+func initMetabase(cfg config.Config) (*metabase.Client, []metabase.Database, []metabase.Card, map[int][]string) {
+	if cfg.MetabaseBaseURL == "" || cfg.MetabaseAPIKey == "" {
+		log.Printf("[METABASE] not configured — set METABASE_BASE_URL + METABASE_API_KEY to enable")
+		return nil, nil, nil, nil
+	}
+
+	client := metabase.NewClientAPIKey(cfg.MetabaseBaseURL, cfg.MetabaseAPIKey, cfg.MetabaseQueryTimeout)
+
+	dbs, err := client.ListDatabases()
+	if err != nil {
+		log.Printf("[METABASE] ListDatabases failed: %v — Metabase integration disabled", err)
+		return nil, nil, nil, nil
+	}
+	for _, db := range dbs {
+		log.Printf("[METABASE] database id=%d name=%q engine=%s", db.ID, db.Name, db.Engine)
+	}
+
+	// Discover which schemas are actually queryable per database so we can
+	// filter the compact schema and prevent the LLM from using phantom schemas.
+	accessibleSchemas := make(map[int][]string)
+	for _, db := range dbs {
+		schemas, err := client.ListAccessibleSchemas(db.ID)
+		if err != nil {
+			log.Printf("[METABASE] ListAccessibleSchemas db=%d failed: %v — schema filtering disabled for this db", db.ID, err)
+			continue
+		}
+		accessibleSchemas[db.ID] = schemas
+		log.Printf("[METABASE] db=%d accessible schemas: %v", db.ID, schemas)
+	}
+
+	// Load saved questions (cards) for use as SQL examples during query generation.
+	// The list endpoint returns names/IDs only; individual card SQL is fetched on demand.
+	cards, err := client.ListCards()
+	if err != nil {
+		log.Printf("[METABASE] ListCards failed: %v — saved questions will not be used as examples", err)
+	} else {
+		log.Printf("[METABASE] loaded %d saved questions for keyword matching (SQL fetched on demand)", len(cards))
+	}
+
+	// Generate schema documentation asynchronously so startup is not blocked.
+	go func() {
+		if err := metabase.GenerateSchemaDoc(client, cfg.MetabaseSchemaPath, cfg.MetabaseEnv); err != nil {
+			log.Printf("[METABASE] schema generation failed: %v", err)
+		}
+	}()
+
+	return client, dbs, cards, accessibleSchemas
+}
 
 func main() {
 	// Load configuration (from .env and environment)
@@ -39,10 +93,12 @@ func main() {
 	} else {
 		log.Printf("[SLACK] user_token_owner=%s username=%s", uid, uname)
 	}
+	// Initialize Metabase (creates client, lists databases, discovers schemas, loads saved questions, starts async schema generation).
+	metabaseClient, metabaseDatabases, metabaseCards, metabaseAccessibleSchemas := initMetabase(cfg)
 	// Create a pending store with 2-hour TTL
 	store := state.NewStore(2 * time.Hour)
 	// Construct core service
-	service := app.NewService(cfg, slackClient, jiraClient, llmClient, store)
+	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, metabaseDatabases, metabaseCards, metabaseAccessibleSchemas, store)
 	// Register HTTP handlers
 	mux := http.NewServeMux()
 	// Health check endpoint

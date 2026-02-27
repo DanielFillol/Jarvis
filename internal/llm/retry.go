@@ -18,14 +18,14 @@ func (c *Client) CallOpenAIWithModel(messages []OpenAIMessage, model string, tem
 // AnswerWithModel generates an answer using a specific model, bypassing the
 // primary/fallback selection in AnswerWithRetry.
 func (c *Client) AnswerWithModel(question, threadHistory, slackCtx, jiraCtx, model string) (string, error) {
-	return c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, "", nil, model)
+	return c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, "", "", nil, model)
 }
 
 // AnswerWithRetry attempts to answer using primaryModel, retrying transient failures,
 // then falls back to fallbackModel (also with retries). This restores the monolith behavior
 // where the LLM call was resilient to flaky networking / 429 / 5xx.
 func (c *Client) AnswerWithRetry(
-	question, threadHistory, slackCtx, jiraCtx, fileCtx string,
+	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx string,
 	images []ImageAttachment,
 	primaryModel, fallbackModel string,
 	maxAttempts int,
@@ -39,14 +39,14 @@ func (c *Client) AnswerWithRetry(
 	}
 
 	// Try primary first.
-	out, err := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, fileCtx, images, primaryModel, maxAttempts, baseDelay)
+	out, err := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, images, primaryModel, maxAttempts, baseDelay)
 	if err == nil && strings.TrimSpace(out) != "" {
 		return out, nil
 	}
 
 	// Fall back if configured and different.
 	if fallbackModel != "" && fallbackModel != primaryModel {
-		out2, err2 := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, fileCtx, images, fallbackModel, maxAttempts, baseDelay)
+		out2, err2 := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, images, fallbackModel, maxAttempts, baseDelay)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
 			return out2, nil
 		}
@@ -63,7 +63,7 @@ func (c *Client) AnswerWithRetry(
 }
 
 func (c *Client) answerWithRetrySingleModel(
-	question, threadHistory, slackCtx, jiraCtx, fileCtx string,
+	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx string,
 	images []ImageAttachment,
 	model string,
 	maxAttempts int,
@@ -71,7 +71,7 @@ func (c *Client) answerWithRetrySingleModel(
 ) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, fileCtx, images, model)
+		out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, images, model)
 		if err == nil && strings.TrimSpace(out) != "" {
 			return out, nil
 		}

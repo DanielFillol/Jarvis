@@ -182,11 +182,18 @@ func (c *Client) chatWithTemperature(messages []OpenAIMessage, model string, tem
 }
 
 // ConfirmJiraCreateIntent calls the LLM to verify whether the message
-// genuinely intends to create a Jira card.  It tries the fallback model first
-// (cheaper/faster) and falls back to the primary model on failure.
+// genuinely intends to create a Jira card.  threadHistory provides prior
+// conversation context so the LLM can distinguish commands like "crie com
+// base nessa discussão" from hypothetical or contextual mentions of creation.
+// It tries the fallback model first (cheaper/faster) and falls back to the
+// primary model on failure.
 // Returns true only when the LLM explicitly confirms creation intent.
 // On any error, returns false to avoid creating unwanted cards.
-func (c *Client) ConfirmJiraCreateIntent(question, fallbackModel, primaryModel string) bool {
+func (c *Client) ConfirmJiraCreateIntent(question, threadHistory, fallbackModel, primaryModel string) bool {
+	threadSection := ""
+	if t := strings.TrimSpace(threadHistory); t != "" {
+		threadSection = fmt.Sprintf("\nContexto da conversa (use para entender se o pedido é imediato ou hipotético):\n%s\n", clip(t, 2000))
+	}
 	prompt := fmt.Sprintf(`Você é um classificador de intenção. O usuário enviou a mensagem abaixo.
 Ele quer criar um novo card/issue/ticket no Jira AGORA, neste momento?
 
@@ -202,8 +209,8 @@ Responda "não" em todos os outros casos, incluindo:
 - Pede para buscar, resumir, analisar ou verificar algo
 - Menciona criar um relatório, reporte ou documento
 - Contém negação: "não é pra criar", "não quero criar"
-
-Mensagem: %q`, question)
+%s
+Mensagem: %q`, threadSection, question)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
 

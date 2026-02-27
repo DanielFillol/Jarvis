@@ -159,18 +159,18 @@ type OpenAIChatRequest = openAIChatRequest
 type OpenAIChatResponse = openAIChatResponse
 
 // Answer generates an answer to the user's question using the language
-// model.  It passes the thread history and any additional Slack or
-// Jira context to the model as part of the prompt.  primaryModel
-// designates the preferred model; fallbackModel is used if the
-// primary fails or returns an empty response.  The returned answer
-// uses Slack Markdown formatting.
-func (c *Client) Answer(question, threadHistory, slackCtx, jiraCtx, fileCtx string, images []ImageAttachment, primaryModel, fallbackModel string) (string, error) {
-	out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, fileCtx, images, primaryModel)
+// model.  It passes the thread history and any additional Slack, Jira,
+// database, or file context to the model as part of the prompt.
+// primaryModel designates the preferred model; fallbackModel is used if the
+// primary fails or returns an empty response.  The returned answer uses
+// Slack Markdown formatting.
+func (c *Client) Answer(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx string, images []ImageAttachment, primaryModel, fallbackModel string) (string, error) {
+	out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, images, primaryModel)
 	if err == nil && strings.TrimSpace(out) != "" {
 		return out, nil
 	}
 	if fallbackModel != "" && fallbackModel != primaryModel {
-		out2, err2 := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, fileCtx, images, fallbackModel)
+		out2, err2 := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, images, fallbackModel)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
 			return out2, nil
 		}
@@ -188,7 +188,7 @@ func (c *Client) Answer(question, threadHistory, slackCtx, jiraCtx, fileCtx stri
 // answerWithModel assembles the prompt and calls the Chat API with the
 // specified model.  It converts Markdown into Slack Markdown before
 // returning the result.
-func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, fileCtx string, images []ImageAttachment, model string) (string, error) {
+func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx string, images []ImageAttachment, model string) (string, error) {
 	botName := c.BotName
 	if strings.TrimSpace(botName) == "" {
 		botName = "Jarvis"
@@ -243,6 +243,11 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, fil
 	if jiraCtx != "" {
 		u.WriteString("CONTEXTO DO JIRA:\n")
 		u.WriteString(jiraCtx)
+		u.WriteString("\n\n")
+	}
+	if dbCtx != "" {
+		u.WriteString("DADOS DO BANCO DE DADOS (resultado de query SQL):\n")
+		u.WriteString(dbCtx)
 		u.WriteString("\n\n")
 	}
 	if fileCtx != "" {

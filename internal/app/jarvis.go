@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/config"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
+	"github.com/DanielFillol/Jarvis/internal/metabase"
 	"github.com/DanielFillol/Jarvis/internal/parse"
 	"github.com/DanielFillol/Jarvis/internal/slack"
 	"github.com/DanielFillol/Jarvis/internal/state"
@@ -25,27 +27,36 @@ import (
 )
 
 // Service encapsulates the core orchestration logic of Jarvis.  It
-// coordinates between Slack, Jira and the language model to answer
-// questions and handle issue creation flows.  The Service does not
-// depend on net/http and is therefore easily testable.
+// coordinates between Slack, Jira, Metabase and the language model to answer
+// questions and handle issue creation flows.  The Service does not depend on
+// net/http and is therefore easily testable.
 type Service struct {
-	Slack   *slack.Client
-	Jira    *jira.Client
-	LLM     *llm.Client
-	Store   *state.Store
-	Tracker *state.MessageTracker
-	Cfg     config.Config
+	Slack                     *slack.Client
+	Jira                      *jira.Client
+	LLM                       *llm.Client
+	Metabase                  *metabase.Client    // nil when Metabase is not configured
+	MetabaseDatabases         []metabase.Database // available databases for routing
+	MetabaseCards             []metabase.Card     // saved questions used as SQL examples
+	MetabaseAccessibleSchemas map[int][]string    // db_id → schemas actually queryable
+	Store                     *state.Store
+	Tracker                   *state.MessageTracker
+	Cfg                       config.Config
 }
 
 // NewService constructs a new Jarvis service from its dependencies.
-func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, store *state.Store) *Service {
+// metabaseClient may be nil when Metabase integration is not configured.
+func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, metabaseClient *metabase.Client, metabaseDatabases []metabase.Database, metabaseCards []metabase.Card, metabaseAccessibleSchemas map[int][]string, store *state.Store) *Service {
 	return &Service{
-		Slack:   slackClient,
-		Jira:    jiraClient,
-		LLM:     llmClient,
-		Store:   store,
-		Tracker: state.NewMessageTracker(),
-		Cfg:     cfg,
+		Slack:                     slackClient,
+		Jira:                      jiraClient,
+		LLM:                       llmClient,
+		Metabase:                  metabaseClient,
+		MetabaseDatabases:         metabaseDatabases,
+		MetabaseCards:             metabaseCards,
+		MetabaseAccessibleSchemas: metabaseAccessibleSchemas,
+		Store:                     store,
+		Tracker:                   state.NewMessageTracker(),
+		Cfg:                       cfg,
 	}
 }
 
@@ -122,7 +133,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// 6) Decide Slack/Jira search (LLM)
 	// Resolve <#CHANID> → #channel-name and <@USERID> → @username for the router and answer LLM.
 	questionForLLM := s.Slack.ResolveUserMentions(s.Slack.ResolveChannelMentions(parse.StripSlackPermalinks(question)))
-	decision, err := s.LLM.DecideRetrieval(questionForLLM, threadHist, s.Cfg.OpenAIModel, s.Cfg.JiraProjectKeys, senderUserID)
+	decision, err := s.LLM.DecideRetrieval(questionForLLM, threadHist, s.Cfg.OpenAIModel, s.Cfg.JiraProjectKeys, senderUserID, s.formattedMetabaseDatabases())
 	if err != nil {
 		log.Printf("[WARN] decideRetrieval failed: %v", err)
 		if hasThreadPermalink {
@@ -232,7 +243,17 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	if finalJiraCtx == "" {
 		finalJiraCtx = jiraCtx
 	}
-	// 9) File context from attachments
+	// 9) Metabase database query
+	var dbCtx string
+	if decision.NeedMetabase && s.Metabase != nil {
+		dbCtx = s.runMetabaseQuery(questionForLLM, threadHist, decision.MetabaseDatabaseID)
+		if dbCtx == "" {
+			// Query was attempted but failed (timeout, SQL error, etc.).
+			// Inject an explicit warning so the LLM does not invent data.
+			dbCtx = "[ERRO: A consulta ao banco de dados falhou ou não retornou dados. NÃO invente métricas, nomes ou valores. Informe ao usuário que não foi possível obter os dados neste momento e sugira tentar novamente.]"
+		}
+	}
+	// 10) File context from attachments
 	fileCtx := s.buildFileContext(files)
 	if fileCtx != "" {
 		log.Printf("[JARVIS] fileContext files=%d chars=%d", len(files), len(fileCtx))
@@ -241,8 +262,8 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	if len(images) > 0 {
 		log.Printf("[JARVIS] imageAttachments count=%d", len(images))
 	}
-	// 10) Answer with LLM (with retry for transient errors)
-	answer, err := s.LLM.AnswerWithRetry(questionForLLM, threadHist, slackCtx, finalJiraCtx, fileCtx, images, s.Cfg.OpenAIModel, s.Cfg.OpenAIFallbackModel, 2, 0)
+	// 11) Answer with LLM (with retry for transient errors)
+	answer, err := s.LLM.AnswerWithRetry(questionForLLM, threadHist, slackCtx, finalJiraCtx, dbCtx, fileCtx, images, s.Cfg.OpenAIModel, s.Cfg.OpenAIFallbackModel, 2, 0)
 	if err != nil || strings.TrimSpace(answer) == "" {
 		log.Printf("[ERR] llmAnswer failed: %v", err)
 		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, (jiraIssueCtx != "" || decision.NeedJira), jiraIssuesFound, issueKey)
@@ -302,7 +323,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 	// 2) Natural language creation: "crie um card...", "crie essa história no JIRA", etc.
 	// The heuristic is a fast pre-filter; the LLM confirms to avoid false positives.
 	if strings.Contains(low, "crie um card") || strings.Contains(low, "criar um card") || parse.LooksLikeJiraCreateIntent(low) {
-		if !s.LLM.ConfirmJiraCreateIntent(q, s.Cfg.OpenAIFallbackModel, s.Cfg.OpenAIModel) {
+		if !s.LLM.ConfirmJiraCreateIntent(q, threadHist, s.Cfg.OpenAIFallbackModel, s.Cfg.OpenAIModel) {
 			log.Printf("[JARVIS] LLM rejected create intent — falling through to Q&A")
 			return false, nil
 		}
@@ -353,7 +374,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		return true, s.createIssueAndReply(channel, threadTs, d)
 	}
 	// 3) Thread-based creation: "com base nessa thread crie um card..."
-	if parse.IsThreadBasedCreate(q) && s.LLM.ConfirmJiraCreateIntent(q, s.Cfg.OpenAIFallbackModel, s.Cfg.OpenAIModel) {
+	if parse.IsThreadBasedCreate(q) && s.LLM.ConfirmJiraCreateIntent(q, threadHist, s.Cfg.OpenAIFallbackModel, s.Cfg.OpenAIModel) {
 		// 3a) Multi-card variant: "crie dois cards", "um sobre X e outro Y"
 		if parse.IsMultiCardCreate(q) {
 			drafts, derr := s.LLM.ExtractMultipleIssuesFromThread(threadHist, q, s.Cfg.OpenAIModel, s.Cfg.JiraProjectNameMap)
@@ -1449,4 +1470,286 @@ Aqui está o que posso fazer por você:
 • Use o prefixo _jarvis:_ no início da mensagem
 
 Pode perguntar à vontade! 🚀`, botName, projCtx, createSection, botName)
+}
+
+// formattedMetabaseDatabases returns the available Metabase databases formatted
+// as ["1: Production DB (postgres)", ...] for injection into the router prompt.
+// Returns nil when Metabase is not configured.
+func (s *Service) formattedMetabaseDatabases() []string {
+	if s.Metabase == nil || len(s.MetabaseDatabases) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(s.MetabaseDatabases))
+	for _, db := range s.MetabaseDatabases {
+		engine := db.Engine
+		if engine == "" {
+			engine = "unknown"
+		}
+		out = append(out, fmt.Sprintf("%d: %s (%s)", db.ID, db.Name, engine))
+	}
+	return out
+}
+
+// extractLastExecutedSQL parses thread history produced by runMetabaseQuery
+// and returns the SQL from the most recent "Query executada (db=N):" or
+// "Query tentada (db=N):" block.  Returns an empty string when not found.
+// This is used to give the LLM a concrete starting point for follow-up
+// queries, preventing it from silently dropping date or entity filters.
+func extractLastExecutedSQL(threadHistory string) string {
+	re := regexp.MustCompile("(?s)Query (?:executada|tentada) \\(db=\\d+\\):\n```sql\n(.*?)\n```")
+	matches := re.FindAllStringSubmatch(threadHistory, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(matches[len(matches)-1][1])
+}
+
+// lookupDatabaseEngine returns the engine string (e.g. "redshift", "postgres")
+// for the given Metabase database ID, or an empty string when not found.
+func (s *Service) lookupDatabaseEngine(databaseID int) string {
+	for _, db := range s.MetabaseDatabases {
+		if db.ID == databaseID {
+			return db.Engine
+		}
+	}
+	return ""
+}
+
+// relevantCards returns up to limit saved Metabase questions whose names share
+// the most keywords with the user's question.  Cards with no native SQL, or
+// belonging to a different database (when databaseID > 0), are excluded.
+func (s *Service) relevantCards(question string, databaseID int, limit int) []metabase.Card {
+	tokens := tokenize(question)
+	if len(tokens) == 0 || len(s.MetabaseCards) == 0 {
+		return nil
+	}
+
+	type scored struct {
+		card  metabase.Card
+		score int
+	}
+	var candidates []scored
+	for _, c := range s.MetabaseCards {
+		if c.NativeSQL() == "" {
+			continue
+		}
+		if databaseID > 0 && c.DatabaseID != databaseID {
+			continue
+		}
+		score := 0
+		for _, t := range tokenize(c.Name) {
+			for _, qt := range tokens {
+				if t == qt {
+					score++
+				}
+			}
+		}
+		if score > 0 {
+			candidates = append(candidates, scored{c, score})
+		}
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	out := make([]metabase.Card, len(candidates))
+	for i, sc := range candidates {
+		out[i] = sc.card
+	}
+	return out
+}
+
+// tokenize splits s into lowercase words, stripping punctuation.
+func tokenize(s string) []string {
+	s = strings.ToLower(s)
+	var tokens []string
+	for _, word := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\n' || r == '?' || r == '!' || r == ',' || r == '.' || r == ';' || r == ':' || r == '"' || r == '\''
+	}) {
+		if len(word) > 2 { // skip very short words (de, do, da, a, o, …)
+			tokens = append(tokens, word)
+		}
+	}
+	return tokens
+}
+
+// filterCompactSchemaByAccessible removes table entries whose schema prefix is
+// not in the accessible set.  Header lines and blank lines are always kept.
+// For table entries without a schema prefix the schema defaults to "public".
+func filterCompactSchemaByAccessible(schemaDoc string, accessible []string) string {
+	if len(accessible) == 0 {
+		return schemaDoc
+	}
+	allowed := make(map[string]bool, len(accessible))
+	for _, s := range accessible {
+		allowed[s] = true
+	}
+
+	var sb strings.Builder
+	for _, line := range strings.Split(schemaDoc, "\n") {
+		if strings.HasPrefix(line, "- ") {
+			rest := line[2:]
+			colonIdx := strings.Index(rest, ":")
+			if colonIdx > 0 {
+				tableRef := rest[:colonIdx]
+				dotIdx := strings.Index(tableRef, ".")
+				schema := "public"
+				if dotIdx > 0 {
+					schema = tableRef[:dotIdx]
+				}
+				if !allowed[schema] {
+					continue // drop this table
+				}
+			}
+		}
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+	}
+	return sb.String()
+}
+
+// buildCardExamples formats relevant saved questions as an examples section
+// for injection into the SQL generation prompt.
+func buildCardExamples(cards []metabase.Card) string {
+	if len(cards) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("PERGUNTAS SALVAS NO METABASE (use como referência de tabelas e estrutura SQL — adapte conforme a pergunta do usuário):\n")
+	for i, c := range cards {
+		sql := strings.TrimSpace(c.NativeSQL())
+		// Truncate very long queries to keep the prompt focused.
+		if len(sql) > 1200 {
+			sql = sql[:1200] + "\n-- (truncado)"
+		}
+		sb.WriteString(fmt.Sprintf("\n%d. \"%s\" (db=%d):\n```sql\n%s\n```\n", i+1, c.Name, c.DatabaseID, sql))
+	}
+	return sb.String()
+}
+
+// runMetabaseQuery generates a SQL query via the LLM and executes it against
+// the Metabase database identified by databaseID.  threadHistory provides
+// conversational context so the LLM can resolve pronouns and references from
+// prior turns (e.g. "ela" → "Multilixo").  Errors are logged and an empty
+// string is returned when any step fails, so the caller can degrade gracefully.
+func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID int) string {
+	if databaseID <= 0 {
+		// Router didn't pick a database; try the first available one.
+		if len(s.MetabaseDatabases) == 0 {
+			log.Printf("[METABASE] runMetabaseQuery: no databases available")
+			return ""
+		}
+		databaseID = s.MetabaseDatabases[0].ID
+		log.Printf("[METABASE] runMetabaseQuery: no db_id from router, defaulting to db=%d", databaseID)
+	}
+
+	// Load the compact schema first (much smaller — better LLM coverage).
+	// Fall back to the full schema when the compact file is not available.
+	schemaPath := s.Cfg.MetabaseSchemaPath
+	if schemaPath == "" {
+		schemaPath = "./docs/metabase_schema.md"
+	}
+	compactPath := metabase.CompactSchemaPath(schemaPath)
+	schemaDoc := ""
+	if b, readErr := os.ReadFile(compactPath); readErr == nil {
+		schemaDoc = string(b)
+		log.Printf("[METABASE] runMetabaseQuery: using compact schema %q (%d bytes)", compactPath, len(schemaDoc))
+	} else if b, readErr2 := os.ReadFile(schemaPath); readErr2 == nil {
+		schemaDoc = string(b)
+		log.Printf("[METABASE] runMetabaseQuery: compact schema not found, using full schema %q (%d bytes)", schemaPath, len(schemaDoc))
+	} else {
+		log.Printf("[METABASE] runMetabaseQuery: could not read schema file %q: %v", schemaPath, readErr2)
+		return ""
+	}
+
+	// Filter the schema to only tables in schemas that are actually queryable,
+	// preventing the LLM from writing SQL with phantom schema names.
+	if schemas, ok := s.MetabaseAccessibleSchemas[databaseID]; ok && len(schemas) > 0 {
+		filtered := filterCompactSchemaByAccessible(schemaDoc, schemas)
+		log.Printf("[METABASE] runMetabaseQuery: schema filtered %d→%d bytes (accessible schemas: %v)", len(schemaDoc), len(filtered), schemas)
+		schemaDoc = filtered
+	}
+
+	// Find saved Metabase questions related to this query and inject them as
+	// SQL examples so the LLM can use validated table/column names directly.
+	// The list endpoint omits dataset_query, so we fetch individual cards for
+	// the small set of keyword matches to get their native SQL.
+	relCards := s.relevantCards(question, databaseID, 5)
+	if len(relCards) > 0 {
+		names := make([]string, len(relCards))
+		for i, rc := range relCards {
+			names[i] = fmt.Sprintf("%q", rc.Name)
+		}
+		log.Printf("[METABASE] runMetabaseQuery: keyword matched %d card(s): %s", len(relCards), strings.Join(names, ", "))
+
+		// Fetch full card details to get native SQL (list endpoint omits it).
+		for i, rc := range relCards {
+			if rc.NativeSQL() != "" {
+				continue // already have SQL (unlikely from list, but safe)
+			}
+			full, err := s.Metabase.GetCard(rc.ID)
+			if err != nil {
+				log.Printf("[METABASE] GetCard(%d) failed: %v", rc.ID, err)
+				continue
+			}
+			relCards[i] = full
+		}
+
+		// Keep only cards that have retrievable native SQL.
+		withSQL := relCards[:0]
+		for _, rc := range relCards {
+			if rc.NativeSQL() != "" {
+				withSQL = append(withSQL, rc)
+			}
+		}
+		relCards = withSQL
+		if len(relCards) > 0 {
+			log.Printf("[METABASE] runMetabaseQuery: using %d card(s) with SQL as examples", len(relCards))
+		} else {
+			log.Printf("[METABASE] runMetabaseQuery: matched cards have no native SQL — proceeding schema-only")
+		}
+	}
+	examples := buildCardExamples(relCards)
+
+	// Extract the last executed SQL from the thread so follow-up questions can
+	// use it as a base, preserving existing filters (especially date filters).
+	baseSQL := extractLastExecutedSQL(threadHistory)
+	if baseSQL != "" {
+		log.Printf("[METABASE] runMetabaseQuery: base SQL found in thread (%d chars)", len(baseSQL))
+	}
+
+	// Ask the LLM to write the SQL.  Pass thread history so the model can
+	// resolve pronouns and entities mentioned in earlier turns.
+	engineType := s.lookupDatabaseEngine(databaseID)
+	sql, err := s.LLM.GenerateSQL(question, threadHistory, schemaDoc, examples, baseSQL, databaseID, engineType, s.Cfg.OpenAIModel)
+	if err != nil {
+		log.Printf("[METABASE] runMetabaseQuery: GenerateSQL failed: %v", err)
+		return ""
+	}
+	if strings.TrimSpace(sql) == "" {
+		log.Printf("[METABASE] runMetabaseQuery: LLM could not generate SQL for question=%q", clip(question, 120))
+		return ""
+	}
+
+	// Execute the query.
+	result, err := s.Metabase.RunQuery(databaseID, sql)
+	if err != nil {
+		log.Printf("[METABASE] runMetabaseQuery: RunQuery failed: %v", err)
+		// Return the generated SQL even on failure so the user can inspect or
+		// correct it, and so follow-up questions ("qual a query que você escreveu?")
+		// can be answered correctly from the thread context.
+		return fmt.Sprintf("[ERRO: A consulta ao banco de dados falhou: %v]\n\nQuery tentada (db=%d):\n```sql\n%s\n```", err, databaseID, sql)
+	}
+
+	formatted := metabase.FormatQueryResult(result, 100)
+	log.Printf("[METABASE] runMetabaseQuery: db=%d rows=%d chars=%d", databaseID, len(result.Data.Rows), len(formatted))
+
+	// Include the SQL and db ID so the LLM can reference both when composing
+	// the answer, and the router can extract the db ID from thread history for
+	// follow-up re-execution requests.
+	return fmt.Sprintf("Query executada (db=%d):\n```sql\n%s\n```\n\nResultado:\n%s", databaseID, sql, formatted)
 }
