@@ -87,7 +87,7 @@ Regras de roteamento:
 4. Se need_jira=true para pergunta substantiva (não apenas listagem de tickets), considere need_slack=true também — discussões no Slack enriquecem a resposta com contexto que o Jira não tem.
 5. Perguntas curtas (≤ 2 palavras) ou que já têm resposta no histórico da thread → need_slack=false, need_jira=false.
 6. Criar card no Jira → need_slack=false, need_jira=false.
-7. Se o histórico da thread mostra resultados de banco de dados (linhas como "Query executada (db=N):" ou "Resultado:") E o usuário pede para: executar/rodar a consulta, modificar um filtro, adicionar/remover uma condição, tentar com outro parâmetro, ou faz uma pergunta de follow-up sobre os mesmos dados (ex: "e dessas quantas têm rota?", "filtre por data X") → need_metabase=true com o metabase_database_id=N extraído da linha "Query executada (db=N):".
+7. Se o histórico da thread contém blocos de código SQL ou menções a resultados de banco de dados, E o usuário pede para: executar/rodar a consulta ("executa", "execute", "roda", "ué executa"), modificar um filtro, adicionar/remover uma condição, tentar com outro parâmetro, confirmar se uma query funciona, ou faz uma pergunta de follow-up sobre os mesmos dados (ex: "e dessas quantas têm rota?", "filtre por data X") → need_metabase=true. Use o metabase_database_id da linha "Query executada (db=N):" se existir, senão use 0 (o sistema fará o fallback automaticamente).
 8. Se o usuário pergunta sobre a query/SQL que o bot usou ("qual query você usou", "me da o SQL", "qual é a consulta", "que query é essa") → need_slack=false, need_jira=false, need_metabase=false (a resposta está no histórico da thread, não precisa de nova consulta).
 9. Perguntas de follow-up de dados no mesmo contexto (pronomes como "dessas", "desses", "deles", referindo a entidades já consultadas) → need_metabase=true com o mesmo database_id do turno anterior.
 
@@ -260,11 +260,12 @@ func detectMetabaseFollowUp(qLower, threadHistory string) int {
 	// These unambiguously mean "run/change the SQL query", so it is safe to
 	// force Metabase routing regardless of what other sources the LLM picked.
 	reExecKeywords := []string{
-		"execute", "executar", "rode", "rodar", "re-execute", "re-executar",
+		"execute", "executar", "executa", "rode", "rodar", "re-execute", "re-executar",
 		"tente", "tentar", "adicione", "adicionar", "remova", "remover",
 		"altere", "alterar", "mude", "mudar", "modifique", "modificar",
 		"filtre", "filtrar", "inclua", "incluir", "exclua", "excluir",
 		"mesma query", "mesma consulta", "a query", "o sql", "a consulta",
+		"essa query", "essa consulta", "esse sql",
 	}
 	for _, kw := range reExecKeywords {
 		if strings.Contains(qLower, kw) {

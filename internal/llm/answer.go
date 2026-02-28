@@ -217,6 +217,7 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 		"- • ou - → listas sem ordem definida. Sub-itens com dois espaços de indentação.",
 		"- 1. 2. 3. → passos sequenciais, rankings, procedimentos passo a passo.",
 		"- NÃO use # ## ### → use *Título* ou *Título:* em linha própria.",
+		"- NÃO use tabelas Markdown (| col | col |) → Slack não as renderiza. Para dados tabulares use lista ou bloco de código.",
 		"",
 		"*Princípio geral:* varie os estilos conforme o conteúdo. Respostas longas com múltiplas seções ficam melhor com títulos em negrito. Código e JQL sempre em bloco. Notas críticas em blockquote. Não use sempre o mesmo padrão — leia o que foi perguntado e escolha o formato que torna a resposta mais fácil de ler.",
 	}

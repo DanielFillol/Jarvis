@@ -110,6 +110,64 @@ func firstSQLLine(sql string) string {
 	return sql
 }
 
+// GenerateCorrectedSQL asks the LLM to fix a failed SQL query.
+// It receives the original question, schema, the query that produced an error,
+// and the error message returned by Metabase, and returns a corrected query.
+// Returns an empty string (and nil error) when the LLM cannot fix the query.
+func (c *Client) GenerateCorrectedSQL(question, schemaDoc, failedSQL, errorMsg, engineType string, databaseID int, model string) (string, error) {
+	if strings.TrimSpace(schemaDoc) == "" {
+		return "", nil
+	}
+
+	engineRules := engineSpecificRules(engineType)
+	prompt := fmt.Sprintf(`Você é um especialista em SQL. A query abaixo foi executada no banco de dados (ID: %d) e retornou um erro. Corrija-a para responder à pergunta original.
+
+PERGUNTA ORIGINAL:
+%s
+
+QUERY COM ERRO:
+%s
+
+ERRO RETORNADO:
+%s
+
+REGRAS OBRIGATÓRIAS:
+1. Use apenas SELECT (ou WITH ... SELECT). NUNCA use INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE.
+2. Use apenas tabelas e colunas que existem no schema fornecido.
+3. Se não for possível corrigir, responda exatamente com: IMPOSSIBLE
+4. Retorne APENAS o SQL puro — sem explicações, sem blocos de código, sem comentários, sem markdown.
+5. Use LIMIT 100 salvo quando a pergunta exigir agregação total (SUM, COUNT, AVG, etc.).
+6. Para filtrar por nome de empresa/cliente, use ILIKE ou LOWER() em vez de comparação exata.%s
+
+SCHEMA DO BANCO (ID: %d):
+%s
+
+SQL CORRIGIDO:`,
+		databaseID, question, failedSQL, clip(errorMsg, 600), engineRules, databaseID, clip(schemaDoc, 100000))
+
+	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
+	out, err := c.Chat(messages, model, 0.1, 2000)
+	if err != nil {
+		return "", err
+	}
+
+	out = strings.TrimSpace(stripCodeFences(out))
+
+	if strings.EqualFold(out, "IMPOSSIBLE") || out == "" {
+		log.Printf("[LLM] GenerateCorrectedSQL: model replied IMPOSSIBLE or empty")
+		return "", nil
+	}
+
+	upper := strings.ToUpper(strings.TrimSpace(out))
+	if !strings.HasPrefix(upper, "SELECT") && !strings.HasPrefix(upper, "WITH") {
+		log.Printf("[LLM] GenerateCorrectedSQL: rejected non-SELECT query: %s", clip(out, 200))
+		return "", nil
+	}
+
+	log.Printf("[LLM] GenerateCorrectedSQL: corrected sql_first_line=%s", clip(firstSQLLine(out), 120))
+	return out, nil
+}
+
 // engineSpecificRules returns a block of numbered SQL rules tailored to the
 // given Metabase engine string (e.g. "redshift", "postgres", "mysql",
 // "bigquery", "snowflake").  An empty string is returned when the engine is

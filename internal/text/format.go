@@ -12,6 +12,10 @@ var (
 	reMDUnderBold = regexp.MustCompile(`__(.+?)__`)
 	reMDTilde     = regexp.MustCompile(`~~(.+?)~~`)
 	reMDHeading   = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
+	// Matches blocks of 2+ consecutive lines starting with "|" (Markdown tables).
+	// Slack does not render Markdown tables; we wrap them in a code block so the
+	// columns stay readable in a monospace font.
+	reMDTable = regexp.MustCompile(`(?m)(^\|[^\n]+\n?){2,}`)
 	// Ordered list items: "1. " at the start of a line → "1. " (already valid in Slack, just ensure no conversion needed)
 	// Code blocks (```) pass through as-is — Slack renders them natively.
 	// Blockquotes (>) pass through as-is — Slack renders them natively.
@@ -37,6 +41,11 @@ func MarkdownToMarkdown(s string) string {
 	s = reMDTilde.ReplaceAllString(s, "~$1~")
 	// ### Title / ## Title / # Title → *Title*
 	s = reMDHeading.ReplaceAllString(s, "*$1*")
+
+	// Wrap Markdown tables in code blocks (Slack doesn't render | tables natively).
+	s = reMDTable.ReplaceAllStringFunc(s, func(m string) string {
+		return "```\n" + strings.TrimRight(m, "\n") + "\n```\n"
+	})
 
 	// Reinsert code blocks
 	for i, block := range blocks {

@@ -41,6 +41,11 @@ type Service struct {
 	Store                     *state.Store
 	Tracker                   *state.MessageTracker
 	Cfg                       config.Config
+	// threadLastDBID maps "channel:threadTs" → database ID for the last Metabase
+	// query executed in that thread.  Used to restore routing context for
+	// follow-up messages like "essa query funciona" / "ué executa entao" that
+	// don't contain the "Query executada (db=N):" tag (which is internal only).
+	threadLastDBID sync.Map
 }
 
 // NewService constructs a new Jarvis service from its dependencies.
@@ -152,6 +157,34 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		decision.NeedJira = false
 		decision.JiraJQL = ""
 	}
+	// Deterministic override: if this thread previously ran a Metabase query and
+	// the current message looks like a re-execution / follow-up ("essa query
+	// funciona", "ué executa entao", etc.), force Metabase routing.
+	// The LLM router and detectMetabaseFollowUp both rely on "Query executada
+	// (db=N):" appearing in thread history, but that text is internal-only and
+	// never reaches the Slack thread.  The stored DB ID is authoritative.
+	if !decision.NeedMetabase && s.Metabase != nil {
+		if storedDBID, ok := s.loadThreadDBID(contextChannel, contextThreadTs); ok {
+			qLow := strings.ToLower(questionForLLM)
+			metaFollowUpKeywords := []string{
+				"executa", "execute", "roda essa", "roda isso", "rode",
+				"essa query", "essa consulta", "esse sql",
+				"a query", "a consulta", "o sql",
+				"funciona", "funcionou",
+				"tente novamente", "tenta de novo", "tentar de novo",
+			}
+			for _, kw := range metaFollowUpKeywords {
+				if strings.Contains(qLow, kw) {
+					decision.NeedMetabase = true
+					decision.MetabaseDatabaseID = storedDBID
+					decision.NeedSlack = false
+					decision.SlackQuery = ""
+					log.Printf("[JARVIS] metabase follow-up override: db=%d trigger=%q", storedDBID, kw)
+					break
+				}
+			}
+		}
+	}
 	log.Printf("[JARVIS] needSlack=%t slackQuery=%q needJira=%t jiraIntent=%q jiraJQL=%q issueKey=%q", decision.NeedSlack, preview(decision.SlackQuery, 120), decision.NeedJira, decision.JiraIntent, preview(decision.JiraJQL, 120), issueKey)
 	// 7) Slack context
 	var slackCtx string
@@ -247,6 +280,9 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	var dbCtx string
 	if decision.NeedMetabase && s.Metabase != nil {
 		dbCtx = s.runMetabaseQuery(questionForLLM, threadHist, decision.MetabaseDatabaseID)
+		// Persist the database ID so future follow-up routing works even when
+		// the Slack thread history doesn't contain "Query executada (db=N):".
+		s.storeThreadDBID(contextChannel, contextThreadTs, decision.MetabaseDatabaseID)
 		if dbCtx == "" {
 			// Query was attempted but failed (timeout, SQL error, etc.).
 			// Inject an explicit warning so the LLM does not invent data.
@@ -1490,18 +1526,53 @@ func (s *Service) formattedMetabaseDatabases() []string {
 	return out
 }
 
-// extractLastExecutedSQL parses thread history produced by runMetabaseQuery
-// and returns the SQL from the most recent "Query executada (db=N):" or
-// "Query tentada (db=N):" block.  Returns an empty string when not found.
-// This is used to give the LLM a concrete starting point for follow-up
-// queries, preventing it from silently dropping date or entity filters.
+// extractLastExecutedSQL tries to find the most recent SQL query in thread
+// history to use as a base for follow-up queries.
+//
+// Primary strategy: look for the internal "Query executada (db=N):\n```sql\n..."
+// tag produced by runMetabaseQuery.  This tag is injected into the LLM context
+// but never reaches the Slack thread text, so it rarely matches in practice.
+//
+// Fallback strategy: find the last SQL code block (```sql or bare ``` followed
+// by SELECT/WITH) that appears in the thread — these come from LLM responses
+// that suggest corrective queries or show previously executed SQL.
 func extractLastExecutedSQL(threadHistory string) string {
-	re := regexp.MustCompile("(?s)Query (?:executada|tentada) \\(db=\\d+\\):\n```sql\n(.*?)\n```")
-	matches := re.FindAllStringSubmatch(threadHistory, -1)
-	if len(matches) == 0 {
-		return ""
+	// Primary: exact internal tag format.
+	reExec := regexp.MustCompile("(?s)Query (?:executada|tentada) \\(db=\\d+\\):\n```sql\n(.*?)\n```")
+	if m := reExec.FindAllStringSubmatch(threadHistory, -1); len(m) > 0 {
+		return strings.TrimSpace(m[len(m)-1][1])
 	}
-	return strings.TrimSpace(matches[len(matches)-1][1])
+	// Fallback: any SQL code block in the thread (e.g. bot-suggested queries).
+	reBlock := regexp.MustCompile("(?s)```(?:sql)?\n((?i:SELECT|WITH)[^`]+)\n```")
+	if m := reBlock.FindAllStringSubmatch(threadHistory, -1); len(m) > 0 {
+		sql := strings.TrimSpace(m[len(m)-1][1])
+		upper := strings.ToUpper(sql)
+		if strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "WITH") {
+			return sql
+		}
+	}
+	return ""
+}
+
+// storeThreadDBID records the Metabase database ID used for a thread so
+// follow-up routing can reference it even when the thread history does not
+// contain the internal "Query executada (db=N):" tag.
+func (s *Service) storeThreadDBID(channel, threadTs string, dbID int) {
+	if channel == "" || threadTs == "" || dbID <= 0 {
+		return
+	}
+	s.threadLastDBID.Store(channel+":"+threadTs, dbID)
+}
+
+// loadThreadDBID returns the last Metabase database ID used in a thread,
+// or (0, false) when none has been stored.
+func (s *Service) loadThreadDBID(channel, threadTs string) (int, bool) {
+	v, ok := s.threadLastDBID.Load(channel + ":" + threadTs)
+	if !ok {
+		return 0, false
+	}
+	id, ok := v.(int)
+	return id, ok && id > 0
 }
 
 // lookupDatabaseEngine returns the engine string (e.g. "redshift", "postgres")
@@ -1735,21 +1806,50 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 		return ""
 	}
 
-	// Execute the query.
-	result, err := s.Metabase.RunQuery(databaseID, sql)
-	if err != nil {
-		log.Printf("[METABASE] runMetabaseQuery: RunQuery failed: %v", err)
-		// Return the generated SQL even on failure so the user can inspect or
-		// correct it, and so follow-up questions ("qual a query que você escreveu?")
-		// can be answered correctly from the thread context.
-		return fmt.Sprintf("[ERRO: A consulta ao banco de dados falhou: %v]\n\nQuery tentada (db=%d):\n```sql\n%s\n```", err, databaseID, sql)
+	// Execute the query with up to 3 attempts.  On failure, the LLM is asked
+	// to produce a corrected query using the error message as feedback.
+	const maxSQLRetries = 3
+	lastSQL := sql
+	var result metabase.QueryResult
+	for attempt := 1; attempt <= maxSQLRetries; attempt++ {
+		var runErr error
+		result, runErr = s.Metabase.RunQuery(databaseID, lastSQL)
+
+		// Collect any error — either transport-level or Metabase-level.
+		queryErrMsg := ""
+		if runErr != nil {
+			queryErrMsg = runErr.Error()
+		} else if result.Error != "" {
+			queryErrMsg = result.Error
+		}
+
+		if queryErrMsg == "" {
+			break // query succeeded
+		}
+
+		log.Printf("[METABASE] runMetabaseQuery: attempt %d/%d failed: %s", attempt, maxSQLRetries, clip(queryErrMsg, 200))
+
+		if attempt == maxSQLRetries {
+			return fmt.Sprintf("[ERRO: A consulta ao banco de dados falhou após %d tentativas: %s]\n\nÚltima query tentada (db=%d):\n```sql\n%s\n```", maxSQLRetries, queryErrMsg, databaseID, lastSQL)
+		}
+
+		// Ask the LLM to fix the SQL using the error as context.
+		corrected, corrErr := s.LLM.GenerateCorrectedSQL(question, schemaDoc, lastSQL, queryErrMsg, engineType, databaseID, s.Cfg.OpenAIModel)
+		if corrErr != nil || strings.TrimSpace(corrected) == "" {
+			log.Printf("[METABASE] runMetabaseQuery: could not generate corrected SQL: %v", corrErr)
+			return fmt.Sprintf("[ERRO: A consulta ao banco de dados falhou: %s]\n\nQuery tentada (db=%d):\n```sql\n%s\n```", queryErrMsg, databaseID, lastSQL)
+		}
+
+		log.Printf("[METABASE] runMetabaseQuery: retrying with corrected SQL (attempt %d/%d)", attempt+1, maxSQLRetries)
+		lastSQL = corrected
 	}
 
-	formatted := metabase.FormatQueryResult(result, 100)
+	formatted := "-"
+	formatted = metabase.FormatQueryResult(result, 100)
 	log.Printf("[METABASE] runMetabaseQuery: db=%d rows=%d chars=%d", databaseID, len(result.Data.Rows), len(formatted))
 
 	// Include the SQL and db ID so the LLM can reference both when composing
 	// the answer, and the router can extract the db ID from thread history for
 	// follow-up re-execution requests.
-	return fmt.Sprintf("Query executada (db=%d):\n```sql\n%s\n```\n\nResultado:\n%s", databaseID, sql, formatted)
+	return fmt.Sprintf("Query executada (db=%d):\n```sql\n%s\n```\n\nResultado:\n%s", databaseID, lastSQL, formatted)
 }
