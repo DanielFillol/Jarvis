@@ -1,4 +1,6 @@
 .idea/
+metabase_schema.md
+metabase_schema_compact.md
 .env
 go.mod
 go.sum

@@ -46,6 +46,16 @@ type Service struct {
 	// follow-up messages like "essa query funciona" / "ué executa entao" that
 	// don't contain the "Query executada (db=N):" tag (which is internal only).
 	threadLastDBID sync.Map
+
+	// threadLastSQL maps "channel:threadTs" → the last successfully executed SQL
+	// string in that thread.  Used as a reliable base for follow-up queries so
+	// that all prior filters are preserved even when the thread history does not
+	// contain the full LLM response (which may be truncated by Slack).
+	threadLastSQL sync.Map
+
+	// pendingReplies maps "channel:threadTs" → []string (message chunks) for
+	// long answers awaiting user confirmation before being posted to the thread.
+	pendingReplies sync.Map
 }
 
 // NewService constructs a new Jarvis service from its dependencies.
@@ -84,6 +94,35 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		contextChannel = chFromLink
 		contextThreadTs = tsFromLink
 		hasThreadPermalink = true
+	}
+	// 1.5) Check if the user is confirming or cancelling a pending long reply.
+	{
+		pendingKeyTs := contextThreadTs
+		if pendingKeyTs == "" {
+			pendingKeyTs = originTs
+		}
+		pendingKey := contextChannel + ":" + pendingKeyTs
+		if raw, ok := s.pendingReplies.Load(pendingKey); ok {
+			chunks := raw.([]string)
+			if isLongReplyCancellation(question) {
+				s.pendingReplies.Delete(pendingKey)
+				_ = s.Slack.PostMessage(channel, threadTs, "Ok, resposta cancelada.")
+				log.Printf("[JARVIS] long reply cancelled dur=%s", time.Since(start))
+				return nil
+			}
+			if isLongReplyConfirmation(question) {
+				s.pendingReplies.Delete(pendingKey)
+				for i, chunk := range chunks {
+					if postErr := s.Slack.PostMessage(channel, threadTs, chunk); postErr != nil {
+						log.Printf("[ERR] long reply chunk %d/%d: %v", i+1, len(chunks), postErr)
+					}
+				}
+				log.Printf("[JARVIS] long reply confirmed, posted %d chunks dur=%s", len(chunks), time.Since(start))
+				return nil
+			}
+			// Not a yes/no — discard pending and process the new question normally.
+			s.pendingReplies.Delete(pendingKey)
+		}
 	}
 	// 2) Thread history for memory (full only when explicit permalink)
 	var threadHist string
@@ -279,10 +318,33 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// 9) Metabase database query
 	var dbCtx string
 	if decision.NeedMetabase && s.Metabase != nil {
-		dbCtx = s.runMetabaseQuery(questionForLLM, threadHist, decision.MetabaseDatabaseID)
-		// Persist the database ID so future follow-up routing works even when
-		// the Slack thread history doesn't contain "Query executada (db=N):".
+		// Retrieve the last SQL from memory so follow-up queries preserve all
+		// existing filters, even when the thread history is truncated.
+		memBaseSQL, _ := s.loadThreadLastSQL(contextChannel, contextThreadTs)
+		var executedSQL string
+		dbCtx, _, executedSQL = s.runMetabaseQuery(questionForLLM, threadHist, decision.MetabaseDatabaseID, memBaseSQL)
+
+		// LLM requested clarification before generating SQL — ask the user and
+		// stop processing here (no query was executed, no data to answer with).
+		if strings.HasPrefix(dbCtx, llm.ClarificationPrefix) {
+			clarificationQ := strings.TrimPrefix(dbCtx, llm.ClarificationPrefix)
+			if replyErr := replyFn(clarificationQ); replyErr != nil {
+				log.Printf("[ERR] postSlackMessage (clarification) failed: %v", replyErr)
+				return replyErr
+			}
+			if busyTs != "" {
+				s.Tracker.Track(channel, originTs, busyTs)
+			}
+			log.Printf("[JARVIS] clarification requested dur=%s", time.Since(start))
+			return nil
+		}
+
+		// Persist the database ID and last SQL for follow-up routing.
 		s.storeThreadDBID(contextChannel, contextThreadTs, decision.MetabaseDatabaseID)
+		if executedSQL != "" {
+			s.storeThreadLastSQL(contextChannel, contextThreadTs, executedSQL)
+		}
+
 		if dbCtx == "" {
 			// Query was attempted but failed (timeout, SQL error, etc.).
 			// Inject an explicit warning so the LLM does not invent data.
@@ -308,10 +370,38 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	if answer == "" {
 		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, (jiraIssueCtx != "" || decision.NeedJira), jiraIssuesFound, issueKey)
 	}
+	// If the answer is too long for an in-place update, ask the user for
+	// confirmation before posting multiple messages in the thread.
+	const longReplyThreshold = 3900
+	if len(answer) > longReplyThreshold {
+		chunks := splitIntoChunks(answer, longReplyThreshold)
+		pendingKeyTs := contextThreadTs
+		if pendingKeyTs == "" {
+			pendingKeyTs = originTs
+		}
+		s.pendingReplies.Store(contextChannel+":"+pendingKeyTs, chunks)
+		var confirmMsg string
+		if len(chunks) == 1 {
+			confirmMsg = "Essa resposta é longa. Posso postar na thread? _(responda *sim* ou *não*)_"
+		} else {
+			confirmMsg = fmt.Sprintf("Essa resposta precisará de *%d mensagens* para ser enviada por completo. Posso postar tudo? _(responda *sim* ou *não*)_", len(chunks))
+		}
+		if err := replyFn(confirmMsg); err != nil {
+			log.Printf("[ERR] long reply confirmation prompt failed: %v", err)
+			return err
+		}
+		if busyTs != "" {
+			s.Tracker.Track(channel, originTs, busyTs)
+		}
+		log.Printf("[JARVIS] long reply pending chunks=%d total_chars=%d dur=%s", len(chunks), len(answer), time.Since(start))
+		return nil
+	}
+
 	if err := replyFn(answer); err != nil {
 		log.Printf("[ERR] postSlackMessage failed: %v", err)
 		return err
 	}
+
 	// Track origin → bot reply so we can delete the reply if the user deletes their message.
 	if busyTs != "" {
 		s.Tracker.Track(channel, originTs, busyTs)
@@ -1575,6 +1665,27 @@ func (s *Service) loadThreadDBID(channel, threadTs string) (int, bool) {
 	return id, ok && id > 0
 }
 
+// storeThreadLastSQL records the last successfully executed SQL for a thread
+// so that follow-up queries can use it as a base even when the Slack thread
+// history is too short to contain the full previous LLM response.
+func (s *Service) storeThreadLastSQL(channel, threadTs, sql string) {
+	if channel == "" || threadTs == "" || strings.TrimSpace(sql) == "" {
+		return
+	}
+	s.threadLastSQL.Store(channel+":"+threadTs, sql)
+}
+
+// loadThreadLastSQL returns the last SQL executed in a thread, or ("", false)
+// when none has been stored yet.
+func (s *Service) loadThreadLastSQL(channel, threadTs string) (string, bool) {
+	v, ok := s.threadLastSQL.Load(channel + ":" + threadTs)
+	if !ok {
+		return "", false
+	}
+	sql, ok := v.(string)
+	return sql, ok && strings.TrimSpace(sql) != ""
+}
+
 // lookupDatabaseEngine returns the engine string (e.g. "redshift", "postgres")
 // for the given Metabase database ID, or an empty string when not found.
 func (s *Service) lookupDatabaseEngine(databaseID int) string {
@@ -1705,14 +1816,27 @@ func buildCardExamples(cards []metabase.Card) string {
 // runMetabaseQuery generates a SQL query via the LLM and executes it against
 // the Metabase database identified by databaseID.  threadHistory provides
 // conversational context so the LLM can resolve pronouns and references from
-// prior turns (e.g. "ela" → "Multilixo").  Errors are logged and an empty
-// string is returned when any step fails, so the caller can degrade gracefully.
-func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID int) string {
+// prior turns (e.g. "ela" → "Multilixo").
+//
+// memBaseSQL is the last SQL stored in memory for this thread (may be empty).
+// When non-empty it is used as the QUERY BASE in preference to anything extracted
+// from threadHistory, preventing follow-up queries from losing filters when the
+// thread history is truncated.
+//
+// Returns (contextString, queryResult, executedSQL):
+//   - contextString is the formatted block injected into the LLM answer prompt.
+//     When the LLM requests a clarification, contextString starts with
+//     llm.ClarificationPrefix and the other values are zero — the caller must
+//     relay the question to the user and skip SQL execution.
+//   - queryResult holds the raw Metabase response and is non-nil only on a
+//     successful query; it is used to generate CSV exports.
+//   - executedSQL is the SQL that was successfully run (empty on failure).
+func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID int, memBaseSQL string) (string, *metabase.QueryResult, string) {
 	if databaseID <= 0 {
 		// Router didn't pick a database; try the first available one.
 		if len(s.MetabaseDatabases) == 0 {
 			log.Printf("[METABASE] runMetabaseQuery: no databases available")
-			return ""
+			return "", nil, ""
 		}
 		databaseID = s.MetabaseDatabases[0].ID
 		log.Printf("[METABASE] runMetabaseQuery: no db_id from router, defaulting to db=%d", databaseID)
@@ -1734,7 +1858,7 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 		log.Printf("[METABASE] runMetabaseQuery: compact schema not found, using full schema %q (%d bytes)", schemaPath, len(schemaDoc))
 	} else {
 		log.Printf("[METABASE] runMetabaseQuery: could not read schema file %q: %v", schemaPath, readErr2)
-		return ""
+		return "", nil, ""
 	}
 
 	// Filter the schema to only tables in schemas that are actually queryable,
@@ -1786,11 +1910,17 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 	}
 	examples := buildCardExamples(relCards)
 
-	// Extract the last executed SQL from the thread so follow-up questions can
-	// use it as a base, preserving existing filters (especially date filters).
-	baseSQL := extractLastExecutedSQL(threadHistory)
+	// Prefer the in-memory stored SQL over what can be extracted from the
+	// Slack thread history, because the thread history is often truncated when
+	// the previous bot response was long (>~500 chars).
+	baseSQL := memBaseSQL
 	if baseSQL != "" {
-		log.Printf("[METABASE] runMetabaseQuery: base SQL found in thread (%d chars)", len(baseSQL))
+		log.Printf("[METABASE] runMetabaseQuery: base SQL from memory (%d chars)", len(baseSQL))
+	} else {
+		baseSQL = extractLastExecutedSQL(threadHistory)
+		if baseSQL != "" {
+			log.Printf("[METABASE] runMetabaseQuery: base SQL from thread history (%d chars)", len(baseSQL))
+		}
 	}
 
 	// Ask the LLM to write the SQL.  Pass thread history so the model can
@@ -1799,11 +1929,19 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 	sql, err := s.LLM.GenerateSQL(question, threadHistory, schemaDoc, examples, baseSQL, databaseID, engineType, s.Cfg.OpenAIModel)
 	if err != nil {
 		log.Printf("[METABASE] runMetabaseQuery: GenerateSQL failed: %v", err)
-		return ""
+		return "", nil, ""
 	}
 	if strings.TrimSpace(sql) == "" {
 		log.Printf("[METABASE] runMetabaseQuery: LLM could not generate SQL for question=%q", clip(question, 120))
-		return ""
+		return "", nil, ""
+	}
+
+	// LLM determined that more context is needed before a safe query can be
+	// generated.  Return the clarification question so HandleMessage can ask
+	// the user directly instead of executing potentially wrong SQL.
+	if strings.HasPrefix(sql, llm.ClarificationPrefix) {
+		log.Printf("[METABASE] runMetabaseQuery: clarification requested for question=%q", clip(question, 120))
+		return sql, nil, ""
 	}
 
 	// Execute the query with up to 3 attempts.  On failure, the LLM is asked
@@ -1830,14 +1968,14 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 		log.Printf("[METABASE] runMetabaseQuery: attempt %d/%d failed: %s", attempt, maxSQLRetries, clip(queryErrMsg, 200))
 
 		if attempt == maxSQLRetries {
-			return fmt.Sprintf("[ERRO: A consulta ao banco de dados falhou após %d tentativas: %s]\n\nÚltima query tentada (db=%d):\n```sql\n%s\n```", maxSQLRetries, queryErrMsg, databaseID, lastSQL)
+			return fmt.Sprintf("[ERRO: A consulta ao banco de dados falhou após %d tentativas: %s]\n\nÚltima query tentada (db=%d):\n```sql\n%s\n```", maxSQLRetries, queryErrMsg, databaseID, lastSQL), nil, ""
 		}
 
 		// Ask the LLM to fix the SQL using the error as context.
 		corrected, corrErr := s.LLM.GenerateCorrectedSQL(question, schemaDoc, lastSQL, queryErrMsg, engineType, databaseID, s.Cfg.OpenAIModel)
 		if corrErr != nil || strings.TrimSpace(corrected) == "" {
 			log.Printf("[METABASE] runMetabaseQuery: could not generate corrected SQL: %v", corrErr)
-			return fmt.Sprintf("[ERRO: A consulta ao banco de dados falhou: %s]\n\nQuery tentada (db=%d):\n```sql\n%s\n```", queryErrMsg, databaseID, lastSQL)
+			return fmt.Sprintf("[ERRO: A consulta ao banco de dados falhou: %s]\n\nQuery tentada (db=%d):\n```sql\n%s\n```", queryErrMsg, databaseID, lastSQL), nil, ""
 		}
 
 		log.Printf("[METABASE] runMetabaseQuery: retrying with corrected SQL (attempt %d/%d)", attempt+1, maxSQLRetries)
@@ -1851,5 +1989,49 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 	// Include the SQL and db ID so the LLM can reference both when composing
 	// the answer, and the router can extract the db ID from thread history for
 	// follow-up re-execution requests.
-	return fmt.Sprintf("Query executada (db=%d):\n```sql\n%s\n```\n\nResultado:\n%s", databaseID, lastSQL, formatted)
+	ctx := fmt.Sprintf("Query executada (db=%d):\n```sql\n%s\n```\n\nResultado:\n%s", databaseID, lastSQL, formatted)
+	return ctx, &result, lastSQL
+}
+
+// splitIntoChunks divides text into chunks of at most maxLen bytes,
+// preferring to cut at newline boundaries to keep lines intact.
+func splitIntoChunks(text string, maxLen int) []string {
+	if len(text) <= maxLen {
+		return []string{text}
+	}
+	var chunks []string
+	for len(text) > 0 {
+		if len(text) <= maxLen {
+			chunks = append(chunks, text)
+			break
+		}
+		cut := maxLen
+		// Try to cut at a newline in the latter half of the chunk.
+		if idx := strings.LastIndex(text[:maxLen], "\n"); idx > maxLen/3 {
+			cut = idx + 1
+		}
+		chunks = append(chunks, strings.TrimRight(text[:cut], " \t"))
+		text = strings.TrimLeft(text[cut:], "\n")
+	}
+	return chunks
+}
+
+// isLongReplyConfirmation returns true when the user's message is a
+// positive response to the "can I post the long reply?" prompt.
+func isLongReplyConfirmation(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	return t == "sim" || t == "s" || t == "ok" || t == "pode" || t == "postar" ||
+		strings.Contains(t, "pode postar") || strings.Contains(t, "pode sim") ||
+		strings.Contains(t, "claro") || strings.Contains(t, "confirmar") ||
+		strings.Contains(t, "postar tudo") || strings.Contains(t, "pode enviar")
+}
+
+// isLongReplyCancellation returns true when the user's message is a
+// negative response to the "can I post the long reply?" prompt.
+func isLongReplyCancellation(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	return t == "não" || t == "nao" || t == "n" || t == "cancelar" ||
+		strings.Contains(t, "não precisa") || strings.Contains(t, "nao precisa") ||
+		strings.Contains(t, "não postar") || strings.Contains(t, "nao postar") ||
+		strings.Contains(t, "cancela") || strings.Contains(t, "não quero")
 }

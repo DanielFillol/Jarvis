@@ -193,11 +193,19 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 	if strings.TrimSpace(botName) == "" {
 		botName = "Jarvis"
 	}
+	sqlOnlyCtx := dbCtx != "" && jiraCtx == ""
+
+	contextHint := "Se o contexto não for suficiente, diga o que falta e sugira como achar (JQL/links)."
+	if sqlOnlyCtx {
+		contextHint = "Se os dados não forem suficientes para responder, informe o usuário e sugira como refinar a pergunta. Nunca mencione JQL — este contexto é exclusivamente de banco de dados SQL."
+	}
+
 	systemParts := []string{
 		"Você é o " + botName + ", assistente do Slack.",
 		"Responda em português brasileiro, direto, sem enrolação, usando o contexto quando existir.",
-		"Se o contexto não for suficiente, diga o que falta e sugira como achar (JQL/links).",
+		contextHint,
 		"Não invente fatos.",
+		"Quando a pergunta for ambígua ou faltar informação essencial para uma boa resposta, prefira fazer uma pergunta de esclarecimento direta ao usuário em vez de adivinhar ou dar uma resposta genérica.",
 		"MENÇÕES DE USUÁRIOS SLACK: Ao mencionar um usuário pelo ID (ex: U067UM4LRGB), SEMPRE use o formato de mention <@USERID> (ex: <@U067UM4LRGB>). O Slack renderiza automaticamente como o nome de exibição. NUNCA escreva @U067UM4LRGB ou o ID puro — use sempre <@ID>.",
 		"CAPACIDADES: Você consegue ler e resumir threads do Slack quando o usuário fornece um link direto (permalink). Ao receber um link como https://empresa.slack.com/archives/CHANID/pTIMESTAMP, você recupera e resume o conteúdo da thread automaticamente. Nunca diga que não consegue acessar links de thread do Slack.",
 		"",
@@ -220,6 +228,8 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 		"- NÃO use tabelas Markdown (| col | col |) → Slack não as renderiza. Para dados tabulares use lista ou bloco de código.",
 		"",
 		"*Princípio geral:* varie os estilos conforme o conteúdo. Respostas longas com múltiplas seções ficam melhor com títulos em negrito. Código e JQL sempre em bloco. Notas críticas em blockquote. Não use sempre o mesmo padrão — leia o que foi perguntado e escolha o formato que torna a resposta mais fácil de ler.",
+		"",
+		"LIMITAÇÃO IMPORTANTE: Você não consegue enviar arquivos, anexos ou downloads no Slack. Quando o usuário pedir dados em CSV, Excel ou qualquer outro formato de arquivo para download, informe claramente que essa funcionalidade não está disponível no momento e ofereça apresentar os dados diretamente na mensagem (tabela em bloco de código, lista, etc.).",
 	}
 	if strings.TrimSpace(c.JiraBaseURL) != "" {
 		baseURL := strings.TrimRight(strings.TrimSpace(c.JiraBaseURL), "/")
@@ -228,6 +238,13 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 			"- Quando precisar gerar um link completo de uma issue Jira, use SEMPRE este base URL: "+baseURL,
 			"- Formato: "+baseURL+"/browse/KEY (ex: "+baseURL+"/browse/PROJ-123)",
 			"- NUNCA use outros domínios além do base URL fornecido acima.")
+	}
+	if sqlOnlyCtx {
+		systemParts = append(systemParts, "",
+			"CONTEXTO: Esta pergunta é respondida com dados de banco de dados SQL.",
+			"- NÃO mencione JQL em nenhuma hipótese — JQL é exclusivo para perguntas sobre o Jira.",
+			"- NÃO oriente o usuário a usar o Jira ou a fazer buscas no Jira.",
+			"- Se os dados forem insuficientes, pergunte ao usuário como refinar a consulta.")
 	}
 	system := strings.Join(systemParts, "\n")
 	var u strings.Builder
@@ -278,7 +295,7 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 		{Role: "system", Content: system},
 		userMsg,
 	}
-	out, err := c.Chat(msgs, model, 0.7, 2500)
+	out, err := c.Chat(msgs, model, 0.7, 8000)
 	if err != nil {
 		return "", err
 	}

@@ -7,6 +7,12 @@ import (
 	"strings"
 )
 
+// ClarificationPrefix is the sentinel prefix returned by GenerateSQL when the
+// LLM cannot safely generate a query without more context from the user.
+// The caller must detect this prefix and relay the question to the user
+// instead of executing any SQL.
+const ClarificationPrefix = "CLARIFICATION_NEEDED: "
+
 // GenerateSQL asks the LLM to produce a safe SELECT query that answers
 // question using the provided Metabase schema documentation.
 //
@@ -59,12 +65,15 @@ REGRAS OBRIGATÓRIAS:
 2. Use apenas tabelas e colunas que existem no schema fornecido.
 3. Se não for possível responder à pergunta com os dados disponíveis, responda exatamente com: IMPOSSIBLE
 4. Retorne APENAS o SQL puro — sem explicações, sem blocos de código, sem comentários, sem markdown.
-5. Use LIMIT 100 salvo quando a pergunta exigir uma agregação total (SUM, COUNT, AVG, etc.).
-6. Prefira nomes de coluna descritivos no SELECT (use aliases se necessário).
+5. Use LIMIT 100 salvo quando a pergunta exigir uma agregação total (SUM, COUNT, AVG, etc.) ou quando o usuário pedir explicitamente para exportar/trazer "todos" os dados.
+6. NOMES DE COLUNAS (ALIAS): NUNCA retorne colunas com nomes técnicos brutos (ex: id, hauler_id, created_at). Use aliases claros e em português amigável usando aspas duplas (ex: SELECT id AS "ID da Coleta", name AS "Nome do Transportador").
 7. Quando existirem perguntas salvas similares, prefira usar as mesmas tabelas e estrutura delas como base.
-8. Para filtrar por nome de empresa/cliente, use comparação case-insensitive (ILIKE, LOWER(), etc. conforme o dialeto) em vez de comparação exata (=), para tolerar diferenças de capitalização e codificação.
-9. Ao detalhar resultados de uma query anterior (drill-down), use o mesmo campo que foi utilizado no GROUP BY / SELECT da query original. Ex: se a query anterior agrupou por fantasy_name, filtre por fantasy_name — não por legal_name ou outro campo similar.
-10. Se houver uma QUERY BASE abaixo, use-a como ponto de partida para perguntas de follow-up (refinamentos, filtros adicionais, agrupamentos diferentes sobre os mesmos dados). NUNCA remova filtros já existentes na QUERY BASE — especialmente filtros de data e de entidade principal. Se a pergunta for sobre um tema completamente diferente, ignore a QUERY BASE e escreva do zero.%s
+8. Para filtrar por nome de empresa/cliente, use comparação case-insensitive (ILIKE, LOWER(), etc. conforme o dialeto) em vez de comparação exata (=).
+9. Ao detalhar resultados de uma query anterior (drill-down), use o mesmo campo que foi utilizado no GROUP BY / SELECT da query original.
+10. Se houver uma QUERY BASE abaixo, use-a como ponto de partida para perguntas de follow-up. NUNCA remova filtros já existentes na QUERY BASE.
+11. Se a pergunta for ambígua ou incompleta, responda com exatamente: CLARIFICATION_NEEDED: <sua pergunta de esclarecimento em português> — EXCETO para solicitações de exportação (ex: "me dá em csv").
+12. Se a pergunta contiver múltiplas etapas sequenciais, escreva SQL APENAS para a primeira etapa.
+13. FORMATO DE DATA: Para campos de data e hora, formate-os sempre para o padrão brasileiro 'DD/MM/YYYY HH24:MI' ou apenas 'DD/MM/YYYY' conforme o contexto.%s
 %s%s%s
 SCHEMA DO BANCO (ID: %d):
 %s
@@ -85,6 +94,9 @@ SQL:`, engineRules, threadSection, examplesSection, baseSQLSection, databaseID, 
 	if strings.EqualFold(out, "IMPOSSIBLE") || out == "" {
 		log.Printf("[LLM] GenerateSQL: model replied IMPOSSIBLE or empty for question=%q", clip(question, 120))
 		return "", nil
+	}
+	if strings.HasPrefix(out, ClarificationPrefix) {
+		return out, nil
 	}
 
 	// Safety guard: only allow SELECT / WITH … SELECT queries.
