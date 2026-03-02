@@ -317,12 +317,13 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	}
 	// 9) Metabase database query
 	var dbCtx string
+	var dbQueryResult *metabase.QueryResult
 	if decision.NeedMetabase && s.Metabase != nil {
 		// Retrieve the last SQL from memory so follow-up queries preserve all
 		// existing filters, even when the thread history is truncated.
 		memBaseSQL, _ := s.loadThreadLastSQL(contextChannel, contextThreadTs)
 		var executedSQL string
-		dbCtx, _, executedSQL = s.runMetabaseQuery(questionForLLM, threadHist, decision.MetabaseDatabaseID, memBaseSQL)
+		dbCtx, dbQueryResult, executedSQL = s.runMetabaseQuery(questionForLLM, threadHist, decision.MetabaseDatabaseID, memBaseSQL)
 
 		// LLM requested clarification before generating SQL — ask the user and
 		// stop processing here (no query was executed, no data to answer with).
@@ -360,6 +361,33 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	if len(images) > 0 {
 		log.Printf("[JARVIS] imageAttachments count=%d", len(images))
 	}
+	// 10.5) For large result sets where the user wants all data, bypass LLM data
+	// formatting: give LLM only a compact summary to write an intro sentence,
+	// then append the full Go-formatted table to the answer afterwards.
+	const largeResultThreshold = 30
+	var appendDataTable string
+	if dbQueryResult != nil && len(dbQueryResult.Data.Rows) > largeResultThreshold && wantsAllData(questionForLLM) {
+		nRows := len(dbQueryResult.Data.Rows)
+		cols := make([]string, len(dbQueryResult.Data.Cols))
+		for i, c := range dbQueryResult.Data.Cols {
+			if c.DisplayName != "" {
+				cols[i] = c.DisplayName
+			} else {
+				cols[i] = c.Name
+			}
+		}
+		appendDataTable = metabase.FormatQueryResult(*dbQueryResult, nRows)
+		sample := metabase.FormatQueryResult(*dbQueryResult, 3)
+		dbCtx = fmt.Sprintf(
+			"Query SQL retornou %d registros com os campos: %s.\n\n"+
+				"INSTRUÇÃO INTERNA: Escreva APENAS 1 frase curta de introdução descrevendo o resultado "+
+				"(ex: \"Encontrei %d registros...\"). Finalize com o marcador exato [TABLE] e nada mais.\n\n"+
+				"Amostra (3 de %d registros):\n%s",
+			nRows, strings.Join(cols, ", "),
+			nRows, nRows, sample,
+		)
+		log.Printf("[JARVIS] large result: bypassing LLM for data formatting, rows=%d", nRows)
+	}
 	// 11) Answer with LLM (with retry for transient errors)
 	answer, err := s.LLM.AnswerWithRetry(questionForLLM, threadHist, slackCtx, finalJiraCtx, dbCtx, fileCtx, images, s.Cfg.OpenAIModel, s.Cfg.OpenAIFallbackModel, 2, 0)
 	if err != nil || strings.TrimSpace(answer) == "" {
@@ -369,6 +397,14 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	answer = strings.TrimSpace(answer)
 	if answer == "" {
 		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, (jiraIssueCtx != "" || decision.NeedJira), jiraIssuesFound, issueKey)
+	}
+	// Append the Go-formatted data table when we bypassed LLM data formatting.
+	if appendDataTable != "" {
+		if strings.Contains(answer, "[TABLE]") {
+			answer = strings.Replace(answer, "[TABLE]", "\n```\n"+appendDataTable+"\n```", 1)
+		} else {
+			answer = answer + "\n\n```\n" + appendDataTable + "\n```"
+		}
 	}
 	// If the answer is too long for an in-place update, ask the user for
 	// confirmation before posting multiple messages in the thread.
@@ -1983,7 +2019,7 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 	}
 
 	formatted := "-"
-	formatted = metabase.FormatQueryResult(result, 100)
+	formatted = metabase.FormatQueryResult(result, len(result.Data.Rows))
 	log.Printf("[METABASE] runMetabaseQuery: db=%d rows=%d chars=%d", databaseID, len(result.Data.Rows), len(formatted))
 
 	// Include the SQL and db ID so the LLM can reference both when composing
@@ -1991,6 +2027,18 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 	// follow-up re-execution requests.
 	ctx := fmt.Sprintf("Query executada (db=%d):\n```sql\n%s\n```\n\nResultado:\n%s", databaseID, lastSQL, formatted)
 	return ctx, &result, lastSQL
+}
+
+// wantsAllData returns true when the user's question indicates they want the
+// full result set without truncation (e.g. "todos", "sem limite", "blocos de N").
+func wantsAllData(text string) bool {
+	t := strings.ToLower(text)
+	return strings.Contains(t, "todos") || strings.Contains(t, "todas") ||
+		strings.Contains(t, "tudo") || strings.Contains(t, "sem limite") ||
+		strings.Contains(t, "sem limitar") || strings.Contains(t, "não limite") ||
+		strings.Contains(t, "nao limite") || strings.Contains(t, "bloco") ||
+		strings.Contains(t, "lista completa") || strings.Contains(t, "traz tudo") ||
+		strings.Contains(t, "trazer tudo") || strings.Contains(t, "quero todas")
 }
 
 // splitIntoChunks divides text into chunks of at most maxLen bytes,

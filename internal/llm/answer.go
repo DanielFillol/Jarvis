@@ -295,7 +295,7 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 		{Role: "system", Content: system},
 		userMsg,
 	}
-	out, err := c.Chat(msgs, model, 0.7, 8000)
+	out, err := c.Chat(msgs, model, 0.7, 20000)
 	if err != nil {
 		return "", err
 	}

@@ -65,7 +65,7 @@ REGRAS OBRIGATÓRIAS:
 2. Use apenas tabelas e colunas que existem no schema fornecido.
 3. Se não for possível responder à pergunta com os dados disponíveis, responda exatamente com: IMPOSSIBLE
 4. Retorne APENAS o SQL puro — sem explicações, sem blocos de código, sem comentários, sem markdown.
-5. Use LIMIT 100 salvo quando a pergunta exigir uma agregação total (SUM, COUNT, AVG, etc.) ou quando o usuário pedir explicitamente para exportar/trazer "todos" os dados.
+5. Use LIMIT 100 salvo quando: (a) a pergunta exigir uma agregação total (SUM, COUNT, AVG, etc.); (b) o usuário pedir "todos", "todas", "sem limitar", "sem limite", "tudo que encontrar" ou similar — nestes casos NÃO adicione LIMIT. Pedidos de "blocos de N" ou "N por vez" são instruções de apresentação para o bot, NÃO para SQL — ignore-os ao definir o LIMIT.
 6. NOMES DE COLUNAS (ALIAS): NUNCA retorne colunas com nomes técnicos brutos (ex: id, hauler_id, created_at). Use aliases claros e em português amigável usando aspas duplas (ex: SELECT id AS "ID da Coleta", name AS "Nome do Transportador").
 7. Quando existirem perguntas salvas similares, prefira usar as mesmas tabelas e estrutura delas como base.
 8. Para filtrar por nome de empresa/cliente, use comparação case-insensitive (ILIKE, LOWER(), etc. conforme o dialeto) em vez de comparação exata (=).
@@ -148,7 +148,7 @@ REGRAS OBRIGATÓRIAS:
 2. Use apenas tabelas e colunas que existem no schema fornecido.
 3. Se não for possível corrigir, responda exatamente com: IMPOSSIBLE
 4. Retorne APENAS o SQL puro — sem explicações, sem blocos de código, sem comentários, sem markdown.
-5. Use LIMIT 100 salvo quando a pergunta exigir agregação total (SUM, COUNT, AVG, etc.).
+5. Use LIMIT 100 salvo quando: (a) a pergunta exigir agregação total; (b) o usuário pediu "todos", "sem limite" ou similar — nestes casos NÃO adicione LIMIT. "Blocos de N" é instrução de apresentação para o bot, não LIMIT SQL.
 6. Para filtrar por nome de empresa/cliente, use ILIKE ou LOWER() em vez de comparação exata.%s
 
 SCHEMA DO BANCO (ID: %d):
