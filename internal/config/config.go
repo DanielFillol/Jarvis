@@ -10,56 +10,87 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// Config aggregates all environment variables required by the application.
-// It is loaded once on startup via the Load function.  Fields that are
-// optional may remain empty; required fields should be validated by the
-// caller as appropriate.
+// Config aggregates all environment variables used by the application.
+// It is loaded once at startup via Load.  Fields marked as optional may
+// remain empty; the caller is responsible for validating required fields.
 type Config struct {
+	// ── Required ─────────────────────────────────────────────────────────────
 	Port                string
 	SlackSigningSecret  string
 	SlackBotToken       string
 	SlackUserToken      string
 	SlackSearchMaxPages int
 	OpenAIAPIKey        string
-	OpenAIModel         string
-	OpenAIFallbackModel string
-	JiraBaseURL         string
-	JiraEmail           string
-	JiraAPIToken        string
-	// JiraProjectKeys is the list of Jira project keys to search by default
+	// OpenAIModel is the primary model used for heavy tasks such as answer
+	// generation and bot introduction.  Defaults to "gpt-4o-mini".
+	OpenAIModel string
+	// OpenAILesserModel is a cheaper/faster model used for lightweight calls
+	// (routing decisions, intent detection, SQL generation, issue extraction).
+	// Falls back to OpenAIModel when empty.  Set via OPENAI_LESSER_MODEL.
+	OpenAILesserModel string
+	// BotName is the display name shown in messages and prompts.
+	// Defaults to "Jarvis".
+	BotName string
+
+	// ── Optional: Jira ───────────────────────────────────────────────────────
+	// Configure JIRA_BASE_URL + JIRA_EMAIL + JIRA_API_TOKEN to enable Jira
+	// integration (issue lookup, search, creation).
+	JiraBaseURL  string
+	JiraEmail    string
+	JiraAPIToken string
+	// JiraProjectKeys is the list of default project keys to search
 	// (e.g. ["PROJ", "BACKEND"]).  Set via JIRA_PROJECT_KEYS=PROJ,BACKEND.
 	JiraProjectKeys []string
-	// JiraProjectNameMap maps human-readable project names (lowercase) to their
-	// Jira keys.  Loaded from JIRA_PROJECT_NAME_MAP=name1:KEY1,name2:KEY2.
+	// JiraProjectNameMap maps human-readable project names (lowercase) to
+	// their Jira keys.  Set via JIRA_PROJECT_NAME_MAP=name1:KEY1,name2:KEY2.
 	JiraProjectNameMap map[string]string
-	JiraCreateEnabled  bool
-	// BotName is the display name of the bot used in messages and prompts.
-	// Defaults to "Jarvis".  Set via BOT_NAME=MyBot.
-	BotName string
-	// Metabase connection settings.  Authentication uses an API key
-	// (Admin → Settings → Authentication → API Keys in Metabase ≥ 0.47).
+	// JiraCreateEnabled allows the bot to create Jira issues on behalf of
+	// users.  Disabled by default.  Set via JIRA_CREATE_ENABLED=true.
+	JiraCreateEnabled bool
+
+	// ── Optional: Metabase ───────────────────────────────────────────────────
+	// Configure METABASE_BASE_URL + METABASE_API_KEY to enable Metabase
+	// integration (natural-language SQL queries against connected databases).
+	// Authentication uses an API key (Admin → Settings → API Keys, Metabase ≥ 0.47).
 	MetabaseBaseURL string
 	MetabaseAPIKey  string
 	// MetabaseSchemaPath is the output path for the generated schema
 	// Markdown file.  Defaults to "./docs/metabase_schema.md".
 	MetabaseSchemaPath string
-	// MetabaseEnv is a free-form label included in the generated file
+	// MetabaseEnv is a free-form label included in the generated schema
 	// header (e.g. "production", "staging").  Defaults to "production".
 	MetabaseEnv string
-	// MetabaseQueryTimeout is the HTTP timeout for SQL execution via
-	// /api/dataset.  Analytical databases like Redshift can be slow.
+	// MetabaseQueryTimeout is the HTTP timeout for SQL execution.
+	// Analytical databases can be slow; tune this as needed.
 	// Defaults to 5 minutes.  Set via METABASE_QUERY_TIMEOUT=300s.
 	MetabaseQueryTimeout time.Duration
 }
 
-// Load reads configuration from environment variables.  If a .env file
-// exists in the working directory it will be loaded automatically via
-// godotenv.Load.  Default values are applied for certain fields when
-// environment variables are missing.  The returned Config may be
-// partially populated; validation should be performed by the caller.
+// LesserModel returns the lesser/auxiliary model identifier.  When
+// OPENAI_LESSER_MODEL is not set, it falls back to OpenAIModel so that a
+// single-model deployment works without any additional configuration.
+func (c Config) LesserModel() string {
+	if strings.TrimSpace(c.OpenAILesserModel) != "" {
+		return c.OpenAILesserModel
+	}
+	return c.OpenAIModel
+}
+
+// JiraEnabled reports whether Jira credentials have been provided.
+func (c Config) JiraEnabled() bool {
+	return strings.TrimSpace(c.JiraBaseURL) != ""
+}
+
+// MetabaseEnabled reports whether Metabase credentials have been provided.
+func (c Config) MetabaseEnabled() bool {
+	return strings.TrimSpace(c.MetabaseBaseURL) != ""
+}
+
+// Load reads configuration from environment variables.  A .env file in the
+// working directory is loaded automatically if present (godotenv); errors are
+// ignored because variables may already be set in the process environment.
+// Default values are applied where appropriate.
 func Load() Config {
-	// Attempt to load .env if present; ignore errors since variables may
-	// already be set in the process environment.
 	_ = godotenv.Load()
 
 	cfg := Config{}
@@ -69,14 +100,16 @@ func Load() Config {
 	cfg.SlackUserToken = os.Getenv("SLACK_USER_TOKEN")
 	cfg.OpenAIAPIKey = os.Getenv("OPENAI_API_KEY")
 	cfg.OpenAIModel = getEnv("OPENAI_MODEL", "gpt-4o-mini")
-	cfg.OpenAIFallbackModel = os.Getenv("OPENAI_FALLBACK_MODEL")
+	cfg.OpenAILesserModel = os.Getenv("OPENAI_LESSER_MODEL")
+	cfg.BotName = getEnv("BOT_NAME", "Jarvis")
+
 	cfg.JiraBaseURL = os.Getenv("JIRA_BASE_URL")
 	cfg.JiraEmail = os.Getenv("JIRA_EMAIL")
 	cfg.JiraAPIToken = os.Getenv("JIRA_API_TOKEN")
 	cfg.JiraCreateEnabled = strings.EqualFold(strings.TrimSpace(getEnv("JIRA_CREATE_ENABLED", "false")), "true")
 	cfg.JiraProjectKeys = parseCSV(getEnv("JIRA_PROJECT_KEYS", ""))
 	cfg.JiraProjectNameMap = parseProjectNameMap(os.Getenv("JIRA_PROJECT_NAME_MAP"))
-	cfg.BotName = getEnv("BOT_NAME", "Jarvis")
+
 	cfg.MetabaseBaseURL = os.Getenv("METABASE_BASE_URL")
 	cfg.MetabaseAPIKey = os.Getenv("METABASE_API_KEY")
 	cfg.MetabaseSchemaPath = getEnv("METABASE_SCHEMA_PATH", "./docs/metabase_schema.md")
@@ -86,6 +119,7 @@ func Load() Config {
 	} else {
 		cfg.MetabaseQueryTimeout = 5 * time.Minute
 	}
+
 	pages := getEnv("SLACK_SEARCH_MAX_PAGES", "10")
 	if n, err := strconv.Atoi(pages); err == nil {
 		cfg.SlackSearchMaxPages = n
@@ -95,7 +129,7 @@ func Load() Config {
 	return cfg
 }
 
-// getEnv returns the trimmed value of an environment variable or a default if empty.
+// getEnv returns the trimmed value of an environment variable, or def when empty.
 func getEnv(key, def string) string {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
@@ -104,9 +138,9 @@ func getEnv(key, def string) string {
 	return v
 }
 
-// parseProjectNameMap parses a string of the form "name1:KEY1,name2:KEY2"
-// into a map from lowercased name to uppercase Jira key.
-// Entries that are malformed or empty are silently ignored.
+// parseProjectNameMap parses "name1:KEY1,name2:KEY2" into a map from
+// lowercased name to uppercase Jira project key.
+// Malformed or empty entries are silently ignored.
 func parseProjectNameMap(s string) map[string]string {
 	m := make(map[string]string)
 	for _, entry := range strings.Split(s, ",") {
@@ -127,8 +161,7 @@ func parseProjectNameMap(s string) map[string]string {
 	return m
 }
 
-// parseCSV splits a comma-separated string into a slice of strings,
-// trimming whitespace around each entry and omitting empty entries.
+// parseCSV splits a comma-separated string into a trimmed, non-empty slice.
 func parseCSV(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {

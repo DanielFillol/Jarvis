@@ -18,7 +18,7 @@ const ClarificationPrefix = "CLARIFICATION_NEEDED: "
 //
 // threadHistory provides prior conversation context so the LLM can resolve
 // pronouns and references to entities mentioned in earlier turns
-// (e.g. "ela" → "Multilixo" when established in a previous message).
+// (e.g. "ela" resolved to a company name established in a previous message).
 //
 // baseSQL is the last SQL query executed in the current thread (if any).
 // When non-empty it is injected as a "QUERY BASE" so the LLM can use it as
@@ -66,7 +66,7 @@ REGRAS OBRIGATÓRIAS:
 3. Se não for possível responder à pergunta com os dados disponíveis, responda exatamente com: IMPOSSIBLE
 4. Retorne APENAS o SQL puro — sem explicações, sem blocos de código, sem comentários, sem markdown.
 5. Use LIMIT 100 salvo quando: (a) a pergunta exigir uma agregação total (SUM, COUNT, AVG, etc.); (b) o usuário pedir "todos", "todas", "sem limitar", "sem limite", "tudo que encontrar" ou similar — nestes casos NÃO adicione LIMIT. Pedidos de "blocos de N" ou "N por vez" são instruções de apresentação para o bot, NÃO para SQL — ignore-os ao definir o LIMIT.
-6. NOMES DE COLUNAS (ALIAS): NUNCA retorne colunas com nomes técnicos brutos (ex: id, hauler_id, created_at). Use aliases claros e em português amigável usando aspas duplas (ex: SELECT id AS "ID da Coleta", name AS "Nome do Transportador").
+6. NOMES DE COLUNAS (ALIAS): NUNCA retorne colunas com nomes técnicos brutos (ex: id, user_id, created_at). Use aliases descritivos em português com aspas duplas (ex: SELECT id AS "ID", name AS "Nome", created_at AS "Data de Criação").
 7. Quando existirem perguntas salvas similares, prefira usar as mesmas tabelas e estrutura delas como base.
 8. Para filtrar por nome de empresa/cliente, use comparação case-insensitive (ILIKE, LOWER(), etc. conforme o dialeto) em vez de comparação exata (=).
 9. Ao detalhar resultados de uma query anterior (drill-down), use o mesmo campo que foi utilizado no GROUP BY / SELECT da query original.

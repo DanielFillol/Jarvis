@@ -73,7 +73,7 @@ func initMetabase(cfg config.Config) (*metabase.Client, []metabase.Database, []m
 func main() {
 	// Load configuration (from .env and environment)
 	cfg := config.Load()
-	log.Printf("[BOOT] env check: SLACK_SIGNING_SECRET=%t SLACK_BOT_TOKEN=%t SLACK_USER_TOKEN=%t OPENAI_API_KEY=%t OPENAI_MODEL=%q OPENAI_FALLBACK_MODEL=%q JIRA_BASE_URL=%t JIRA_EMAIL=%t JIRA_API_TOKEN=%t JIRA_CREATE_ENABLED=%t JIRA_PROJECT_KEYS=%v BOT_NAME=%q", cfg.SlackSigningSecret != "", cfg.SlackBotToken != "", cfg.SlackUserToken != "", cfg.OpenAIAPIKey != "", cfg.OpenAIModel, cfg.OpenAIFallbackModel, cfg.JiraBaseURL != "", cfg.JiraEmail != "", cfg.JiraAPIToken != "", cfg.JiraCreateEnabled, cfg.JiraProjectKeys, cfg.BotName)
+	log.Printf("[BOOT] env check: SLACK_SIGNING_SECRET=%t SLACK_BOT_TOKEN=%t SLACK_USER_TOKEN=%t OPENAI_API_KEY=%t OPENAI_MODEL=%q OPENAI_LESSER_MODEL=%q JIRA_BASE_URL=%t JIRA_EMAIL=%t JIRA_API_TOKEN=%t JIRA_CREATE_ENABLED=%t JIRA_PROJECT_KEYS=%v BOT_NAME=%q", cfg.SlackSigningSecret != "", cfg.SlackBotToken != "", cfg.SlackUserToken != "", cfg.OpenAIAPIKey != "", cfg.OpenAIModel, cfg.OpenAILesserModel, cfg.JiraBaseURL != "", cfg.JiraEmail != "", cfg.JiraAPIToken != "", cfg.JiraCreateEnabled, cfg.JiraProjectKeys, cfg.BotName)
 	// Register project name→key mapping for natural language parsing
 	parse.SetProjectNameMap(cfg.JiraProjectNameMap)
 	// Initialize clients
@@ -112,7 +112,7 @@ func main() {
 	mux.Handle("/slack/events", slackHandler)
 	// Start HTTP server
 	port := cfg.Port
-	log.Printf("[BOOT] starting Jarvis port=%s", port)
+	log.Printf("[BOOT] starting %s port=%s", cfg.BotName, port)
 	log.Printf("[BOOT] Listening on :%s", port)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("[BOOT] ListenAndServe: %v", err)

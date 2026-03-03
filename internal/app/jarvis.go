@@ -177,7 +177,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// 6) Decide Slack/Jira search (LLM)
 	// Resolve <#CHANID> → #channel-name and <@USERID> → @username for the router and answer LLM.
 	questionForLLM := s.Slack.ResolveUserMentions(s.Slack.ResolveChannelMentions(parse.StripSlackPermalinks(question)))
-	decision, err := s.LLM.DecideRetrieval(questionForLLM, threadHist, s.Cfg.OpenAIModel, s.Cfg.JiraProjectKeys, senderUserID, s.formattedMetabaseDatabases())
+	decision, err := s.LLM.DecideRetrieval(questionForLLM, threadHist, s.Cfg.LesserModel(), s.Cfg.JiraEnabled(), s.Cfg.JiraProjectKeys, senderUserID, s.formattedMetabaseDatabases())
 	if err != nil {
 		log.Printf("[WARN] decideRetrieval failed: %v", err)
 		if hasThreadPermalink {
@@ -318,11 +318,11 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// 9) Metabase database query
 	var dbCtx string
 	var dbQueryResult *metabase.QueryResult
+	var executedSQL string // promoted so ShowSQL handling below can access it
 	if decision.NeedMetabase && s.Metabase != nil {
 		// Retrieve the last SQL from memory so follow-up queries preserve all
 		// existing filters, even when the thread history is truncated.
 		memBaseSQL, _ := s.loadThreadLastSQL(contextChannel, contextThreadTs)
-		var executedSQL string
 		dbCtx, dbQueryResult, executedSQL = s.runMetabaseQuery(questionForLLM, threadHist, decision.MetabaseDatabaseID, memBaseSQL)
 
 		// LLM requested clarification before generating SQL — ask the user and
@@ -351,6 +351,28 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			// Inject an explicit warning so the LLM does not invent data.
 			dbCtx = "[ERRO: A consulta ao banco de dados falhou ou não retornou dados. NÃO invente métricas, nomes ou valores. Informe ao usuário que não foi possível obter os dados neste momento e sugira tentar novamente.]"
 		}
+	}
+	// 9.5) ShowSQL: the user asked for the query used in a prior answer.
+	// Reply with the validated SQL directly, skipping the answer LLM entirely.
+	if decision.ShowSQL {
+		var showSQLReply string
+		if executedSQL != "" {
+			showSQLReply = fmt.Sprintf(
+				"Reconstruí e validei a query com base no contexto desta conversa:\n```sql\n%s\n```\n\n> _Nota: esta é uma reconstrução — pode diferir levemente da query original, mas foi executada com sucesso no banco de dados._",
+				executedSQL,
+			)
+		} else {
+			showSQLReply = "Não consegui reconstruir uma query válida para esta conversa após várias tentativas. Perdi o contexto necessário para regenerar a consulta. Tente reformular a pergunta original para que eu possa buscar os dados novamente."
+		}
+		if replyErr := replyFn(showSQLReply); replyErr != nil {
+			log.Printf("[ERR] postSlackMessage (show SQL) failed: %v", replyErr)
+			return replyErr
+		}
+		if busyTs != "" {
+			s.Tracker.Track(channel, originTs, busyTs)
+		}
+		log.Printf("[JARVIS] show SQL handled executedSQL_len=%d dur=%s", len(executedSQL), time.Since(start))
+		return nil
 	}
 	// 10) File context from attachments
 	fileCtx := s.buildFileContext(files)
@@ -389,7 +411,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		log.Printf("[JARVIS] large result: bypassing LLM for data formatting, rows=%d", nRows)
 	}
 	// 11) Answer with LLM (with retry for transient errors)
-	answer, err := s.LLM.AnswerWithRetry(questionForLLM, threadHist, slackCtx, finalJiraCtx, dbCtx, fileCtx, images, s.Cfg.OpenAIModel, s.Cfg.OpenAIFallbackModel, 2, 0)
+	answer, err := s.LLM.AnswerWithRetry(questionForLLM, threadHist, slackCtx, finalJiraCtx, dbCtx, fileCtx, images, s.Cfg.OpenAIModel, s.Cfg.OpenAILesserModel, 2, 0)
 	if err != nil || strings.TrimSpace(answer) == "" {
 		log.Printf("[ERR] llmAnswer failed: %v", err)
 		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, (jiraIssueCtx != "" || decision.NeedJira), jiraIssuesFound, issueKey)
@@ -485,7 +507,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 	// 2) Natural language creation: "crie um card...", "crie essa história no JIRA", etc.
 	// The heuristic is a fast pre-filter; the LLM confirms to avoid false positives.
 	if strings.Contains(low, "crie um card") || strings.Contains(low, "criar um card") || parse.LooksLikeJiraCreateIntent(low) {
-		if !s.LLM.ConfirmJiraCreateIntent(q, threadHist, s.Cfg.OpenAIFallbackModel, s.Cfg.OpenAIModel) {
+		if !s.LLM.ConfirmJiraCreateIntent(q, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
 			log.Printf("[JARVIS] LLM rejected create intent — falling through to Q&A")
 			return false, nil
 		}
@@ -496,7 +518,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		// Fetch real Jira examples to inspire the LLM
 		exampleIssues := s.fetchExampleIssues(d.Project, d.IssueType)
 
-		dd, derr := s.LLM.ExtractIssueFromThread(threadHist, q, s.Cfg.OpenAIModel, exampleIssues, s.Cfg.JiraProjectNameMap)
+		dd, derr := s.LLM.ExtractIssueFromThread(threadHist, q, s.Cfg.LesserModel(), exampleIssues, s.Cfg.JiraProjectNameMap)
 		if derr == nil {
 			// Fields explicitly provided by the user take absolute priority
 			if strings.TrimSpace(d.Project) != "" {
@@ -536,10 +558,10 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		return true, s.createIssueAndReply(channel, threadTs, d)
 	}
 	// 3) Thread-based creation: "com base nessa thread crie um card..."
-	if parse.IsThreadBasedCreate(q) && s.LLM.ConfirmJiraCreateIntent(q, threadHist, s.Cfg.OpenAIFallbackModel, s.Cfg.OpenAIModel) {
+	if parse.IsThreadBasedCreate(q) && s.LLM.ConfirmJiraCreateIntent(q, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
 		// 3a) Multi-card variant: "crie dois cards", "um sobre X e outro Y"
 		if parse.IsMultiCardCreate(q) {
-			drafts, derr := s.LLM.ExtractMultipleIssuesFromThread(threadHist, q, s.Cfg.OpenAIModel, s.Cfg.JiraProjectNameMap)
+			drafts, derr := s.LLM.ExtractMultipleIssuesFromThread(threadHist, q, s.Cfg.LesserModel(), s.Cfg.JiraProjectNameMap)
 			if derr != nil {
 				_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Não consegui montar os rascunhos dos cards a partir da thread: %v", derr))
 				return true, nil
@@ -578,7 +600,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		// Fetch real Jira examples to inspire the LLM
 		exampleIssues := s.fetchExampleIssues(parsedProject, parsedType)
 
-		draft, derr := s.LLM.ExtractIssueFromThread(threadHist, q, s.Cfg.OpenAIModel, exampleIssues, s.Cfg.JiraProjectNameMap)
+		draft, derr := s.LLM.ExtractIssueFromThread(threadHist, q, s.Cfg.LesserModel(), exampleIssues, s.Cfg.JiraProjectNameMap)
 		if derr != nil {
 			_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Não consegui montar o rascunho do card a partir da thread: %v", derr))
 			return true, nil
@@ -1525,14 +1547,15 @@ func (s *Service) handleIntroRequest(channel, threadTs, originTs string) error {
 	ctx := llm.IntroContext{
 		BotName:           s.Cfg.BotName,
 		PrimaryModel:      s.Cfg.OpenAIModel,
-		FallbackModel:     s.Cfg.OpenAIFallbackModel,
+		LesserModel:       s.Cfg.OpenAILesserModel,
 		JiraBaseURL:       s.Cfg.JiraBaseURL,
 		JiraProjects:      projList,
 		SlackChannels:     chanList,
 		JiraCreateEnabled: s.Cfg.JiraCreateEnabled,
+		MetabaseEnabled:   s.Metabase != nil,
 	}
 
-	answer, err := s.LLM.GenerateIntroduction(ctx, s.Cfg.OpenAIModel, s.Cfg.OpenAIFallbackModel)
+	answer, err := s.LLM.GenerateIntroduction(ctx, s.Cfg.OpenAIModel, s.Cfg.OpenAILesserModel)
 	if err != nil || strings.TrimSpace(answer) == "" {
 		log.Printf("[JARVIS] intro: LLM failed (%v), using static fallback", err)
 		answer = buildIntroMessage(s.Cfg.BotName, s.Cfg.JiraCreateEnabled, projList)
@@ -1962,7 +1985,7 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 	// Ask the LLM to write the SQL.  Pass thread history so the model can
 	// resolve pronouns and entities mentioned in earlier turns.
 	engineType := s.lookupDatabaseEngine(databaseID)
-	sql, err := s.LLM.GenerateSQL(question, threadHistory, schemaDoc, examples, baseSQL, databaseID, engineType, s.Cfg.OpenAIModel)
+	sql, err := s.LLM.GenerateSQL(question, threadHistory, schemaDoc, examples, baseSQL, databaseID, engineType, s.Cfg.LesserModel())
 	if err != nil {
 		log.Printf("[METABASE] runMetabaseQuery: GenerateSQL failed: %v", err)
 		return "", nil, ""
@@ -2008,7 +2031,7 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 		}
 
 		// Ask the LLM to fix the SQL using the error as context.
-		corrected, corrErr := s.LLM.GenerateCorrectedSQL(question, schemaDoc, lastSQL, queryErrMsg, engineType, databaseID, s.Cfg.OpenAIModel)
+		corrected, corrErr := s.LLM.GenerateCorrectedSQL(question, schemaDoc, lastSQL, queryErrMsg, engineType, databaseID, s.Cfg.LesserModel())
 		if corrErr != nil || strings.TrimSpace(corrected) == "" {
 			log.Printf("[METABASE] runMetabaseQuery: could not generate corrected SQL: %v", corrErr)
 			return fmt.Sprintf("[ERRO: A consulta ao banco de dados falhou: %s]\n\nQuery tentada (db=%d):\n```sql\n%s\n```", queryErrMsg, databaseID, lastSQL), nil, ""

@@ -23,15 +23,23 @@ type RetrievalDecision struct {
 	JiraJQL            string `json:"jira_jql"`
 	NeedMetabase       bool   `json:"need_metabase"`
 	MetabaseDatabaseID int    `json:"metabase_database_id"`
+	// ShowSQL is true when the user is asking for the SQL query used in a
+	// prior answer.  HandleMessage will attempt to reconstruct and validate
+	// the query via runMetabaseQuery (with the usual 3-attempt retry logic)
+	// and reply with the SQL directly, bypassing the answer LLM.
+	ShowSQL bool `json:"show_sql"`
 }
 
 // DecideRetrieval consults the language model to determine which contexts
 // (Slack, Jira, Metabase) should be retrieved for a given question.
-// metabaseDatabases is a list of available Metabase databases formatted as
+//
+// jiraEnabled must be true when Jira credentials are configured; when false
+// the Jira routing section is omitted from the prompt entirely.
+// metabaseDatabases is a list of available databases formatted as
 // "ID: Name (engine)".  Pass an empty slice to disable Metabase routing.
-func (c *Client) DecideRetrieval(question, threadHistory, model string, projectKeys []string, senderUserID string, metabaseDatabases []string) (RetrievalDecision, error) {
+func (c *Client) DecideRetrieval(question, threadHistory, model string, jiraEnabled bool, projectKeys []string, senderUserID string, metabaseDatabases []string) (RetrievalDecision, error) {
 	projectsCtx := ""
-	if len(projectKeys) > 0 {
+	if jiraEnabled && len(projectKeys) > 0 {
 		projectsCtx = fmt.Sprintf("\nProjetos Jira configurados: %s\n", strings.Join(projectKeys, ", "))
 	}
 	senderCtx := ""
@@ -60,37 +68,23 @@ func (c *Client) DecideRetrieval(question, threadHistory, model string, projectK
 	if len(metabaseDatabases) > 0 {
 		metabaseJSON = `
   "need_metabase": true/false,
-  "metabase_database_id": <ID do banco acima ou 0>,`
+  "metabase_database_id": <ID do banco acima ou 0>`
 	}
 
-	prompt := fmt.Sprintf(`Você é um roteador de contexto de um assistente Slack+Jira+Metabase.
-Decida quais fontes buscar para responder a pergunta.
-%s%s%s%s
-Retorne APENAS JSON válido:
-{
-  "need_slack": true/false,
-  "slack_query": "...",
-  "need_jira": true/false,
-  "jira_intent": "listar_bugs_abertos|busca_texto|default",
-  "jira_jql": ""%s
-}
-
-Fontes disponíveis:
-- Jira: tickets, status, roadmap, bugs, histórias, épicos, progresso de tarefas.
-- Slack: discussões, decisões, links de threads, contexto operacional, conversas sobre um tema.
-- Metabase (banco de dados): métricas, contagens, totais, médias, relatórios de dados, KPIs, análises de negócio que requerem agregações SQL (ex: "quantos pedidos hoje?", "receita do mês", "top 10 clientes", "usuários ativos"). Use need_metabase=true apenas se a pergunta claramente necessita de dados do banco.
-
-Regras de roteamento:
-1. Roadmap, escopo, "o que foi feito", "está no ar", bugs abertos → need_jira=true.
+	// Build Jira-specific prompt sections only when Jira is configured.
+	jiraSourceLine := ""
+	jiraRules := ""
+	jiraIntentBlock := ""
+	jiraJQLBlock := ""
+	if jiraEnabled {
+		jiraSourceLine = "- Jira: tickets, status, roadmap, bugs, histórias, épicos, progresso de tarefas.\n"
+		jiraRules = `1. Roadmap, escopo, "o que foi feito", "está no ar", bugs abertos → need_jira=true.
 2. "onde falamos", "qual foi a decisão", "me manda o link", "thread do slack" → need_slack=true.
 3. Resumo/retrospectiva de processo (sprint, fechamento, entrega) → need_jira=true E need_slack=true.
-4. Se need_jira=true para pergunta substantiva (não apenas listagem de tickets), considere need_slack=true também — discussões no Slack enriquecem a resposta com contexto que o Jira não tem.
+4. Se need_jira=true para pergunta substantiva (não apenas listagem de tickets), considere need_slack=true também.
 5. Perguntas curtas (≤ 2 palavras) ou que já têm resposta no histórico da thread → need_slack=false, need_jira=false.
-6. Criar card no Jira → need_slack=false, need_jira=false.
-7. Se o histórico da thread contém blocos de código SQL ou menções a resultados de banco de dados, E o usuário pede para: executar/rodar a consulta ("executa", "execute", "roda", "ué executa"), modificar um filtro, adicionar/remover uma condição, tentar com outro parâmetro, confirmar se uma query funciona, ou faz uma pergunta de follow-up sobre os mesmos dados (ex: "e dessas quantas têm rota?", "filtre por data X") → need_metabase=true. Use o metabase_database_id da linha "Query executada (db=N):" se existir, senão use 0 (o sistema fará o fallback automaticamente).
-8. Se o usuário pergunta sobre a query/SQL que o bot usou ("qual query você usou", "me da o SQL", "qual é a consulta", "que query é essa") → need_slack=false, need_jira=false, need_metabase=false (a resposta está no histórico da thread, não precisa de nova consulta).
-9. Perguntas de follow-up de dados no mesmo contexto (pronomes como "dessas", "desses", "deles", referindo a entidades já consultadas) → need_metabase=true com o mesmo database_id do turno anterior.
-
+6. Criar card no Jira → need_slack=false, need_jira=false.`
+		jiraIntentBlock = `
 Valores de jira_intent:
 - "listar_bugs_abertos": perguntas sobre bugs em aberto, falhas, erros.
 - "busca_texto": pesquisa de contexto sobre um tema específico no Jira (funcionalidades, épicos, histórias).
@@ -101,17 +95,48 @@ Regras para jira_jql:
 - Use apenas campos padrão do Jira Cloud: project, issuetype, status, statusCategory, text, assignee, priority, labels, sprint, fixVersion, updated, created.
 - Para busca por texto: text ~ "termo"
 - Para bugs abertos: issuetype = Bug AND statusCategory != Done
-- Para busca por sprint: sprint = "Sprint N" (ex: sprint = "Sprint 7") ou sprint in openSprints() para sprints ativas
+- Para busca por sprint: sprint = "Sprint N" ou sprint in openSprints() para sprints ativas.
 - SEMPRE agrupe condições OR com parênteses quando combinadas com AND: project = X AND (text ~ "a" OR text ~ "b") — NUNCA escreva: project = X AND text ~ "a" OR text ~ "b"
+`
+		jiraJQLBlock = `  "need_jira": true/false,
+  "jira_intent": "listar_bugs_abertos|busca_texto|default",
+  "jira_jql": ""`
+	} else {
+		// Jira not configured: always output false/empty fields so the JSON is valid.
+		jiraJQLBlock = `  "need_jira": false,
+  "jira_intent": "",
+  "jira_jql": ""`
+	}
 
+	prompt := fmt.Sprintf(`Você é um roteador de contexto de um assistente de Slack.
+Decida quais fontes buscar para responder a pergunta.
+%s%s%s%s
+Retorne APENAS JSON válido:
+{
+  "need_slack": true/false,
+  "slack_query": "...",
+%s%s,
+  "show_sql": true/false
+}
+
+Fontes disponíveis:
+%s- Slack: discussões, decisões, links de threads, contexto operacional, conversas sobre um tema.
+- Metabase (banco de dados): métricas, contagens, totais, médias, relatórios de dados, KPIs, análises de negócio que requerem agregações SQL (ex: "quantos pedidos hoje?", "receita do mês", "top 10 clientes"). Use need_metabase=true apenas se a pergunta claramente necessita de dados do banco.
+
+Regras de roteamento:
+%s
+7. Se o histórico da thread contém blocos de código SQL ou resultados de banco de dados, E o usuário pede para executar/rodar/modificar a consulta ou faz uma pergunta de follow-up sobre os mesmos dados → need_metabase=true. Use o metabase_database_id da linha "Query executada (db=N):" se existir, senão use 0.
+8. Se o usuário pergunta sobre a query/SQL que o bot usou ("qual query você usou", "me da o SQL", "qual é a consulta que você fez", "fornecer a query") → show_sql=true, need_metabase=true, metabase_database_id com o ID da linha "Query executada (db=N):" do histórico (ou 0 se não houver), need_slack=false, need_jira=false. O sistema irá reconstruir e validar a query.
+9. Perguntas de follow-up de dados (pronomes como "dessas", "desses", referindo a entidades já consultadas) → need_metabase=true com o mesmo database_id do turno anterior.
+%s
 Regras para slack_query (IMPORTANTE):
 - slack_query NUNCA pode ficar vazio quando need_slack=true — sempre gere uma query útil.
-- Se a pergunta mencionar canais (ex: #prod-coletas, #prod-musa-hub), inclua in:#nome-do-canal na query.
+- Se a pergunta mencionar canais (ex: #nome-do-canal), inclua in:#nome-do-canal na query.
 - Use apenas 2–4 palavras-chave do tema, sem filtros extras.
 - NÃO use has:thread, has:link, has:reaction — reduzem o recall drasticamente.
 - Prefira termos sem aspas; use aspas apenas para frases exatas críticas.
-- Quando a pergunta é "o que X falou/disse/escreveu/postou", use from:@username (NÃO apenas a menção @username). Ex: "o que o @fillol falou" → from:@fillol
-- Se a pergunta menciona um usuário Slack (<@USERID>) em contexto de busca geral (não "o que falou"), inclua o identificador EXATO: ex. "<@U09FJSKP407>"
+- Quando a pergunta é "o que X falou/disse/escreveu/postou", use from:@username. Ex: "o que o @alice falou" → from:@alice
+- Se a pergunta menciona um usuário Slack (<@USERID>) em contexto de busca geral, inclua o identificador EXATO: ex. "<@U09FJSKP407>"
 
 Regras para datas na slack_query:
 - NÃO inclua expressões como "essa semana" ou "esta semana" como termos de busca — a API do Slack não as interpreta.
@@ -128,7 +153,7 @@ Thread (contexto recente):
 
 Pergunta:
 %s
-`, projectsCtx, senderCtx, dateCtx, metabaseCtx, metabaseJSON, clip(threadHistory, 1200), question)
+`, projectsCtx, senderCtx, dateCtx, metabaseCtx, jiraJQLBlock, metabaseJSON, jiraSourceLine, jiraRules, jiraIntentBlock, clip(threadHistory, 1200), question)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
 	// Use 4000 tokens: reasoning models (e.g. gpt-5-mini) consume invisible thinking
@@ -155,28 +180,49 @@ Pergunta:
 		d.MetabaseDatabaseID = 0
 	}
 
-	// (3) normalize Slack query quirks
+	// Enforce that Jira is never routed when not configured.
+	if !jiraEnabled {
+		d.NeedJira = false
+		d.JiraIntent = ""
+		d.JiraJQL = ""
+	}
+
+	// Normalize Slack query quirks.
 	d.SlackQuery = normalizeSlackQuery(d.SlackQuery)
 
-	// (2) deterministic overrides
-	applyDeterministicOverrides(question, threadHistory, &d)
+	// Apply deterministic overrides last.
+	applyDeterministicOverrides(question, threadHistory, jiraEnabled, &d)
 
 	return d, nil
 }
 
-// applyDeterministicOverrides enforces deterministic routing rules that should
-// not depend on the LLM being perfect.
-func applyDeterministicOverrides(question, threadHistory string, d *RetrievalDecision) {
+// applyDeterministicOverrides enforces routing rules that must hold regardless
+// of what the LLM decided.  jiraEnabled must match the value passed to
+// DecideRetrieval so that overrides never accidentally enable a disabled source.
+func applyDeterministicOverrides(question, threadHistory string, jiraEnabled bool, d *RetrievalDecision) {
 	qLower := strings.ToLower(strings.TrimSpace(question))
 	if qLower == "" {
 		return
 	}
 
-	// Note: Jira creation intent suppression was removed from here.
-	// The LLM prompt already contains rule 6 ("criar card → need_slack=false,
-	// need_jira=false"). Using a heuristic override here caused context
-	// suppression on Q&A fallbacks when the create intent was rejected by
-	// ConfirmJiraCreateIntent in the create flow.
+	// 0. ShowSQL request: force Metabase routing (to validate the reconstructed
+	// query), clear Slack/Jira, and recover the database ID from thread history
+	// in case the LLM missed it.
+	if d.ShowSQL {
+		d.NeedMetabase = true
+		d.NeedSlack = false
+		d.SlackQuery = ""
+		d.NeedJira = false
+		d.JiraJQL = ""
+		if d.MetabaseDatabaseID <= 0 {
+			if m := reMetabaseResult.FindStringSubmatch(threadHistory); m != nil {
+				if dbID, _ := strconv.Atoi(m[1]); dbID > 0 {
+					d.MetabaseDatabaseID = dbID
+				}
+			}
+		}
+		return
+	}
 
 	// 1. SQL re-execution/modification intent: if the thread has a prior
 	// Metabase result and the question looks like a modification or follow-up,
@@ -196,6 +242,11 @@ func applyDeterministicOverrides(question, threadHistory string, d *RetrievalDec
 		d.SlackQuery = ""
 		d.NeedJira = false
 		d.JiraJQL = ""
+		return
+	}
+
+	// Rules 3–5 require Jira to be configured; skip entirely when it is not.
+	if !jiraEnabled {
 		return
 	}
 

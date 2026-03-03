@@ -94,20 +94,25 @@ type openAIChatResponse struct {
 	} `json:"error,omitempty"`
 }
 
-// Client encapsulates the OpenAI API key used to authenticate chat
-// completions requests.
+// Client encapsulates credentials and capability flags used across all LLM calls.
 type Client struct {
 	APIKey      string
 	JiraBaseURL string
 	BotName     string
+	// JiraEnabled and MetabaseEnabled tell the answer LLM which integrations
+	// are available so it can respond accurately when users ask about them.
+	JiraEnabled     bool
+	MetabaseEnabled bool
 }
 
 // NewClient constructs a new LLM client from the provided configuration.
 func NewClient(cfg config.Config) *Client {
 	return &Client{
-		APIKey:      cfg.OpenAIAPIKey,
-		JiraBaseURL: cfg.JiraBaseURL,
-		BotName:     cfg.BotName,
+		APIKey:          cfg.OpenAIAPIKey,
+		JiraBaseURL:     cfg.JiraBaseURL,
+		BotName:         cfg.BotName,
+		JiraEnabled:     cfg.JiraEnabled(),
+		MetabaseEnabled: cfg.MetabaseEnabled(),
 	}
 }
 
@@ -182,14 +187,12 @@ func (c *Client) chatWithTemperature(messages []OpenAIMessage, model string, tem
 }
 
 // ConfirmJiraCreateIntent calls the LLM to verify whether the message
-// genuinely intends to create a Jira card.  threadHistory provides prior
-// conversation context so the LLM can distinguish commands like "crie com
-// base nessa discussão" from hypothetical or contextual mentions of creation.
-// It tries the fallback model first (cheaper/faster) and falls back to the
-// primary model on failure.
-// Returns true only when the LLM explicitly confirms creation intent.
-// On any error, returns false to avoid creating unwanted cards.
-func (c *Client) ConfirmJiraCreateIntent(question, threadHistory, fallbackModel, primaryModel string) bool {
+// genuinely intends to create a Jira issue right now.  threadHistory provides
+// prior conversation context so the LLM can distinguish immediate commands
+// from hypothetical or contextual mentions of creation.
+// The lesserModel is tried first (cheaper/faster); primaryModel is used on
+// failure.  Returns false on any error to avoid creating unwanted issues.
+func (c *Client) ConfirmJiraCreateIntent(question, threadHistory, lesserModel, primaryModel string) bool {
 	threadSection := ""
 	if t := strings.TrimSpace(threadHistory); t != "" {
 		threadSection = fmt.Sprintf("\nContexto da conversa (use para entender se o pedido é imediato ou hipotético):\n%s\n", clip(t, 2000))
@@ -214,7 +217,7 @@ Mensagem: %q`, threadSection, question)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
 
-	model := strings.TrimSpace(fallbackModel)
+	model := strings.TrimSpace(lesserModel)
 	if model == "" {
 		model = primaryModel
 	}

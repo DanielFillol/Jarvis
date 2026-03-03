@@ -13,16 +13,17 @@ import (
 type IntroContext struct {
 	BotName           string
 	PrimaryModel      string
-	FallbackModel     string
+	LesserModel       string
 	JiraBaseURL       string
-	JiraProjects      []string // formatted as "KEY — Nome"
-	SlackChannels     []string // formatted as "#canal"
+	JiraProjects      []string // formatted as "KEY — Name"
+	SlackChannels     []string // formatted as "#channel"
 	JiraCreateEnabled bool
+	MetabaseEnabled   bool
 }
 
 // GenerateIntroduction calls the LLM to produce a rich, contextual
 // self-introduction in Slack mrkdwn format using real configuration data.
-func (c *Client) GenerateIntroduction(ctx IntroContext, model, fallbackModel string) (string, error) {
+func (c *Client) GenerateIntroduction(ctx IntroContext, model, lesserModel string) (string, error) {
 	botName := ctx.BotName
 	if strings.TrimSpace(botName) == "" {
 		botName = "Jarvis"
@@ -80,7 +81,24 @@ func (c *Client) GenerateIntroduction(ctx IntroContext, model, fallbackModel str
 • _"buscar menções a 'compliance' nos últimos 30 dias"_`
 	}
 
-	prompt := fmt.Sprintf(`Você é o %s, assistente do Slack com personalidade, integrado ao Jira e IA.
+	// Build optional Metabase section.
+	metabaseBlock := ""
+	if ctx.MetabaseEnabled {
+		metabaseBlock = `:bar_chart: *Dados (Metabase)*
+• _"quantos pedidos chegaram hoje?"_ — consulta SQL em linguagem natural
+• _"receita do mês por categoria"_ — agrega e resume dados do banco
+• _"top 10 clientes ativos"_ — ranking e filtros sobre qualquer tabela
+• _"compare os últimos 3 meses"_ — análises de tendência e variação
+
+`
+	}
+
+	lesserLine := ""
+	if strings.TrimSpace(ctx.LesserModel) != "" && ctx.LesserModel != ctx.PrimaryModel {
+		lesserLine = " — auxiliar: _" + ctx.LesserModel + "_"
+	}
+
+	prompt := fmt.Sprintf(`Você é o %s, assistente do Slack com personalidade.
 
 Sua tarefa: gerar uma apresentação em Slack mrkdwn usando EXATAMENTE o esqueleto abaixo.
 Substitua cada [PLACEHOLDER] pelo conteúdo real indicado. Não adicione nem remova seções.
@@ -94,7 +112,7 @@ Oi! Sou o *%s* :wave: — [1 frase direta e com personalidade descrevendo o que 
 :slack: *Slack*
 %s
 
-%s:paperclip: *Arquivos*
+%s%s:paperclip: *Arquivos*
 • _"analise este relatório PDF"_ — lê e interpreta o conteúdo do documento
 • _"o que está nessa planilha?"_ — extrai dados de XLSX/DOCX
 • _"descreva a imagem anexada"_ — visão de IA para imagens (PNG, JPG, GIF, WEBP)
@@ -103,8 +121,8 @@ Oi! Sou o *%s* :wave: — [1 frase direta e com personalidade descrevendo o que 
 :speech_balloon: *Conversa livre*
 [2-3 exemplos de uso livre em itálico: resumir thread, tirar dúvida técnica, analisar arquivo ou redigir texto]
 
-> :robot_face: Modelo: *%s* — fallback: _%s_
-> Me chame com _@%s_ ou _jarvis:_ em qualquer canal :rocket:
+> :robot_face: Modelo: *%s*%s
+> Me chame com _@%s_ ou _%s:_ em qualquer canal :rocket:
 ═══ FIM DO ESQUELETO ═══
 
 REGRAS INVIOLÁVEIS de formatação Slack mrkdwn:
@@ -119,14 +137,14 @@ REGRAS INVIOLÁVEIS de formatação Slack mrkdwn:
 		botName, botName,
 		sampleKey, sampleKey2, sampleKey,
 		chanExamples,
-		createBlock,
-		ctx.PrimaryModel, ctx.FallbackModel, botName,
+		createBlock, metabaseBlock,
+		ctx.PrimaryModel, lesserLine, botName, strings.ToLower(botName),
 	)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
 	out, err := c.Chat(messages, model, 0.75, 2000)
-	if err != nil && strings.TrimSpace(fallbackModel) != "" && fallbackModel != model {
-		out, err = c.Chat(messages, fallbackModel, 0.75, 2000)
+	if err != nil && strings.TrimSpace(lesserModel) != "" && lesserModel != model {
+		out, err = c.Chat(messages, lesserModel, 0.75, 2000)
 	}
 	if err != nil {
 		return "", err
@@ -245,6 +263,16 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 			"- NÃO mencione JQL em nenhuma hipótese — JQL é exclusivo para perguntas sobre o Jira.",
 			"- NÃO oriente o usuário a usar o Jira ou a fazer buscas no Jira.",
 			"- Se os dados forem insuficientes, pergunte ao usuário como refinar a consulta.")
+	}
+	// Inform the LLM which optional integrations are active so it responds
+	// honestly when users ask about capabilities that are not configured.
+	if !c.JiraEnabled {
+		systemParts = append(systemParts, "",
+			"JIRA NÃO CONFIGURADO: A integração com Jira não está habilitada nesta instalação. Se o usuário pedir algo relacionado a Jira (criar card, buscar issue, roadmap etc.), informe gentilmente que essa integração não está disponível e sugira que o administrador configure as variáveis JIRA_BASE_URL, JIRA_EMAIL e JIRA_API_TOKEN.")
+	}
+	if !c.MetabaseEnabled {
+		systemParts = append(systemParts, "",
+			"METABASE NÃO CONFIGURADO: A integração com Metabase (banco de dados) não está habilitada nesta instalação. Se o usuário pedir consultas de dados, métricas ou relatórios que requeiram SQL, informe gentilmente que essa integração não está disponível e sugira que o administrador configure as variáveis METABASE_BASE_URL e METABASE_API_KEY.")
 	}
 	system := strings.Join(systemParts, "\n")
 	var u strings.Builder

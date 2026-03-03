@@ -21,13 +21,13 @@ func (c *Client) AnswerWithModel(question, threadHistory, slackCtx, jiraCtx, mod
 	return c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, "", "", nil, model)
 }
 
-// AnswerWithRetry attempts to answer using primaryModel, retrying transient failures,
-// then falls back to fallbackModel (also with retries). This restores the monolith behavior
-// where the LLM call was resilient to flaky networking / 429 / 5xx.
+// AnswerWithRetry generates an answer using primaryModel, retrying on transient
+// failures, then falls back to lesserModel when configured and different.
+// This makes answer generation resilient to flaky networking, 429s, and 5xxs.
 func (c *Client) AnswerWithRetry(
 	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx string,
 	images []ImageAttachment,
-	primaryModel, fallbackModel string,
+	primaryModel, lesserModel string,
 	maxAttempts int,
 	baseDelay time.Duration,
 ) (string, error) {
@@ -44,16 +44,16 @@ func (c *Client) AnswerWithRetry(
 		return out, nil
 	}
 
-	// Fall back if configured and different.
-	if fallbackModel != "" && fallbackModel != primaryModel {
-		out2, err2 := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, images, fallbackModel, maxAttempts, baseDelay)
+	// Fall back to the lesser model if configured and different from primary.
+	if lesserModel != "" && lesserModel != primaryModel {
+		out2, err2 := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, images, lesserModel, maxAttempts, baseDelay)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
 			return out2, nil
 		}
 		if err2 != nil {
 			return "", err2
 		}
-		return "", errors.New("empty content from openai (fallback)")
+		return "", errors.New("empty content from openai (lesser model fallback)")
 	}
 
 	if err != nil {
