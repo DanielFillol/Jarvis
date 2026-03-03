@@ -1350,3 +1350,45 @@ func (c *Client) rewriteFromToUserIDs(q string) string {
 	out = strings.Join(strings.Fields(out), " ")
 	return strings.TrimSpace(out)
 }
+
+// GetThreadFiles fetches all file attachments from the messages of a Slack
+// thread and returns them deduplicated by file ID.
+func (c *Client) GetThreadFiles(channel, threadTs string) ([]File, error) {
+	if c.BotToken == "" {
+		return nil, errors.New("missing Slack bot token")
+	}
+	u := fmt.Sprintf("%s/conversations.replies?channel=%s&ts=%s&limit=200", c.apiBase(), url.QueryEscape(channel), url.QueryEscape(threadTs))
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("Authorization", "Bearer "+c.BotToken)
+	resp, err := c.do(req, 15*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	var data struct {
+		OK       bool   `json:"ok"`
+		Error    string `json:"error"`
+		Messages []struct {
+			Files []File `json:"files,omitempty"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(rb, &data); err != nil {
+		return nil, err
+	}
+	if !data.OK {
+		return nil, fmt.Errorf("slack error: %s", data.Error)
+	}
+	var files []File
+	seen := make(map[string]bool)
+	for _, m := range data.Messages {
+		for _, f := range m.Files {
+			if seen[f.ID] {
+				continue
+			}
+			seen[f.ID] = true
+			files = append(files, f)
+		}
+	}
+	return files, nil
+}

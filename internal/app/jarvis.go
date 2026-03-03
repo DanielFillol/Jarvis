@@ -752,8 +752,9 @@ func (s *Service) fetchExampleIssues(project, issueType string) []string {
 	return examples
 }
 
-// createIssueAndReply creates a Jira issue via the Jira client and posts
-// a confirmation message to Slack.  It returns any error from Jira.
+// createIssueAndReply creates a Jira issue via the Jira client, posts a
+// confirmation message to Slack, and attaches any images or videos found in
+// the thread to the newly created issue.
 func (s *Service) createIssueAndReply(channel, threadTs string, d jira.IssueDraft) error {
 	d.Project = strings.TrimSpace(d.Project)
 	d.IssueType = strings.TrimSpace(d.IssueType)
@@ -771,7 +772,41 @@ func (s *Service) createIssueAndReply(channel, threadTs string, d jira.IssueDraf
 	base := strings.TrimRight(s.Cfg.JiraBaseURL, "/")
 	link := base + "/browse/" + created.Key
 	_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Card criado ✅ *%s*\n%s", created.Key, link))
+	s.attachThreadMediaToIssue(created.Key, channel, threadTs)
 	return nil
+}
+
+// attachThreadMediaToIssue fetches all files from the Slack thread and uploads
+// them as attachments to the given Jira issue.  Errors are logged but not
+// propagated — attachment failures do not affect the card creation reply.
+func (s *Service) attachThreadMediaToIssue(issueKey, channel, threadTs string) {
+	files, err := s.Slack.GetThreadFiles(channel, threadTs)
+	if err != nil {
+		log.Printf("[JARVIS] GetThreadFiles for %s: %v", issueKey, err)
+		return
+	}
+	const maxFileBytes = 10 * 1024 * 1024 // 10 MB per file
+	attached := 0
+	for _, f := range files {
+		if f.Size > maxFileBytes {
+			log.Printf("[JARVIS] skipping %s (size %d > 10MB) for jira attach", f.Name, f.Size)
+			continue
+		}
+		data, dlErr := s.Slack.DownloadFile(f.URLPrivateDownload)
+		if dlErr != nil {
+			log.Printf("[JARVIS] download %s for jira attach: %v", f.Name, dlErr)
+			continue
+		}
+		if attErr := s.Jira.AttachFileToIssue(issueKey, f.Name, f.Mimetype, data); attErr != nil {
+			log.Printf("[JARVIS] attach %s to %s: %v", f.Name, issueKey, attErr)
+			continue
+		}
+		log.Printf("[JARVIS] attached %s to %s", f.Name, issueKey)
+		attached++
+	}
+	if attached > 0 {
+		log.Printf("[JARVIS] %d file(s) attached to %s", attached, issueKey)
+	}
 }
 
 // isTextMimetype reports whether a file MIME type is a supported text format

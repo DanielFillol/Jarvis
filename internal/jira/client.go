@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -359,6 +360,42 @@ func jiraClip(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// AttachFileToIssue uploads a file as an attachment to an existing Jira issue.
+// The Jira attachment API requires the X-Atlassian-Token: no-check header to
+// bypass XSRF verification.
+func (c *Client) AttachFileToIssue(issueKey, filename, contentType string, data []byte) error {
+	if c.BaseURL == "" || c.Email == "" || c.Token == "" {
+		return errors.New("missing Jira credentials or base URL")
+	}
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	part, err := w.CreateFormFile("file", filename)
+	if err != nil {
+		return fmt.Errorf("create form file: %w", err)
+	}
+	if _, err := part.Write(data); err != nil {
+		return fmt.Errorf("write file data: %w", err)
+	}
+	w.Close()
+	u := fmt.Sprintf("%s/rest/api/3/issue/%s/attachments", c.BaseURL, url.PathEscape(issueKey))
+	req, _ := http.NewRequest("POST", u, &buf)
+	req.Header.Set("X-Atlassian-Token", "no-check")
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	cred := base64.StdEncoding.EncodeToString([]byte(c.Email + ":" + c.Token))
+	req.Header.Set("Authorization", "Basic "+cred)
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("jira attach: %w", err)
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("jira attach status=%d body=%s", resp.StatusCode, preview(string(rb), 400))
+	}
+	return nil
 }
 
 // preview truncates long strings for use in error messages.
