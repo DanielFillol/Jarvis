@@ -1,4 +1,3 @@
-// internal/parse/issue_key.go
 package parse
 
 import (

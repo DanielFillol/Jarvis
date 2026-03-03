@@ -1,4 +1,3 @@
-// internal/state/pending.go
 package state
 
 import (
@@ -53,7 +52,7 @@ func (s *Store) Save(p *PendingIssue) {
 }
 
 // Load retrieves a pending issue by channel and thread.  If the entry
-// has expired it is removed and nil is returned.  A copy of the
+// has expired, it is removed and nil is returned.  A copy of the
 // underlying struct is returned to avoid accidental mutation.
 func (s *Store) Load(channel, threadTs string) *PendingIssue {
 	s.mu.Lock()

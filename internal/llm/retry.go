@@ -1,4 +1,3 @@
-// internal/llm/retry.go
 package llm
 
 import (
@@ -15,7 +14,7 @@ func (c *Client) CallOpenAIWithModel(messages []OpenAIMessage, model string, tem
 	return c.Chat(messages, model, temperature, maxTokens)
 }
 
-// AnswerWithModel generates an answer using a specific model, bypassing the
+// AnswerWithModel generates an answer using a specific model bypassing the
 // primary/fallback selection in AnswerWithRetry.
 func (c *Client) AnswerWithModel(question, threadHistory, slackCtx, jiraCtx, model string) (string, error) {
 	return c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, "", "", nil, model)
@@ -44,7 +43,7 @@ func (c *Client) AnswerWithRetry(
 		return out, nil
 	}
 
-	// Fall back to the lesser model if configured and different from primary.
+	// Fall back to the lesser model if configured and different from the primary.
 	if lesserModel != "" && lesserModel != primaryModel {
 		out2, err2 := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, images, lesserModel, maxAttempts, baseDelay)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
@@ -92,8 +91,8 @@ func (c *Client) answerWithRetrySingleModel(
 
 func backoffWithJitter(base time.Duration, attempt int) time.Duration {
 	// exponential backoff: base * 2^(attempt-1), capped
-	mult := math.Pow(2, float64(attempt-1))
-	d := time.Duration(float64(base) * mult)
+	multi := math.Pow(2, float64(attempt-1))
+	d := time.Duration(float64(base) * multi)
 	const capDelay = 6 * time.Second
 	if d > capDelay {
 		d = capDelay

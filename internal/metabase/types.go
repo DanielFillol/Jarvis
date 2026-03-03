@@ -1,4 +1,3 @@
-// internal/metabase/types.go
 package metabase
 
 // SessionResp is the response from POST /api/session.
@@ -29,7 +28,7 @@ type DatabaseMetadata struct {
 	Tables []Table `json:"tables"`
 }
 
-// Table represents a Metabase table (i.e. a database table or view).
+// Table represents a Metabase table (i.e., a database table or view).
 type Table struct {
 	ID             int     `json:"id"`
 	Name           string  `json:"name"`

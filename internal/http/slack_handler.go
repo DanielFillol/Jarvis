@@ -1,4 +1,3 @@
-// internal/http/slack_handler.go
 package http
 
 import (
@@ -47,7 +46,7 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var env slack.SlackEventEnvelope
+	var env slack.EventEnvelope
 	if err := json.Unmarshal(rawBody, &env); err != nil {
 		log.Printf("[ERR] unmarshal envelope: %v body=%s", err, preview(string(rawBody), 500))
 		http.Error(w, "bad_request", 400)
@@ -80,7 +79,7 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var msg slack.SlackMessageEvent
+	var msg slack.MessageEvent
 	if err := json.Unmarshal(env.Event, &msg); err != nil {
 		log.Printf("[ERR] unmarshal event: %v event=%s", err, preview(string(env.Event), 600))
 		return
@@ -141,7 +140,7 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Determine if bot was summoned.
 	// - In DMs: always accept.
-	// - In channels: accept ONLY on a direct Slack mention (<@BOTID>), no prefixes, no auto-followups.
+	// - In channels: accept ONLY on a direct Slack mention (<@BOT_ID>), no prefixes, no auto-followups.
 	summoned := isDM
 	if !summoned {
 		summoned = parse.LooksLikeDirectMention(text, h.Slack.BotUserID)
@@ -157,7 +156,7 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[BOT] summoned but empty after strip and no files; ignoring")
 		return
 	}
-	// When user sends only files without any text, generate a default prompt.
+	// When a user sends only files without any text, generate a default prompt.
 	if question == "" {
 		question = "Analise o(s) arquivo(s) anexado(s) e me dê um resumo."
 	}

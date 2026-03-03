@@ -1,4 +1,3 @@
-// internal/app/jira_messages.go
 package app
 
 import (

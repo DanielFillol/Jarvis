@@ -1,4 +1,3 @@
-// internal/app/jarvis.go
 package app
 
 import (
@@ -27,7 +26,7 @@ import (
 )
 
 // Service encapsulates the core orchestration logic of Jarvis.  It
-// coordinates between Slack, Jira, Metabase and the language model to answer
+// coordinates between Slack, Jira, Metabase, and the language model to answer
 // questions and handle issue creation flows.  The Service does not depend on
 // net/http and is therefore easily testable.
 type Service struct {
@@ -42,9 +41,7 @@ type Service struct {
 	Tracker                   *state.MessageTracker
 	Cfg                       config.Config
 	// threadLastDBID maps "channel:threadTs" → database ID for the last Metabase
-	// query executed in that thread.  Used to restore routing context for
-	// follow-up messages like "essa query funciona" / "ué executa entao" that
-	// don't contain the "Query executada (db=N):" tag (which is internal only).
+	// query executed in that thread.  Used to restore routing context for follow-up messages
 	threadLastDBID sync.Map
 
 	// threadLastSQL maps "channel:threadTs" → the last successfully executed SQL
@@ -77,16 +74,16 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 
 // HandleMessage processes an incoming message directed at the bot.  It
 // delegates to the appropriate flows: Jira creation, issue lookup,
-// context retrieval and answer generation.  On error, a fallback
+// context retrieval, and answer generation.  On error, a fallback
 // answer is posted to Slack to provide user feedback.
-func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, question, senderUserID string, files []slack.SlackFile) error {
+func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, question, senderUserID string, files []slack.File) error {
 	start := time.Now()
 	log.Printf("[JARVIS] start question=%q originTs=%q senderUserID=%q", preview(question, 180), originTs, senderUserID)
-	// 0) Early check: bot introduction / capabilities overview
+	// 0) Early check: bot introduction / capability overview
 	if isIntroRequest(question) {
 		return s.handleIntroRequest(channel, threadTs, originTs)
 	}
-	// 1) Decide which thread to use as context (current vs permalink)
+	// 1) Decide which thread to use as context (current vs. permalink)
 	contextChannel := channel
 	contextThreadTs := threadTs
 	hasThreadPermalink := false
@@ -136,7 +133,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		log.Printf("[WARN] thread history failed: %v", err)
 	}
 	log.Printf("[JARVIS] thread history chars=%d", len(threadHist))
-	// 3) High priority: Jira create flows (always refer to the Slack thread where the user spoke)
+	// 3) High priority: Jira creates flows (always refer to the Slack thread where the user spoke)
 	handled, err := s.maybeHandleJiraCreateFlows(channel, threadTs, originTs, originalText, question, threadHist)
 	if handled {
 		log.Printf("[JARVIS] jiraCreateFlow handled dur=%s", time.Since(start))
@@ -181,7 +178,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	if err != nil {
 		log.Printf("[WARN] decideRetrieval failed: %v", err)
 		if hasThreadPermalink {
-			// In permalink mode, avoid over-calling Jira when the router fails.
+			// In permalink mode, try not to over-calling Jira when the router fails.
 			decision = llm.RetrievalDecision{}
 		} else {
 			decision = llm.RetrievalDecision{NeedSlack: false, NeedJira: true, JiraIntent: "default"}
@@ -230,7 +227,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	var slackMatches int
 	if decision.NeedSlack && strings.TrimSpace(decision.SlackQuery) != "" && s.Cfg.SlackUserToken != "" {
 		// Capture any from:USERID filters before resolution; if users:read scope is
-		// missing, ResolveUserIDsInQuery strips them and we fall back to client-side
+		// missing, ResolveUserIDsInQuery strips them, and we fall back to client-side
 		// filtering by user ID after the search.
 		unresolvedUserIDs := extractFromUserIDs(decision.SlackQuery)
 		// Resolve from:USERID → from:@username so Slack search filters correctly.
@@ -264,18 +261,18 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		}
 	}
 	// 7b) Direct channel history fallback for unresolved <#CHANID> mentions.
-	// When channels:read is missing we can't resolve IDs to names for search,
+	// When channels:read are missing, we can't resolve IDs to names for search,
 	// but conversations.history (channels:history scope) can fetch by ID directly.
 	if decision.NeedSlack {
 		if chanIDs := extractChannelIDsFromText(question); len(chanIDs) > 0 {
-			// Monday of current week as the oldest boundary.
+			// Monday of the current week as the oldest boundary.
 			now := time.Now()
 			weekday := int(now.Weekday())
 			if weekday == 0 {
 				weekday = 7
 			}
 			weekStart := now.AddDate(0, 0, -(weekday - 1)).Truncate(24 * time.Hour)
-			var directMsgs []slack.SlackSearchMessage
+			var directMsgs []slack.SearchMessage
 			for _, cid := range chanIDs {
 				msgs, err := s.Slack.GetChannelHistoryForPeriod(cid, weekStart, now, 80)
 				if err != nil {
@@ -318,7 +315,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// 9) Metabase database query
 	var dbCtx string
 	var dbQueryResult *metabase.QueryResult
-	var executedSQL string // promoted so ShowSQL handling below can access it
+	var executedSQL string // promoted so the ShowSQL handling below can access it
 	if decision.NeedMetabase && s.Metabase != nil {
 		// Retrieve the last SQL from memory so follow-up queries preserve all
 		// existing filters, even when the thread history is truncated.
@@ -385,7 +382,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	}
 	// 10.5) For large result sets where the user wants all data, bypass LLM data
 	// formatting: give LLM only a compact summary to write an intro sentence,
-	// then append the full Go-formatted table to the answer afterwards.
+	// then append the full Go-formatted table to the answer afterward.
 	const largeResultThreshold = 30
 	var appendDataTable string
 	if dbQueryResult != nil && len(dbQueryResult.Data.Rows) > largeResultThreshold && wantsAllData(questionForLLM) {
@@ -414,11 +411,11 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	answer, err := s.LLM.AnswerWithRetry(questionForLLM, threadHist, slackCtx, finalJiraCtx, dbCtx, fileCtx, images, s.Cfg.OpenAIModel, s.Cfg.OpenAILesserModel, 2, 0)
 	if err != nil || strings.TrimSpace(answer) == "" {
 		log.Printf("[ERR] llmAnswer failed: %v", err)
-		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, (jiraIssueCtx != "" || decision.NeedJira), jiraIssuesFound, issueKey)
+		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, jiraIssueCtx != "" || decision.NeedJira, jiraIssuesFound, issueKey)
 	}
 	answer = strings.TrimSpace(answer)
 	if answer == "" {
-		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, (jiraIssueCtx != "" || decision.NeedJira), jiraIssuesFound, issueKey)
+		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, jiraIssueCtx != "" || decision.NeedJira, jiraIssuesFound, issueKey)
 	}
 	// Append the Go-formatted data table when we bypassed LLM data formatting.
 	if appendDataTable != "" {
@@ -482,7 +479,7 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		return true, nil
 	}
 	// 1) Explicit creation: "jira criar | PROJ | Type | Title | Description..."
-	if ok, draft := parse.ParseJiraCreateExplicit(q); ok {
+	if ok, draft := parse.JiraCreateExplicit(q); ok {
 		needProject := strings.TrimSpace(draft.Project) == ""
 		needType := strings.TrimSpace(draft.IssueType) == ""
 		if needProject || needType {
@@ -512,9 +509,9 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 			return false, nil
 		}
 		d := jira.IssueDraft{}
-		d.Project = parse.ParseProjectKeyFromText(q)
-		d.IssueType = parse.ParseIssueTypeFromText(q)
-		d.Summary = parse.ParseSummaryFromText(q)
+		d.Project = parse.ProjectKeyFromText(q)
+		d.IssueType = parse.IssueTypeFromText(q)
+		d.Summary = parse.SummaryFromText(q)
 		// Fetch real Jira examples to inspire the LLM
 		exampleIssues := s.fetchExampleIssues(d.Project, d.IssueType)
 
@@ -567,8 +564,8 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 				return true, nil
 			}
 			// Fields explicitly mentioned in the command take priority for all cards
-			parsedProject := parse.ParseProjectKeyFromText(q)
-			parsedType := parse.ParseIssueTypeFromText(q)
+			parsedProject := parse.ProjectKeyFromText(q)
+			parsedType := parse.IssueTypeFromText(q)
 			for i := range drafts {
 				if strings.TrimSpace(parsedProject) != "" {
 					drafts[i].Project = parsedProject
@@ -594,8 +591,8 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		}
 
 		// 3b) Single-card variant
-		parsedProject := parse.ParseProjectKeyFromText(q)
-		parsedType := parse.ParseIssueTypeFromText(q)
+		parsedProject := parse.ProjectKeyFromText(q)
+		parsedType := parse.IssueTypeFromText(q)
 
 		// Fetch real Jira examples to inspire the LLM
 		exampleIssues := s.fetchExampleIssues(parsedProject, parsedType)
@@ -806,7 +803,7 @@ func isImageMimetype(mimetype string) bool {
 // buildImageAttachments downloads image files and returns them as vision
 // attachments for the LLM. Images larger than 5 MB are skipped (OpenAI
 // base64 limit).
-func (s *Service) buildImageAttachments(files []slack.SlackFile) []llm.ImageAttachment {
+func (s *Service) buildImageAttachments(files []slack.File) []llm.ImageAttachment {
 	const maxImageBytes = 5 * 1024 * 1024 // 5 MB (OpenAI base64 limit)
 	var out []llm.ImageAttachment
 	for _, f := range files {
@@ -872,7 +869,7 @@ func isDocxMimetype(mimetype string) bool {
 
 // docxBytesToText extracts plain text from a DOCX file (which is a ZIP
 // containing word/document.xml). It preserves paragraph breaks.
-// Uses only the standard library — no external dependency required.
+// Uses only the standard library — no external dependency is required.
 func docxBytesToText(data []byte) (string, error) {
 	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -923,7 +920,7 @@ func extractDocxText(data []byte) string {
 			}
 		case xml.CharData:
 			if inText {
-				b.Write([]byte(t))
+				b.Write(t)
 			}
 		}
 	}
@@ -961,7 +958,7 @@ func xlsxBytesToText(data []byte) (string, error) {
 // Supported: text/*, JSON, YAML, XML, JS, TS (raw bytes) and XLSX (parsed as table).
 // Files larger than 20 MB are skipped. Total output is capped at 8 M chars to
 // stay safely under the OpenAI API limit of ~10 M chars per message.
-func (s *Service) buildFileContext(files []slack.SlackFile) string {
+func (s *Service) buildFileContext(files []slack.File) string {
 	const maxFileBytes = 20 * 1024 * 1024 // 20 MB per file
 	const maxTotalChars = 100_000         // ~100 k chars — safe for 128k-token models
 	if len(files) == 0 {
@@ -1015,7 +1012,7 @@ func (s *Service) buildFileContext(files []slack.SlackFile) string {
 			content = string(data)
 		}
 
-		// Enforce total character cap — truncate current file if needed.
+		// Enforce total character cap — truncate the current file if needed.
 		remaining := maxTotalChars - b.Len()
 		if remaining <= 0 {
 			log.Printf("[JARVIS] fileContext cap reached, skipping file %q", f.Name)
@@ -1041,7 +1038,7 @@ func (s *Service) buildFileContext(files []slack.SlackFile) string {
 
 // buildSlackContext builds a textual summary of Slack search results.
 // It limits the number of matches included to 'limit'.
-func buildSlackContext(matches []slack.SlackSearchMessage, limit int) string {
+func buildSlackContext(matches []slack.SearchMessage, limit int) string {
 	if limit <= 0 {
 		limit = 8
 	}
@@ -1060,7 +1057,7 @@ func buildSlackContext(matches []slack.SlackSearchMessage, limit int) string {
 }
 
 // buildJiraIssueContext builds a textual summary of a single Jira issue.
-func buildJiraIssueContext(it jira.JiraIssueResp) string {
+func buildJiraIssueContext(it jira.IssueResp) string {
 	assignee := "Unassigned"
 	if it.Fields.Assignee != nil && it.Fields.Assignee.DisplayName != "" {
 		assignee = it.Fields.Assignee.DisplayName
@@ -1100,9 +1097,9 @@ func buildJiraIssueContext(it jira.JiraIssueResp) string {
 }
 
 // buildJiraContext produces a formatted context summary from a slice
-// of Jira issues.  If the number of issues exceeds 'limit' it will
+// of Jira issues.  If the number of issues exceeds 'limit,' it will
 // group by status and summarize counts.
-func buildJiraContext(issues []jira.JiraSearchJQLRespIssue, limit int) string {
+func buildJiraContext(issues []jira.SearchJQLRespIssue, limit int) string {
 	if limit <= 0 {
 		limit = 40
 	}
@@ -1112,7 +1109,7 @@ func buildJiraContext(issues []jira.JiraSearchJQLRespIssue, limit int) string {
 	return buildJiraContextGrouped(issues)
 }
 
-func buildJiraContextSimple(issues []jira.JiraSearchJQLRespIssue) string {
+func buildJiraContextSimple(issues []jira.SearchJQLRespIssue) string {
 	var b strings.Builder
 	for i, it := range issues {
 		sprint := ""
@@ -1131,8 +1128,8 @@ func buildJiraContextSimple(issues []jira.JiraSearchJQLRespIssue) string {
 	return b.String()
 }
 
-func buildJiraContextGrouped(issues []jira.JiraSearchJQLRespIssue) string {
-	byStatus := make(map[string][]jira.JiraSearchJQLRespIssue)
+func buildJiraContextGrouped(issues []jira.SearchJQLRespIssue) string {
+	byStatus := make(map[string][]jira.SearchJQLRespIssue)
 	for _, it := range issues {
 		byStatus[it.Status] = append(byStatus[it.Status], it)
 	}
@@ -1207,17 +1204,17 @@ func defaultJQLForIntent(intent, question string, projects []string) string {
 	}
 }
 
-// fixJQLPrecedence fixes operator precedence when AND and OR are mixed without
+// fixJQLPrecedence fixes operator precedence when AND OR are mixed without
 // explicit parentheses. Converts:
 //
 //	project in (X) AND text ~ "a" OR text ~ "b" OR text ~ "c"
 //
 // into:
 //
-//	project in (X) AND (text ~ "a" OR text ~ "b" OR text ~ "c")
+//	a project in (X) AND (text ~ "a" OR text ~ "b" OR text ~ "c")
 //
 // It is a no-op when the JQL already contains proper grouping (AND (...)) or
-// when there is no mixing of AND and OR.
+// when there is no mixing of AND OR.
 func fixJQLPrecedence(jql string) string {
 	upper := strings.ToUpper(jql)
 	if !strings.Contains(upper, " AND ") || !strings.Contains(upper, " OR ") {
@@ -1250,7 +1247,7 @@ func fixJQLPrecedence(jql string) string {
 		return jql + orderBy
 	}
 
-	// Split off the last AND in the first segment to get prefix + first condition.
+	// Split off the last AND in the first segment to get the prefix + first condition.
 	m := reLastAND.FindStringSubmatch(orParts[0])
 	if m == nil {
 		return jql + orderBy
@@ -1296,7 +1293,7 @@ func sanitizeJQL(jql string) string {
 
 // extractJQLTextQuery extracts 1-3 meaningful keywords from a natural
 // language question to use as a Jira text search term.  Common stopwords
-// and intent verbs are stripped so only the topic remains.
+// and intent verbs are stripped, so only the topic remains.
 func extractJQLTextQuery(question string) string {
 	skip := map[string]bool{
 		"o": true, "a": true, "os": true, "as": true, "um": true, "uma": true,
@@ -1470,8 +1467,8 @@ func (s *Service) handleIntroRequest(channel, threadTs, originTs string) error {
 
 	// Fetch Jira projects and Slack channels in parallel.
 	var (
-		jiraProjects  []jira.JiraProjectInfo
-		slackChannels []slack.SlackChannelInfo
+		jiraProjects  []jira.ProjectInfo
+		slackChannels []slack.ChannelInfo
 		wg            sync.WaitGroup
 	)
 	wg.Add(2)
@@ -1682,7 +1679,7 @@ func (s *Service) formattedMetabaseDatabases() []string {
 // tag produced by runMetabaseQuery.  This tag is injected into the LLM context
 // but never reaches the Slack thread text, so it rarely matches in practice.
 //
-// Fallback strategy: find the last SQL code block (```sql or bare ``` followed
+// Fallback strategy: find the last SQL code block (```SQL or bare ``` followed
 // by SELECT/WITH) that appears in the thread — these come from LLM responses
 // that suggest corrective queries or show previously executed SQL.
 func extractLastExecutedSQL(threadHistory string) string {
@@ -1691,7 +1688,7 @@ func extractLastExecutedSQL(threadHistory string) string {
 	if m := reExec.FindAllStringSubmatch(threadHistory, -1); len(m) > 0 {
 		return strings.TrimSpace(m[len(m)-1][1])
 	}
-	// Fallback: any SQL code block in the thread (e.g. bot-suggested queries).
+	// Fallback: any SQL code block in the thread (e.g., bot-suggested queries).
 	reBlock := regexp.MustCompile("(?s)```(?:sql)?\n((?i:SELECT|WITH)[^`]+)\n```")
 	if m := reBlock.FindAllStringSubmatch(threadHistory, -1); len(m) > 0 {
 		sql := strings.TrimSpace(m[len(m)-1][1])
@@ -1703,7 +1700,7 @@ func extractLastExecutedSQL(threadHistory string) string {
 	return ""
 }
 
-// storeThreadDBID records the Metabase database ID used for a thread so
+// storeThreadDBID records the Metabase database ID used for a thread, so
 // follow-up routing can reference it even when the thread history does not
 // contain the internal "Query executada (db=N):" tag.
 func (s *Service) storeThreadDBID(channel, threadTs string, dbID int) {
@@ -1820,7 +1817,7 @@ func tokenize(s string) []string {
 
 // filterCompactSchemaByAccessible removes table entries whose schema prefix is
 // not in the accessible set.  Header lines and blank lines are always kept.
-// For table entries without a schema prefix the schema defaults to "public".
+// For table entries without a schema prefix, the schema defaults to "public".
 func filterCompactSchemaByAccessible(schemaDoc string, accessible []string) string {
 	if len(accessible) == 0 {
 		return schemaDoc
@@ -1877,8 +1874,8 @@ func buildCardExamples(cards []metabase.Card) string {
 // conversational context so the LLM can resolve pronouns and references from
 // prior turns (e.g. "ela" → "Multilixo").
 //
-// memBaseSQL is the last SQL stored in memory for this thread (may be empty).
-// When non-empty it is used as the QUERY BASE in preference to anything extracted
+// memBaseSQL is the last SQL stored in memory for this thread (maybe empty).
+// When non-empty, it is used as the QUERY BASE in preference to anything extracted
 // from threadHistory, preventing follow-up queries from losing filters when the
 // thread history is truncated.
 //
@@ -1943,7 +1940,7 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 		// Fetch full card details to get native SQL (list endpoint omits it).
 		for i, rc := range relCards {
 			if rc.NativeSQL() != "" {
-				continue // already have SQL (unlikely from list, but safe)
+				continue // already have SQL (unlikely from a list, but safe)
 			}
 			full, err := s.Metabase.GetCard(rc.ID)
 			if err != nil {
@@ -2041,8 +2038,7 @@ func (s *Service) runMetabaseQuery(question, threadHistory string, databaseID in
 		lastSQL = corrected
 	}
 
-	formatted := "-"
-	formatted = metabase.FormatQueryResult(result, len(result.Data.Rows))
+	formatted := metabase.FormatQueryResult(result, len(result.Data.Rows))
 	log.Printf("[METABASE] runMetabaseQuery: db=%d rows=%d chars=%d", databaseID, len(result.Data.Rows), len(formatted))
 
 	// Include the SQL and db ID so the LLM can reference both when composing

@@ -1,4 +1,3 @@
-// internal/metabase/client.go
 package metabase
 
 import (
@@ -128,7 +127,7 @@ func (c *Client) GetCard(id int) (Card, error) {
 // ListAccessibleSchemas returns the schema names that are actually queryable
 // for the given database.  Uses the fast httpClient (30 s).
 //
-// Redshift exposes externally-shared and late-binding-view schemas only via
+// Redshift exposes externally shared and late-binding-view schemas only via
 // svv_tables (not information_schema.tables), so we try svv_tables first and
 // fall back to information_schema.tables for non-Redshift databases.
 func (c *Client) ListAccessibleSchemas(databaseID int) ([]string, error) {

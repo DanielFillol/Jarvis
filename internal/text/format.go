@@ -1,4 +1,3 @@
-// internal/text/format.go
 package text
 
 import (
@@ -16,7 +15,7 @@ var (
 	// Slack does not render Markdown tables; we wrap them in a code block so the
 	// columns stay readable in a monospace font.
 	reMDTable = regexp.MustCompile(`(?m)(^\|[^\n]+\n?){2,}`)
-	// Ordered list items: "1. " at the start of a line → "1. " (already valid in Slack, just ensure no conversion needed)
+	// Ordered list items: "1. "at the start of a line → "1. " (already valid in Slack, just ensure no conversion needed)
 	// Code blocks (```) pass through as-is — Slack renders them natively.
 	// Blockquotes (>) pass through as-is — Slack renders them natively.
 )
@@ -56,8 +55,3 @@ func MarkdownToMarkdown(s string) string {
 
 // reMDCodeBlock matches fenced code blocks (``` ... ```) across multiple lines.
 var reMDCodeBlock = regexp.MustCompile("(?s)```[^`]*```")
-
-// MarkdownToMrkdwn is an alias for MarkdownToMarkdown.
-func MarkdownToMrkdwn(s string) string {
-	return MarkdownToMarkdown(s)
-}

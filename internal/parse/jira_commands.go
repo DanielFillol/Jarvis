@@ -1,4 +1,3 @@
-// internal/parse/jira_commands.go
 package parse
 
 import (
@@ -8,12 +7,12 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/jira"
 )
 
-// ParseJiraCreateExplicit parses an explicit Jira create command of the
+// JiraCreateExplicit parses an explicit Jira create command of the
 // form "jira criar | PROJ | Tipo | Título | Descrição...".  It returns
 // true if the prefix matches and populates a draft with whatever
 // fields are provided.  Missing project or type are left empty and
 // should be requested from the user.
-func ParseJiraCreateExplicit(q string) (bool, jira.IssueDraft) {
+func JiraCreateExplicit(q string) (bool, jira.IssueDraft) {
 	t := strings.TrimSpace(q)
 	low := strings.ToLower(t)
 	if !strings.HasPrefix(low, "jira criar") {
@@ -169,7 +168,7 @@ func ReadUntilSpaceOrPipe(s string) string {
 var projectNameToKey = map[string]string{}
 
 // SetProjectNameMap replaces the project name→key lookup table used by
-// ParseProjectKeyFromText and LooksLikeJiraCreateIntent.  It should be
+// ProjectKeyFromText and LooksLikeJiraCreateIntent.  It should be
 // called once during application startup after loading configuration.
 // The supplied map must use lowercase names as keys and uppercase Jira
 // project keys as values (e.g. {"backend": "BE", "frontend": "FE"}).
@@ -177,11 +176,10 @@ func SetProjectNameMap(m map[string]string) {
 	projectNameToKey = m
 }
 
-// ParseProjectKeyFromText attempts to extract a project key from a
+// ProjectKeyFromText attempts to extract a project key from a
 // natural language string.  Keys consist of uppercase letters and
-// digits and must appear following a word like "projeto", "project" or
-// "prefixo".
-func ParseProjectKeyFromText(s string) string {
+// digits and must appear following a word like "projeto"/"project"
+func ProjectKeyFromText(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
@@ -198,7 +196,7 @@ func ParseProjectKeyFromText(s string) string {
 		}
 	}
 
-	// 2) Direct project name mention alongside project/prefixo keyword (uses configured map)
+	// 2) Direct project name mention alongside project/prefixo keyword (uses a configured map)
 	for name, key := range projectNameToKey {
 		if strings.Contains(low, name) && (strings.Contains(low, "projeto") || strings.Contains(low, "prefixo") || strings.Contains(low, "project")) {
 			return key
@@ -249,10 +247,10 @@ func ParseProjectKeyFromText(s string) string {
 	return ""
 }
 
-// ParseIssueTypeFromText attempts to infer the issue type from a
+// IssueTypeFromText attempts to infer the issue type from a
 // natural language string.  It returns one of the allowed values such
 // as "Epic", "História", "Bug", "Tarefa", "Subtarefa" or "Spike".
-func ParseIssueTypeFromText(s string) string {
+func IssueTypeFromText(s string) string {
 	low := strings.ToLower(s)
 	if strings.Contains(low, "épico") || strings.Contains(low, "epico") || strings.Contains(low, "epic") {
 		return "Epic"
@@ -275,12 +273,12 @@ func ParseIssueTypeFromText(s string) string {
 	return ""
 }
 
-// ParseSummaryFromText attempts to extract a title/summary from a
+// SummaryFromText attempts to extract a title/summary from a
 // natural language string.  It looks for quoted content or patterns
 // like "título: X".  The returned summary is trimmed and truncated to
 // 140 characters.  If no summary can be extracted, an empty string is
 // returned.
-func ParseSummaryFromText(s string) string {
+func SummaryFromText(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
@@ -306,20 +304,7 @@ func ParseSummaryFromText(s string) string {
 	return ""
 }
 
-// CleanTitle normalizes and truncates a title to 140 characters.
-func CleanTitle(x string) string {
-	y := strings.TrimSpace(x)
-	reTail := regexp.MustCompile(`(?i)\s*([.,])\s*(do\s+tipo|tipo|no\s+projeto|projeto|prefixo|board)\b.*$`)
-	y = reTail.ReplaceAllString(y, "")
-	y = strings.Join(strings.Fields(y), " ")
-	y = strings.TrimRight(y, ". ")
-	if len(y) > 140 {
-		y = y[:140]
-	}
-	return y
-}
-
-// jiraCreateVerbs are the verb forms that indicate a Jira creation intent.
+// jiraCreateVerbs are the verb forms that indicate Jira creation intent.
 var jiraCreateVerbs = []string{"crie", "cria", "criar", "abra", "abre", "abrir"}
 
 // hasCreateVerb returns true if any creation verb is present in the lowercased string.

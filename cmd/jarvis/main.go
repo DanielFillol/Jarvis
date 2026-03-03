@@ -1,4 +1,3 @@
-// cmd/jarvis/main.go
 package main
 
 import (
@@ -60,7 +59,7 @@ func initMetabase(cfg config.Config) (*metabase.Client, []metabase.Database, []m
 		log.Printf("[METABASE] loaded %d saved questions for keyword matching (SQL fetched on demand)", len(cards))
 	}
 
-	// Generate schema documentation asynchronously so startup is not blocked.
+	// Generate schema documentation asynchronously so the startup is not blocked.
 	go func() {
 		if err := metabase.GenerateSchemaDoc(client, cfg.MetabaseSchemaPath, cfg.MetabaseEnv); err != nil {
 			log.Printf("[METABASE] schema generation failed: %v", err)
@@ -87,13 +86,13 @@ func main() {
 		slackClient.BotUserID = id
 		log.Printf("[SLACK] bot_user_id=%s", id)
 	}
-	// Identify user token owner so we can resolve their user ID without users:read scope
+	// Identify a user token owner so we can resolve their user ID without users:read scope
 	if uid, uname, err := slackClient.AuthTestUserToken(); err != nil {
 		log.Printf("[SLACK] auth.test (user token) failed: %v", err)
 	} else {
 		log.Printf("[SLACK] user_token_owner=%s username=%s", uid, uname)
 	}
-	// Initialize Metabase (creates client, lists databases, discovers schemas, loads saved questions, starts async schema generation).
+	// Initialize Metabase (creates a client, lists databases, discovers schemas, loads saved questions, starts async schema generation).
 	metabaseClient, metabaseDatabases, metabaseCards, metabaseAccessibleSchemas := initMetabase(cfg)
 	// Create a pending store with 2-hour TTL
 	store := state.NewStore(2 * time.Hour)

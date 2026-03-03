@@ -1,4 +1,3 @@
-// internal/jira/adf.go
 package jira
 
 import (
@@ -9,7 +8,7 @@ import (
 
 var (
 	reHeading = regexp.MustCompile(`^(#{1,6})\s+(.+)$`)
-	reTask    = regexp.MustCompile(`^-\s+\[([xX ])\]\s*(.*)$`)
+	reTask    = regexp.MustCompile(`^-\s+\[([xX ])]\s*(.*)$`)
 	reBold    = regexp.MustCompile(`\*\*(.+?)\*\*`)
 	reHR      = regexp.MustCompile(`^-{3,}$|^\*{3,}$|^_{3,}$`)
 )
@@ -26,12 +25,12 @@ func isBulletLine(s string) bool {
 // Document Format (ADF) for Jira Cloud API v3.
 //
 // Supported constructs:
-//   - Headings:    ## Title  →  heading level 2
-//   - Bullet list: - item    →  bulletList / listItem
-//   - Task list:   - [ ] …   →  taskList / taskItem
-//   - Bold inline: **text**  →  strong mark
-//   - Separator:   ---       →  rule node
-//   - Everything else        →  paragraph
+//   - Headings: ## Title → heading level 2
+//   - Bullet list: - item → bulletList / listItem
+//   - Task list: - [ ] … → taskList / taskItem
+//   - Bold inline: **text** → strong mark
+//   - Separator: --- → rule node
+//   - Everything else → paragraph
 func MarkdownToADF(text string) map[string]any {
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	counter := 0
@@ -100,7 +99,7 @@ func parseMDBlocks(lines []string, counter *int) []any {
 			continue
 		}
 
-		// Bullet list: - item or * item (flatten sub-items to same level)
+		// Bullet list: - item or * item (flatten subitems to the same level)
 		if isBulletLine(trimmed) {
 			var items []any
 			for i < len(lines) {

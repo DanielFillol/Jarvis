@@ -1,19 +1,18 @@
-// internal/jira/types.go
 package jira
 
-// JiraSearchJQLReq is the request payload for the /rest/api/3/search/jql
+// SearchJQLReq is the request payload for the /rest/api/3/search/jql
 // endpoint.  The JQL string specifies the search query, and optional
 // parameters control paging and the fields returned.
-type JiraSearchJQLReq struct {
+type SearchJQLReq struct {
 	JQL        string   `json:"jql"`
 	StartAt    int      `json:"startAt,omitempty"`
 	MaxResults int      `json:"maxResults,omitempty"`
 	Fields     []string `json:"fields,omitempty"`
 }
 
-// JiraSearchJQLResp models the response from the /rest/api/3/search/jql
+// SearchJQLResp models the response from the /rest/api/3/search/jql
 // endpoint.  Only a subset of fields is defined.
-type JiraSearchJQLResp struct {
+type SearchJQLResp struct {
 	Issues []struct {
 		Key    string `json:"key"`
 		Fields struct {
@@ -34,7 +33,7 @@ type JiraSearchJQLResp struct {
 			Project struct {
 				Key string `json:"key"`
 			} `json:"project"`
-			// customfield_10020 is the standard Jira Cloud sprint field.
+			// Custom-field_10020 is the standard Jira Cloud sprint field.
 			// It is an array; the last active (or most recent) entry is used.
 			Sprint []struct {
 				Name  string `json:"name"`
@@ -44,9 +43,9 @@ type JiraSearchJQLResp struct {
 	} `json:"issues"`
 }
 
-// JiraSearchJQLRespIssue is an internal flattened representation of a
+// SearchJQLRespIssue is an internal flattened representation of a
 // Jira issue used by higher-level code to build context for the LLM.
-type JiraSearchJQLRespIssue struct {
+type SearchJQLRespIssue struct {
 	Key      string
 	Project  string
 	Type     string
@@ -58,11 +57,11 @@ type JiraSearchJQLRespIssue struct {
 	Sprint   string
 }
 
-// JiraIssueResp models the response from Jira's GET issue endpoint.  It
+// IssueResp models the response from Jira's GET issue endpoint.  It
 // contains both rendered and raw fields.  Only fields accessed in
 //
 //	the current code are defined here.
-type JiraIssueResp struct {
+type IssueResp struct {
 	Key            string `json:"key"`
 	RenderedFields struct {
 		Description string `json:"description"`
@@ -115,16 +114,16 @@ type IssueDraft struct {
 	Labels      []string `json:"labels"`
 }
 
-// JiraCreateIssueResp represents the response from Jira's creation issue
+// CreateIssueResp represents the response from Jira's creation issue
 // API.  Only a subset of fields is defined here.
-type JiraCreateIssueResp struct {
+type CreateIssueResp struct {
 	ID   string `json:"id"`
 	Key  string `json:"key"`
 	Self string `json:"self"`
 }
 
-// JiraProjectInfo holds a minimal project summary returned by ListProjects.
-type JiraProjectInfo struct {
+// ProjectInfo holds a minimal project summary returned by ListProjects.
+type ProjectInfo struct {
 	Key  string
 	Name string
 }

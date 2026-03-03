@@ -1,4 +1,3 @@
-// internal/jira/client.go
 package jira
 
 import (
@@ -38,16 +37,16 @@ func NewClient(cfg config.Config) *Client {
 	}
 }
 
-// SearchJQL performs a Jira JQL search.  It returns a JiraSearchJQLResp
+// SearchJQL performs a Jira JQL search.  It returns a SearchJQLResp
 // containing issues.  JQL syntax is not validated by this method.
-func (c *Client) SearchJQL(jql string, startAt, maxResults int, fields []string) (JiraSearchJQLResp, error) {
+func (c *Client) SearchJQL(jql string, startAt, maxResults int, fields []string) (SearchJQLResp, error) {
 	if c.BaseURL == "" {
-		return JiraSearchJQLResp{}, errors.New("missing Jira base URL")
+		return SearchJQLResp{}, errors.New("missing Jira base URL")
 	}
 	if c.Email == "" || c.Token == "" {
-		return JiraSearchJQLResp{}, errors.New("missing Jira credentials")
+		return SearchJQLResp{}, errors.New("missing Jira credentials")
 	}
-	reqBody := JiraSearchJQLReq{
+	reqBody := SearchJQLReq{
 		JQL:        jql,
 		StartAt:    startAt,
 		MaxResults: maxResults,
@@ -63,29 +62,29 @@ func (c *Client) SearchJQL(jql string, startAt, maxResults int, fields []string)
 	client := &http.Client{Timeout: 25 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return JiraSearchJQLResp{}, err
+		return SearchJQLResp{}, err
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return JiraSearchJQLResp{}, fmt.Errorf("jira status=%d body=%s", resp.StatusCode, preview(string(rb), 600))
+		return SearchJQLResp{}, fmt.Errorf("jira status=%d body=%s", resp.StatusCode, preview(string(rb), 600))
 	}
-	var out JiraSearchJQLResp
+	var out SearchJQLResp
 	if err := json.Unmarshal(rb, &out); err != nil {
-		return JiraSearchJQLResp{}, err
+		return SearchJQLResp{}, err
 	}
 	return out, nil
 }
 
 // FetchAll performs a full JQL search, paginating through results up to
-// maxTotal issues.  It flattens each issue into a JiraSearchJQLRespIssue
+// maxTotal issues.  It flattens each issue into a SearchJQLRespIssue
 // for convenient use elsewhere.  If maxTotal <= 0, a default of 200 is
 // used.
-func (c *Client) FetchAll(jql string, maxTotal int) ([]JiraSearchJQLRespIssue, error) {
+func (c *Client) FetchAll(jql string, maxTotal int) ([]SearchJQLRespIssue, error) {
 	if maxTotal <= 0 {
 		maxTotal = 200
 	}
-	var all []JiraSearchJQLRespIssue
+	var all []SearchJQLRespIssue
 	startAt := 0
 	pageSize := 50
 	for {
@@ -109,9 +108,9 @@ func (c *Client) FetchAll(jql string, maxTotal int) ([]JiraSearchJQLRespIssue, e
 					sprint = sp.Name
 					break
 				}
-				sprint = sp.Name // keep overwriting; last entry is most recent
+				sprint = sp.Name // keep overwriting; the last entry is the most recent
 			}
-			all = append(all, JiraSearchJQLRespIssue{
+			all = append(all, SearchJQLRespIssue{
 				Key:      it.Key,
 				Project:  it.Fields.Project.Key,
 				Type:     it.Fields.IssueType.Name,
@@ -136,12 +135,12 @@ func (c *Client) FetchAll(jql string, maxTotal int) ([]JiraSearchJQLRespIssue, e
 // GetIssue fetches a single Jira issue by key.  The renderedFields are
 // requested along with selected fields.  An error is returned if the
 // request fails.
-func (c *Client) GetIssue(key string) (JiraIssueResp, error) {
+func (c *Client) GetIssue(key string) (IssueResp, error) {
 	if c.BaseURL == "" {
-		return JiraIssueResp{}, errors.New("missing Jira base URL")
+		return IssueResp{}, errors.New("missing Jira base URL")
 	}
 	if c.Email == "" || c.Token == "" {
-		return JiraIssueResp{}, errors.New("missing Jira credentials")
+		return IssueResp{}, errors.New("missing Jira credentials")
 	}
 	u := fmt.Sprintf("%s/rest/api/3/issue/%s?expand=renderedFields&fields=summary,description,status,issuetype,priority,assignee,subtasks,parent", c.BaseURL, url.PathEscape(key))
 	req, _ := http.NewRequest("GET", u, nil)
@@ -151,36 +150,36 @@ func (c *Client) GetIssue(key string) (JiraIssueResp, error) {
 	client := &http.Client{Timeout: 25 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return JiraIssueResp{}, err
+		return IssueResp{}, err
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return JiraIssueResp{}, fmt.Errorf("jira get issue status=%d body=%s", resp.StatusCode, preview(string(rb), 600))
+		return IssueResp{}, fmt.Errorf("jira get issue status=%d body=%s", resp.StatusCode, preview(string(rb), 600))
 	}
-	var out JiraIssueResp
+	var out IssueResp
 	if err := json.Unmarshal(rb, &out); err != nil {
-		return JiraIssueResp{}, err
+		return IssueResp{}, err
 	}
 	return out, nil
 }
 
 // CreateIssue creates a new issue in Jira from a draft.  The draft
 // fields must include Project and IssueType; Summary and Description
-// must also be populated.  On success, the new issue key and ID are returned.
-func (c *Client) CreateIssue(d IssueDraft) (JiraCreateIssueResp, error) {
+// must also be populated.  On success, the new issue-key and ID are returned.
+func (c *Client) CreateIssue(d IssueDraft) (CreateIssueResp, error) {
 	d.Project = strings.TrimSpace(d.Project)
 	d.IssueType = strings.TrimSpace(d.IssueType)
 	d.Summary = strings.TrimSpace(d.Summary)
 	d.Description = strings.TrimSpace(d.Description)
 	if d.Project == "" || d.IssueType == "" {
-		return JiraCreateIssueResp{}, errors.New("project and issueType are required")
+		return CreateIssueResp{}, errors.New("project and issueType are required")
 	}
 	if c.BaseURL == "" {
-		return JiraCreateIssueResp{}, errors.New("missing Jira base URL")
+		return CreateIssueResp{}, errors.New("missing Jira base URL")
 	}
 	if c.Email == "" || c.Token == "" {
-		return JiraCreateIssueResp{}, errors.New("missing Jira credentials")
+		return CreateIssueResp{}, errors.New("missing Jira credentials")
 	}
 	fields := map[string]any{
 		"project":     map[string]any{"key": d.Project},
@@ -215,19 +214,19 @@ func (c *Client) CreateIssue(d IssueDraft) (JiraCreateIssueResp, error) {
 	client := &http.Client{Timeout: 35 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return JiraCreateIssueResp{}, err
+		return CreateIssueResp{}, err
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return JiraCreateIssueResp{}, fmt.Errorf("jira create status=%d body=%s", resp.StatusCode, preview(string(rb), 800))
+		return CreateIssueResp{}, fmt.Errorf("jira create status=%d body=%s", resp.StatusCode, preview(string(rb), 800))
 	}
-	var out JiraCreateIssueResp
+	var out CreateIssueResp
 	if err := json.Unmarshal(rb, &out); err != nil {
-		return JiraCreateIssueResp{}, err
+		return CreateIssueResp{}, err
 	}
 	if out.Key == "" {
-		return JiraCreateIssueResp{}, errors.New("jira create: empty key in response")
+		return CreateIssueResp{}, errors.New("jira create: empty key in response")
 	}
 	return out, nil
 }
@@ -293,8 +292,8 @@ func (c *Client) FetchExampleIssues(project, issueType string, limit int) ([]str
 }
 
 // ListProjects fetches all accessible Jira projects and returns up to 50,
-// each as a JiraProjectInfo with key and name.
-func (c *Client) ListProjects() ([]JiraProjectInfo, error) {
+// each as a ProjectInfo with key and name.
+func (c *Client) ListProjects() ([]ProjectInfo, error) {
 	if c.BaseURL == "" {
 		return nil, errors.New("missing Jira base URL")
 	}
@@ -323,10 +322,10 @@ func (c *Client) ListProjects() ([]JiraProjectInfo, error) {
 	if err := json.Unmarshal(rb, &raw); err != nil {
 		return nil, err
 	}
-	out := make([]JiraProjectInfo, 0, len(raw))
+	out := make([]ProjectInfo, 0, len(raw))
 	for _, p := range raw {
 		if p.Key != "" {
-			out = append(out, JiraProjectInfo{Key: p.Key, Name: p.Name})
+			out = append(out, ProjectInfo{Key: p.Key, Name: p.Name})
 		}
 	}
 	return out, nil

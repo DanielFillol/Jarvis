@@ -1,4 +1,3 @@
-// internal/llm/answer.go
 package llm
 
 import (
@@ -29,7 +28,7 @@ func (c *Client) GenerateIntroduction(ctx IntroContext, model, lesserModel strin
 		botName = "Jarvis"
 	}
 
-	// Pick sample values to anchor examples — prefer first 2 distinct keys
+	// Pick sample values to anchor examples — prefer the first 2 distinct keys
 	sampleKey := "PROJ"
 	sampleKey2 := "PROJ"
 	for i, p := range ctx.JiraProjects {
@@ -81,7 +80,7 @@ func (c *Client) GenerateIntroduction(ctx IntroContext, model, lesserModel strin
 • _"buscar menções a 'compliance' nos últimos 30 dias"_`
 	}
 
-	// Build optional Metabase section.
+	// Build the optional Metabase section.
 	metabaseBlock := ""
 	if ctx.MetabaseEnabled {
 		metabaseBlock = `:bar_chart: *Dados (Metabase)*

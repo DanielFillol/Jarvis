@@ -1,10 +1,9 @@
-// internal/state/message_tracker.go
 package state
 
 import "sync"
 
 // MessageTracker keeps a mapping from originTs (the user's triggering message)
-// to botTs (the bot's reply) so that when a user deletes their message the bot
+// to botTs (the bot's reply) so that when a user deletes their message, the bot
 // can delete its own reply automatically.
 type MessageTracker struct {
 	mu   sync.RWMutex

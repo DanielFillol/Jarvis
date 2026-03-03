@@ -1,4 +1,3 @@
-// internal/llm/extract_issue.go
 package llm
 
 import (
@@ -102,7 +101,7 @@ Estrutura da description por tipo:
 
 // ExtractMultipleIssuesFromThread uses the LLM to extract several Jira issue
 // drafts at once from a Slack thread.  userInstruction must describe all cards
-// to be created (e.g. "crie dois cards: um bug sobre X e uma história sobre Y").
+// to be created.
 // The function returns one IssueDraft per card mentioned in the instruction.
 func (c *Client) ExtractMultipleIssuesFromThread(threadHistory, userInstruction, model string, projectNameMap map[string]string) ([]jira.IssueDraft, error) {
 	system := `Você é um Product Manager sênior especializado em escrever issues Jira de alta qualidade.

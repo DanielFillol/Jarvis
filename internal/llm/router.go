@@ -1,4 +1,3 @@
-// internal/llm/router.go
 package llm
 
 import (
@@ -33,7 +32,7 @@ type RetrievalDecision struct {
 // DecideRetrieval consults the language model to determine which contexts
 // (Slack, Jira, Metabase) should be retrieved for a given question.
 //
-// jiraEnabled must be true when Jira credentials are configured; when false
+// jiraEnabled must be true when Jira credentials are configured; when false,
 // the Jira routing section is omitted from the prompt entirely.
 // metabaseDatabases is a list of available databases formatted as
 // "ID: Name (engine)".  Pass an empty slice to disable Metabase routing.
@@ -48,7 +47,7 @@ func (c *Client) DecideRetrieval(question, threadHistory, model string, jiraEnab
 	}
 
 	now := time.Now()
-	// Monday of current week (ISO: Monday = first day)
+	// Monday of the current week (ISO: Monday = first day)
 	weekday := int(now.Weekday())
 	if weekday == 0 {
 		weekday = 7
@@ -102,7 +101,7 @@ Regras para jira_jql:
   "jira_intent": "listar_bugs_abertos|busca_texto|default",
   "jira_jql": ""`
 	} else {
-		// Jira not configured: always output false/empty fields so the JSON is valid.
+		// Jira isn't configured: always output false/empty fields, so the JSON is valid.
 		jiraJQLBlock = `  "need_jira": false,
   "jira_intent": "",
   "jira_jql": ""`
@@ -156,8 +155,8 @@ Pergunta:
 `, projectsCtx, senderCtx, dateCtx, metabaseCtx, jiraJQLBlock, metabaseJSON, jiraSourceLine, jiraRules, jiraIntentBlock, clip(threadHistory, 1200), question)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
-	// Use 4000 tokens: reasoning models (e.g. gpt-5-mini) consume invisible thinking
-	// tokens before producing output; 600 was insufficient and caused empty responses.
+	// Use 4000 tokens: reasoning models (e.g., gpt-5-mini) consume invisible thinking
+	// tokens before producing output; 600 was not enough and caused empty responses.
 	out, err := c.Chat(messages, model, 0.2, 4000)
 	if err != nil {
 		return RetrievalDecision{}, err
@@ -252,7 +251,7 @@ func applyDeterministicOverrides(question, threadHistory string, jiraEnabled boo
 
 	// 3. Roadmap + explicit project → Jira only (structured listing).
 	if strings.Contains(qLower, "roadmap") {
-		if proj := parse.ParseProjectKeyFromText(question); proj != "" {
+		if proj := parse.ProjectKeyFromText(question); proj != "" {
 			d.NeedSlack = false
 			d.SlackQuery = ""
 			d.NeedJira = true
@@ -265,7 +264,7 @@ func applyDeterministicOverrides(question, threadHistory string, jiraEnabled boo
 	// 4. Open bugs + explicit project → Jira only.
 	if (strings.Contains(qLower, "bugs") || strings.Contains(qLower, "bug")) &&
 		(strings.Contains(qLower, "aberto") || strings.Contains(qLower, "em aberto")) {
-		if proj := parse.ParseProjectKeyFromText(question); proj != "" {
+		if proj := parse.ProjectKeyFromText(question); proj != "" {
 			d.NeedSlack = false
 			d.SlackQuery = ""
 			d.NeedJira = true
@@ -374,7 +373,7 @@ func normalizeSlackQuery(q string) string {
 	}
 
 	// Convert "menção/mencao/mencionado USERID" (LLM hallucination) to <@USERID>
-	reMentionWord := regexp.MustCompile(`(?i)\b(?:menção|mencao|mencionado|mencionada|mentioned)\s+((U|W)[A-Z0-9]+)\b`)
+	reMentionWord := regexp.MustCompile(`(?i)\b(?:menção|mencao|mencionado|mencionada|mentioned)\s+(([UW])[A-Z0-9]+)\b`)
 	q = reMentionWord.ReplaceAllString(q, "<@$1>")
 
 	// Strip leftover mention words when a <@USERID> is already present.
@@ -394,10 +393,10 @@ func normalizeSlackQuery(q string) string {
 
 	// Strip unresolved channel ID filters: in:#C09H8S8A0VD
 	// Raw Slack channel IDs are not supported in the in: search filter;
-	// keeping them returns 0 results. Better to search without channel filter.
+	// keeping them returns 0 results. Better to search without a channel filter.
 	reRawChannelFilter := regexp.MustCompile(`\bin:#[CG][A-Z0-9]{8,}\b`)
 	q = strings.TrimSpace(reRawChannelFilter.ReplaceAllString(q, ""))
-	// Also strip leftover <#CHANID> tokens the LLM might have included verbatim.
+	// Also, strip leftover <#CHANID> tokens the LLM might have included verbatim.
 	reRawChannelMention := regexp.MustCompile(`<#[CG][A-Z0-9]{8,}(?:\|[^>]*)?>`)
 	q = strings.TrimSpace(reRawChannelMention.ReplaceAllString(q, ""))
 	// Collapse multiple spaces left by removals.

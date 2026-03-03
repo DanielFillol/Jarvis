@@ -1,4 +1,3 @@
-// internal/llm/sql.go
 package llm
 
 import (
@@ -14,20 +13,21 @@ import (
 const ClarificationPrefix = "CLARIFICATION_NEEDED: "
 
 // GenerateSQL asks the LLM to produce a safe SELECT query that answers
-// question using the provided Metabase schema documentation.
+//
+//	the question using the provided Metabase schema documentation.
 //
 // threadHistory provides prior conversation context so the LLM can resolve
 // pronouns and references to entities mentioned in earlier turns
 // (e.g. "ela" resolved to a company name established in a previous message).
 //
 // baseSQL is the last SQL query executed in the current thread (if any).
-// When non-empty it is injected as a "QUERY BASE" so the LLM can use it as
+// When non-empty, it is injected as a "QUERY BASE" so the LLM can use it as
 // a starting point for follow-up questions, preserving existing filters
 // (especially date filters) instead of rewriting from scratch.
 //
 // engineType is the Metabase database engine string (e.g. "redshift",
 // "postgres", "mysql", "bigquery").  It is used to inject dialect-specific
-// SQL rules into the prompt so the generated SQL is always compatible with
+// SQL rules into the prompt, so the generated SQL is always compatible with
 // the target database.  Pass an empty string when the engine is unknown.
 //
 // Returns an empty string (and nil error) when the LLM determines that the
@@ -183,7 +183,7 @@ SQL CORRIGIDO:`,
 // engineSpecificRules returns a block of numbered SQL rules tailored to the
 // given Metabase engine string (e.g. "redshift", "postgres", "mysql",
 // "bigquery", "snowflake").  An empty string is returned when the engine is
-// unknown so the generic rules still apply.  The block starts with a newline
+// unknown, so the generic rules still apply.  The block starts with a newline,
 // so it slots directly into the prompt rules section.
 func engineSpecificRules(engine string) string {
 	e := strings.ToLower(strings.TrimSpace(engine))

@@ -1,4 +1,3 @@
-// internal/slack/client.go
 package slack
 
 import (
@@ -106,7 +105,7 @@ func (c *Client) PostMessage(channel, threadTs, text string) error {
 	if c.BotToken == "" {
 		return errors.New("missing Slack bot token")
 	}
-	payload := SlackPostMessageRequest{
+	payload := PostMessageRequest{
 		Channel:  channel,
 		Text:     text,
 		ThreadTs: threadTs,
@@ -140,13 +139,13 @@ func (c *Client) PostMessage(channel, threadTs, text string) error {
 // slice of flattened results.  If no user token is configured, an
 // error is returned.
 //
-// Queries containing " OR " (top-level, outside quoted strings) are
-// split into independent sub-searches and their results merged.  This
+// Queries containing "OR" (top-level, outside quoted strings) are
+// split into independent sub-searches, and their results merged.  This
 // works around the Slack search.messages API not reliably supporting
 // complex boolean expressions that combine quoted phrases with OR —
 // a combination that works in the Slack UI but returns 0 results via
 // the API.
-func (c *Client) SearchMessagesAll(query string) ([]SlackSearchMessage, error) {
+func (c *Client) SearchMessagesAll(query string) ([]SearchMessage, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil, errors.New("empty query")
@@ -165,7 +164,7 @@ func (c *Client) SearchMessagesAll(query string) ([]SlackSearchMessage, error) {
 	// Execute each OR clause independently and merge results.
 	log.Printf("[SLACK] OR query split into %d clauses", len(clauses))
 	seen := map[string]bool{}
-	var merged []SlackSearchMessage
+	var merged []SearchMessage
 	for _, clause := range clauses {
 		log.Printf("[SLACK] OR clause search: %q", clause)
 		results, err := c.searchMessagesPages(clause)
@@ -193,7 +192,7 @@ func (c *Client) SearchMessagesAll(query string) ([]SlackSearchMessage, error) {
 
 // searchMessagesPages executes a single Slack search query with
 // cursor-based page iteration and returns up to 200 raw matches.
-func (c *Client) searchMessagesPages(query string) ([]SlackSearchMessage, error) {
+func (c *Client) searchMessagesPages(query string) ([]SearchMessage, error) {
 	maxPages := c.SearchMaxPages
 	if maxPages < 1 {
 		maxPages = 10
@@ -201,7 +200,7 @@ func (c *Client) searchMessagesPages(query string) ([]SlackSearchMessage, error)
 	if maxPages > 50 {
 		maxPages = 50
 	}
-	var out []SlackSearchMessage
+	var out []SearchMessage
 	for page := 1; page <= maxPages; page++ {
 		u := fmt.Sprintf("%s/search.messages?query=%s&count=20&page=%d", c.apiBase(), url.QueryEscape(query), page)
 		req, _ := http.NewRequest("GET", u, nil)
@@ -218,7 +217,7 @@ func (c *Client) searchMessagesPages(query string) ([]SlackSearchMessage, error)
 		if resp.StatusCode >= 300 {
 			return nil, fmt.Errorf("slack status=%d body=%s", resp.StatusCode, preview(string(rb), 300))
 		}
-		var data SlackSearchMessagesResp
+		var data SearchMessagesResp
 		if err := json.Unmarshal(rb, &data); err != nil {
 			return nil, err
 		}
@@ -226,7 +225,7 @@ func (c *Client) searchMessagesPages(query string) ([]SlackSearchMessage, error)
 			return nil, fmt.Errorf("slack error: %s", data.Error)
 		}
 		for _, m := range data.Messages.Matches {
-			out = append(out, SlackSearchMessage{
+			out = append(out, SearchMessage{
 				Text:      cleanSlackText(m.Text),
 				Permalink: m.Permalink,
 				Channel:   m.Channel.Name,
@@ -246,7 +245,7 @@ func (c *Client) searchMessagesPages(query string) ([]SlackSearchMessage, error)
 	// Sort by score descending and dedupe by permalink.
 	sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
 	seen := map[string]bool{}
-	uniq := make([]SlackSearchMessage, 0, len(out))
+	uniq := make([]SearchMessage, 0, len(out))
 	for _, m := range out {
 		if m.Permalink != "" && seen[m.Permalink] {
 			continue
@@ -262,10 +261,9 @@ func (c *Client) searchMessagesPages(query string) ([]SlackSearchMessage, error)
 	return uniq, nil
 }
 
-// splitTopLevelOR splits a Slack search query on " OR " tokens that
-// appear outside of double-quoted strings.  It returns a slice with
-// the individual clauses.  If no top-level OR is found, a single-
-// element slice containing the original query is returned.
+// splitTopLevelOR splits a Slack search query on "OR" tokens that
+// appear outside double-quoted strings.  It returns a slice with
+// the individual clauses.  If no top-level OR is found, a single-element slice containing the original query is returned.
 func splitTopLevelOR(query string) []string {
 	var clauses []string
 	var cur strings.Builder
@@ -350,11 +348,11 @@ func (c *Client) GetThreadHistory(channel, threadTs string, limit int) (string, 
 
 // GetThreadHistoryFull fetches the full message history for a Slack thread via
 // conversations.replies with cursor-based pagination. It returns a concatenated
-// text representation (root + replies) ordered by ts, with basic subtype
+// text representation (root and replies) ordered by ts, with basic subtype
 // filtering and guardrails for maxMessages and maxChars.
 //
 // It is intended for "permalink mode" where the user provides an explicit Slack
-// thread link and we want high-fidelity context.
+// thread link, and we want high-fidelity context.
 func (c *Client) GetThreadHistoryFull(channel, threadTs string, maxMessages int, maxChars int) (string, error) {
 	if c.BotToken == "" {
 		return "", errors.New("missing Slack bot token")
@@ -426,7 +424,7 @@ func (c *Client) GetThreadHistoryFull(channel, threadTs string, maxMessages int,
 			return "", err
 		}
 		if !data.OK {
-			// If bot token failed with not_in_channel and we have user token, retry with user token
+			// If bot token failed with not_in_channel, and we have user token, retry with user token
 			if !useUserToken && data.Error == "not_in_channel" && c.UserToken != "" {
 				useUserToken = true
 				cursor = ""
@@ -607,7 +605,7 @@ func (c *Client) GetPermalink(channel, messageTs string) (string, error) {
 }
 
 // PostMessageAndGetTS posts a message to Slack and returns the timestamp
-// of the posted message.  It is used to obtain a handle for later updates.
+// of the posted message.  It is used to get a handle for later updates.
 func (c *Client) PostMessageAndGetTS(channel, threadTs, text string) (string, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -616,7 +614,7 @@ func (c *Client) PostMessageAndGetTS(channel, threadTs, text string) (string, er
 	if c.BotToken == "" {
 		return "", errors.New("missing Slack bot token")
 	}
-	payload := SlackPostMessageRequest{
+	payload := PostMessageRequest{
 		Channel:  channel,
 		Text:     text,
 		ThreadTs: threadTs,
@@ -856,8 +854,8 @@ func (c *Client) GetChannelName(channelID string) string {
 		return ""
 	}
 	// Prefer user token: broader channel access (bot may not be a member).
-	// Fall back to bot token if user token is unavailable.
-	tokens := []string{}
+	// Fall back to bot token if the user token is unavailable.
+	var tokens []string
 	if c.UserToken != "" {
 		tokens = append(tokens, c.UserToken)
 	}
@@ -900,7 +898,7 @@ func (c *Client) GetChannelName(channelID string) string {
 		}
 		log.Printf("[SLACK] GetChannelName %s: api error=%q", channelID, out.Error)
 		// channel_not_found is definitive — no token will help.
-		// not_in_channel only means this token's user isn't in the channel; try next token.
+		// not_in_channel only means this token's user isn't in the channel; try the next token.
 		if out.Error == "channel_not_found" {
 			break
 		}
@@ -910,7 +908,7 @@ func (c *Client) GetChannelName(channelID string) string {
 
 // ResolveUserMentions replaces <@USERID> and <@USERID|name> patterns in text
 // with @username. When the display name is already embedded after |, it is used
-// directly. Otherwise GetUsernameByID is called (which fast-paths via the cached
+// directly. Otherwise, GetUsernameByID is called (which fast-paths via the cached
 // user token owner, avoiding the need for users:read scope in that case).
 func (c *Client) ResolveUserMentions(text string) string {
 	return reSlackUserMention.ReplaceAllStringFunc(text, func(m string) string {
@@ -925,7 +923,7 @@ func (c *Client) ResolveUserMentions(text string) string {
 		}
 		username, err := c.GetUsernameByID(id)
 		if err != nil {
-			return m // keep original if can't resolve
+			return m // keep original if you can't resolve
 		}
 		return "@" + username
 	})
@@ -988,7 +986,7 @@ func (c *Client) AuthTestUserToken() (string, string, error) {
 }
 
 // GetUsernameByID calls users.info and returns the Slack "name" (handle)
-// e.g. "user.name". It prefers the user token when available.
+// E.g. "user.name". It prefers the user token when available.
 func (c *Client) GetUsernameByID(userID string) (string, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
@@ -1046,7 +1044,7 @@ func (c *Client) GetUsernameByID(userID string) (string, error) {
 // DownloadFile fetches a private Slack file into memory.
 // It tries the user token first (broader file access), then falls back to
 // the bot token. If the response is HTML (Slack login redirect), the token
-// lacks files:read scope and an error is returned.
+// lacks files:read scope, and an error is returned.
 // The caller is responsible for enforcing size limits.
 func (c *Client) DownloadFile(urlPrivate string) ([]byte, error) {
 	urlPrivate = strings.TrimSpace(urlPrivate)
@@ -1054,7 +1052,7 @@ func (c *Client) DownloadFile(urlPrivate string) ([]byte, error) {
 		return nil, errors.New("empty file URL")
 	}
 
-	tokens := []string{}
+	var tokens []string
 	if c.UserToken != "" {
 		tokens = append(tokens, c.UserToken)
 	}
@@ -1103,14 +1101,14 @@ func (c *Client) DownloadFile(urlPrivate string) ([]byte, error) {
 // scope.  The user token is tried first (broader public-channel access), then
 // the bot token.  The channel name in the returned messages is set to channelID
 // since we may not have channels:read to resolve it.
-func (c *Client) GetChannelHistoryForPeriod(channelID string, oldest, latest time.Time, limit int) ([]SlackSearchMessage, error) {
+func (c *Client) GetChannelHistoryForPeriod(channelID string, oldest, latest time.Time, limit int) ([]SearchMessage, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	if limit > 200 {
 		limit = 200
 	}
-	tokens := []string{}
+	var tokens []string
 	if c.UserToken != "" {
 		tokens = append(tokens, c.UserToken)
 	}
@@ -1159,7 +1157,7 @@ func (c *Client) GetChannelHistoryForPeriod(channelID string, oldest, latest tim
 			return nil, fmt.Errorf("conversations.history error: %s", data.Error)
 		}
 
-		var out []SlackSearchMessage
+		var out []SearchMessage
 		for _, m := range data.Messages {
 			if m.BotID != "" || m.Subtype != "" {
 				continue
@@ -1168,7 +1166,7 @@ func (c *Client) GetChannelHistoryForPeriod(channelID string, oldest, latest tim
 			if txt == "" {
 				continue
 			}
-			out = append(out, SlackSearchMessage{
+			out = append(out, SearchMessage{
 				Text:     txt,
 				Channel:  channelID,
 				Username: m.User,
@@ -1183,8 +1181,8 @@ func (c *Client) GetChannelHistoryForPeriod(channelID string, oldest, latest tim
 // ListChannels returns the public channels the bot is a member of (up to 200).
 // It tries the bot token first; if that fails with missing_scope, retries with
 // the user token which typically has broader channel access.
-func (c *Client) ListChannels() ([]SlackChannelInfo, error) {
-	tokens := []string{}
+func (c *Client) ListChannels() ([]ChannelInfo, error) {
+	var tokens []string
 	if c.BotToken != "" {
 		tokens = append(tokens, c.BotToken)
 	}
@@ -1228,10 +1226,10 @@ func (c *Client) ListChannels() ([]SlackChannelInfo, error) {
 			}
 			return nil, fmt.Errorf("conversations.list error: %s", data.Error)
 		}
-		var out []SlackChannelInfo
+		var out []ChannelInfo
 		for _, ch := range data.Channels {
 			if ch.IsMember && ch.Name != "" {
-				out = append(out, SlackChannelInfo{ID: ch.ID, Name: ch.Name})
+				out = append(out, ChannelInfo{ID: ch.ID, Name: ch.Name})
 			}
 		}
 		return out, nil
@@ -1245,7 +1243,7 @@ var reFromUserID = regexp.MustCompile(`\bfrom:([UW][A-Z0-9]+)\b`)
 
 // ResolveUserIDsInQuery replaces from:USERID tokens with from:@username so
 // that the Slack search API filters messages by the correct user.
-// If the user ID cannot be resolved (e.g. missing users:read scope), the
+// If the user ID cannot be resolved (e.g., missing users:read scope), the
 // from:USERID token is removed from the query — the Slack search API does not
 // understand raw user IDs as a from: filter, so leaving it would silently
 // break user filtering. The search runs more broadly in that case.
@@ -1259,7 +1257,7 @@ func (c *Client) ResolveUserIDsInQuery(q string) string {
 		name, err := c.GetUsernameByID(userID)
 		if err != nil {
 			log.Printf("[SLACK] ResolveUserIDsInQuery: could not resolve %s (add users:read scope to fix): %v", userID, err)
-			// Return empty string to remove the broken filter; the Slack search
+			// Return an empty string to remove the broken filter; the Slack search
 			// API ignores from:USERID and would return unfiltered results anyway.
 			return ""
 		}
@@ -1300,7 +1298,7 @@ func (c *Client) rewriteFromToUserIDs(q string) string {
 		}
 		which := m[1]  // from|to
 		userID := m[2] // U...
-		full := m[0]   // full matched segment
+		full := m[0]   // full-matched segment
 		reps = append(reps, repl{full: full, which: which, userID: userID})
 		if !seen[userID] {
 			seen[userID] = true
@@ -1323,13 +1321,13 @@ func (c *Client) rewriteFromToUserIDs(q string) string {
 		if name := idToName[r.userID]; name != "" {
 			out = strings.ReplaceAll(out, r.full, fmt.Sprintf("%s:@%s", r.which, name))
 		} else {
-			// fallback: use <@USERID> format which Slack search accepts even without users:read scope
+			// fallback: use <@USERID> a format which Slack search accepts even without users:read scope
 			out = strings.ReplaceAll(out, r.full, fmt.Sprintf("%s:<@%s>", r.which, r.userID))
 		}
 	}
 
 	// Also resolve bare <@USERID> and <@USERID|name> mentions to @username
-	reBare := regexp.MustCompile(`<@((U|W)[A-Z0-9]+)(?:\|[^>]+)?>`)
+	reBare := regexp.MustCompile(`<@(([UW])[A-Z0-9]+)(?:\|[^>]+)?>`)
 	bareMentions := reBare.FindAllStringSubmatch(out, -1)
 	for _, m := range bareMentions {
 		if len(m) < 2 {

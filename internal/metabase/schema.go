@@ -1,4 +1,3 @@
-// internal/metabase/schema.go
 package metabase
 
 import (
@@ -12,10 +11,10 @@ import (
 )
 
 // GenerateSchemaDoc fetches metadata from Metabase and writes a Markdown
-// documentation file to outputPath.  environment is a free-form label
+// documentation file to outputPath. Environment is a free-form label
 // (e.g. "production", "staging") included in the file header.
 //
-// If outputPath is empty it defaults to "./docs/metabase_schema.md".
+// If outputPath is empty, it defaults to "./docs/metabase_schema.md".
 // The parent directory is created automatically when it does not exist.
 func GenerateSchemaDoc(client *Client, outputPath, environment string) error {
 	if outputPath == "" {

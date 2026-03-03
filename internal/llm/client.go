@@ -1,4 +1,3 @@
-// internal/llm/client.go
 package llm
 
 import (
@@ -16,7 +15,7 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/config"
 )
 
-// ContentPart is a single element in a multi-part message content array,
+// ContentPart is a single element in a multipart message content array,
 // used for vision API calls that mix text and images.
 type ContentPart struct {
 	Type     string        `json:"type"`
@@ -44,8 +43,8 @@ func (a ImageAttachment) DataURL() string {
 }
 
 // OpenAIMessage defines the role and content for a message in the
-// Chat Completions API.  When ContentParts is non-empty (vision messages),
-// the content is serialised as an array; otherwise Content is used as a string.
+// Chat Completions API.  When ContentParts are non-empty (vision messages),
+// the content is serialized as an array; otherwise Content is used as a string.
 type OpenAIMessage struct {
 	Role         string
 	Content      string        // used for plain-text messages
@@ -132,7 +131,7 @@ func (c *Client) Chat(messages []OpenAIMessage, model string, temperature float6
 }
 
 // chatWithTemperature performs the actual HTTP call.  If the model rejects
-// the requested temperature (e.g. gpt-5-mini only accepts the default),
+// the requested temperature (e.g., gpt-5-mini only accepts the default),
 // it retries once without a custom temperature.
 func (c *Client) chatWithTemperature(messages []OpenAIMessage, model string, temperature float64, maxTokens int) (string, error) {
 	reqBody := openAIChatRequest{
@@ -180,7 +179,7 @@ func (c *Client) chatWithTemperature(messages []OpenAIMessage, model string, tem
 	if finishReason == "length" {
 		// Append a note if truncated in the middle of a sentence
 		if !strings.HasSuffix(content, ".") && !strings.HasSuffix(content, "!") && !strings.HasSuffix(content, "?") {
-			content += "\n_(resposta truncada - tente uma pergunta mais especifica)_"
+			content += "\n_(report truncada - tente uma pergunta mais especifica)_"
 		}
 	}
 	return content, nil
@@ -190,7 +189,7 @@ func (c *Client) chatWithTemperature(messages []OpenAIMessage, model string, tem
 // genuinely intends to create a Jira issue right now.  threadHistory provides
 // prior conversation context so the LLM can distinguish immediate commands
 // from hypothetical or contextual mentions of creation.
-// The lesserModel is tried first (cheaper/faster); primaryModel is used on
+// The lesserModel is tried first (cheaper/faster); the primaryModel is used on
 // failure.  Returns false on any error to avoid creating unwanted issues.
 func (c *Client) ConfirmJiraCreateIntent(question, threadHistory, lesserModel, primaryModel string) bool {
 	threadSection := ""

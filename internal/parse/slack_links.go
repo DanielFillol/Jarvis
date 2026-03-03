@@ -7,7 +7,7 @@ import (
 
 var (
 	// Example: https://workspace.slack.com/archives/C02ABCDEF/p1770123456789012
-	reSlackArchivesPermalink = regexp.MustCompile(`https?://[^\s]+/archives/([A-Z0-9]+)/p(\d{16})`)
+	reSlackArchivesPermalink = regexp.MustCompile(`https?://\S+/archives/([A-Z0-9]+)/p(\d{16})`)
 )
 
 // ExtractSlackThreadPermalink extracts (channelID, messageTs) from a Slack

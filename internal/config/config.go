@@ -1,4 +1,3 @@
-// internal/config/config.go
 package config
 
 import (
@@ -39,10 +38,10 @@ type Config struct {
 	JiraEmail    string
 	JiraAPIToken string
 	// JiraProjectKeys is the list of default project keys to search
-	// (e.g. ["PROJ", "BACKEND"]).  Set via JIRA_PROJECT_KEYS=PROJ,BACKEND.
+	// (e.g. ["PROJ", "BACKEND"]).  Set via JIRA_PROJECT_KEYS=PROJ, BACKEND.
 	JiraProjectKeys []string
 	// JiraProjectNameMap maps human-readable project names (lowercase) to
-	// their Jira keys.  Set via JIRA_PROJECT_NAME_MAP=name1:KEY1,name2:KEY2.
+	// their Jira keys.  Set via JIRA_PROJECT_NAME_MAP=name1: KEY1,name2: KEY2.
 	JiraProjectNameMap map[string]string
 	// JiraCreateEnabled allows the bot to create Jira issues on behalf of
 	// users.  Disabled by default.  Set via JIRA_CREATE_ENABLED=true.
@@ -139,7 +138,7 @@ func getEnv(key, def string) string {
 }
 
 // parseProjectNameMap parses "name1:KEY1,name2:KEY2" into a map from
-// lowercased name to uppercase Jira project key.
+// the lowercased name to an uppercase Jira project key.
 // Malformed or empty entries are silently ignored.
 func parseProjectNameMap(s string) map[string]string {
 	m := make(map[string]string)
