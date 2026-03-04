@@ -24,7 +24,7 @@ func (a ImageAttachment) DataURL() string {
 // answerWithModel assembles the prompt and calls the Chat API with the
 // specified model.  It converts Markdown into Slack Markdown before
 // returning the result.
-func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx string, images []ImageAttachment, model string) (string, error) {
+func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string, images []ImageAttachment, model string) (string, error) {
 	botName := c.BotName
 	if strings.TrimSpace(botName) == "" {
 		botName = "Jarvis"
@@ -92,6 +92,10 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 		systemParts = append(systemParts, "",
 			"METABASE NÃO CONFIGURADO: A integração com Metabase (banco de dados) não está habilitada nesta instalação. Se o usuário pedir consultas de dados, métricas ou relatórios que requeiram SQL, informe gentilmente que essa integração não está disponível e sugira que o administrador configure as variáveis METABASE_BASE_URL e METABASE_API_KEY.")
 	}
+	if !c.OutlineEnabled {
+		systemParts = append(systemParts, "",
+			"OUTLINE NÃO CONFIGURADO: A integração com o Outline Wiki não está habilitada nesta instalação. Se o usuário pedir documentação interna, processos ou guias que provavelmente estão na wiki, informe gentilmente que essa integração não está disponível e sugira que o administrador configure as variáveis OUTLINE_BASE_URL e OUTLINE_API_KEY.")
+	}
 	system := strings.Join(systemParts, "\n")
 	var u strings.Builder
 	if threadHistory != "" {
@@ -117,6 +121,11 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 	if fileCtx != "" {
 		u.WriteString("ARQUIVOS ANEXADOS:\n")
 		u.WriteString(fileCtx)
+		u.WriteString("\n\n")
+	}
+	if outlineCtx != "" {
+		u.WriteString("DOCUMENTAÇÃO INTERNA (Outline Wiki):\n")
+		u.WriteString(outlineCtx)
 		u.WriteString("\n\n")
 	}
 	u.WriteString("PERGUNTA:\n")
@@ -154,7 +163,7 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 // failures, then falls back to lesserModel when configured and different.
 // This makes answer generation resilient to flaky networking, 429s, and 5xxs.
 func (c *Client) AnswerWithRetry(
-	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx string,
+	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string,
 	images []ImageAttachment,
 	primaryModel, lesserModel string,
 	maxAttempts int,
@@ -168,14 +177,14 @@ func (c *Client) AnswerWithRetry(
 	}
 
 	// Try primary first.
-	out, err := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, images, primaryModel, maxAttempts, baseDelay)
+	out, err := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, primaryModel, maxAttempts, baseDelay)
 	if err == nil && strings.TrimSpace(out) != "" {
 		return out, nil
 	}
 
 	// Fall back to the lesser model if configured and different from the primary.
 	if lesserModel != "" && lesserModel != primaryModel {
-		out2, err2 := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, images, lesserModel, maxAttempts, baseDelay)
+		out2, err2 := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, lesserModel, maxAttempts, baseDelay)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
 			return out2, nil
 		}
@@ -192,7 +201,7 @@ func (c *Client) AnswerWithRetry(
 }
 
 func (c *Client) answerWithRetrySingleModel(
-	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx string,
+	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string,
 	images []ImageAttachment,
 	model string,
 	maxAttempts int,
@@ -200,7 +209,7 @@ func (c *Client) answerWithRetrySingleModel(
 ) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, images, model)
+		out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, model)
 		if err == nil && strings.TrimSpace(out) != "" {
 			return out, nil
 		}
