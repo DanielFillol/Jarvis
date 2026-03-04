@@ -56,6 +56,7 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 		Metabase:   metabaseClient,
 		Cfg:        cfg,
 		FileServer: fs,
+		Store:      *state.NewStore(2 * time.Hour),
 	}
 }
 
@@ -151,7 +152,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	storedDBID, _ := s.loadThreadDBID(contextChannel, contextThreadTs)
 	decision, err := s.LLM.DecideRetrieval(
 		questionForLLM, threadHist, s.Cfg.OpenAILesserModel,
-		s.Cfg.JiraEnabled(), s.Cfg.JiraProjectKeys, senderUserID,
+		s.Cfg.JiraEnabled(), s.Jira.CatalogCompact, senderUserID,
 		s.formattedMetabaseDatabases(), storedDBID,
 	)
 	if err != nil {
@@ -308,12 +309,44 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		return nil
 	}
 
-	// 10) File context from attachments.
-	fileCtx := s.buildFileContext(files)
-	if fileCtx != "" {
-		log.Printf("[JARVIS] fileContext files=%d chars=%d", len(files), len(fileCtx))
+	// 10) File context from attachments (current message + thread history files).
+	// When the user references a file shared in an earlier reply, we collect all
+	// files from the thread so follow-up questions don't miss prior attachments.
+	allFiles := append([]slack.File{}, files...)
+	if threadTs != "" {
+		fetchTs := contextThreadTs
+		if fetchTs == "" {
+			fetchTs = threadTs
+		}
+		if tf, err := s.Slack.GetThreadFiles(contextChannel, fetchTs); err != nil {
+			log.Printf("[WARN] GetThreadFiles failed: %v", err)
+		} else {
+			seen := make(map[string]bool)
+			for _, f := range allFiles {
+				seen[f.ID] = true
+			}
+			added := 0
+			const maxThreadFiles = 5
+			for _, f := range tf {
+				if added >= maxThreadFiles {
+					break
+				}
+				if !seen[f.ID] {
+					seen[f.ID] = true
+					allFiles = append(allFiles, f)
+					added++
+				}
+			}
+			if added > 0 {
+				log.Printf("[JARVIS] threadFiles added=%d total=%d", added, len(allFiles))
+			}
+		}
 	}
-	images := s.buildImageAttachments(files)
+	fileCtx := s.buildFileContext(allFiles)
+	if fileCtx != "" {
+		log.Printf("[JARVIS] fileContext files=%d chars=%d", len(allFiles), len(fileCtx))
+	}
+	images := s.buildImageAttachments(allFiles)
 	if len(images) > 0 {
 		log.Printf("[JARVIS] imageAttachments count=%d", len(images))
 	}
