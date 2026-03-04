@@ -1,23 +1,153 @@
 package llm
 
 import (
+	"encoding/base64"
 	"errors"
-	"math"
-	"math/rand"
 	"strings"
 	"time"
+
+	"github.com/DanielFillol/Jarvis/internal/text"
 )
 
-// CallOpenAIWithModel delegates to Client.Chat with the same signature.
-// It exists as a named alias for callers that want an explicit model parameter.
-func (c *Client) CallOpenAIWithModel(messages []OpenAIMessage, model string, temperature float64, maxTokens int) (string, error) {
-	return c.Chat(messages, model, temperature, maxTokens)
+// ImageAttachment holds a raw image downloaded from Slack for vision API calls.
+type ImageAttachment struct {
+	MimeType string // e.g. "image/jpeg"
+	Name     string
+	Data     []byte
 }
 
-// AnswerWithModel generates an answer using a specific model bypassing the
-// primary/fallback selection in AnswerWithRetry.
-func (c *Client) AnswerWithModel(question, threadHistory, slackCtx, jiraCtx, model string) (string, error) {
-	return c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, "", "", nil, model)
+// DataURL returns the base64-encoded data URL for the image.
+func (a ImageAttachment) DataURL() string {
+	return "data:" + a.MimeType + ";base64," + base64.StdEncoding.EncodeToString(a.Data)
+}
+
+// answerWithModel assembles the prompt and calls the Chat API with the
+// specified model.  It converts Markdown into Slack Markdown before
+// returning the result.
+func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx string, images []ImageAttachment, model string) (string, error) {
+	botName := c.BotName
+	if strings.TrimSpace(botName) == "" {
+		botName = "Jarvis"
+	}
+	sqlOnlyCtx := dbCtx != "" && jiraCtx == ""
+
+	contextHint := "Se o contexto não for suficiente, diga o que falta e sugira como achar (JQL/links)."
+	if sqlOnlyCtx {
+		contextHint = "Se os dados não forem suficientes para responder, informe o usuário e sugira como refinar a pergunta. Nunca mencione JQL — este contexto é exclusivamente de banco de dados SQL."
+	}
+
+	systemParts := []string{
+		"Você é o " + botName + ", assistente do Slack.",
+		"Responda em português brasileiro, direto, sem enrolação, usando o contexto quando existir.",
+		contextHint,
+		"Não invente fatos.",
+		"Quando a pergunta for ambígua ou faltar informação essencial para uma boa resposta, prefira fazer uma pergunta de esclarecimento direta ao usuário em vez de adivinhar ou dar uma resposta genérica.",
+		"MENÇÕES DE USUÁRIOS SLACK: Ao mencionar um usuário pelo ID (ex: U067UM4LRGB), SEMPRE use o formato de mention <@USERID> (ex: <@U067UM4LRGB>). O Slack renderiza automaticamente como o nome de exibição. NUNCA escreva @U067UM4LRGB ou o ID puro — use sempre <@ID>.",
+		"CAPACIDADES: Você consegue ler e resumir threads do Slack quando o usuário fornece um link direto (permalink). Ao receber um link como https://empresa.slack.com/archives/CHANID/pTIMESTAMP, você recupera e resume o conteúdo da thread automaticamente. Nunca diga que não consegue acessar links de thread do Slack.",
+		"",
+		"FORMATAÇÃO — use Slack mrkdwn com variedade visual. Recursos disponíveis e quando usar cada um:",
+		"",
+		"*Texto:*",
+		"- *negrito* (asterisco simples) → títulos de seção, termos-chave, nomes de projetos. NUNCA use **duplo**.",
+		"- _itálico_ → datas, nomes, valores secundários, ênfase suave.",
+		"- ~tachado~ → itens cancelados, versões antigas, coisas descartadas.",
+		"",
+		"*Código e comandos:*",
+		"- `código inline` → issue keys (PROJ-123), nomes de campos, comandos curtos, valores exatos, JQL de uma linha.",
+		"- ```bloco de código``` → JQL longo, JSON, código-fonte, saídas de terminal, queries multi-linha. Use ``` em linha separada.",
+		"",
+		"*Estrutura:*",
+		"- > blockquote → notas importantes, avisos, dicas, callouts de atenção. Uma ou mais linhas com > no início.",
+		"- • ou - → listas sem ordem definida. Sub-itens com dois espaços de indentação.",
+		"- 1. 2. 3. → passos sequenciais, rankings, procedimentos passo a passo.",
+		"- NÃO use # ## ### → use *Título* ou *Título:* em linha própria.",
+		"- NÃO use tabelas Markdown (| col | col |) → Slack não as renderiza. Para dados tabulares use lista ou bloco de código.",
+		"",
+		"*Princípio geral:* varie os estilos conforme o conteúdo. Respostas longas com múltiplas seções ficam melhor com títulos em negrito. Código e JQL sempre em bloco. Notas críticas em blockquote. Não use sempre o mesmo padrão — leia o que foi perguntado e escolha o formato que torna a resposta mais fácil de ler.",
+		"",
+		"LIMITAÇÃO IMPORTANTE: Você não consegue enviar arquivos, anexos ou downloads no Slack. Quando o usuário pedir dados em CSV, Excel ou qualquer outro formato de arquivo para download, informe claramente que essa funcionalidade não está disponível no momento e ofereça apresentar os dados diretamente na mensagem (tabela em bloco de código, lista, etc.).",
+	}
+	if strings.TrimSpace(c.JiraBaseURL) != "" {
+		baseURL := strings.TrimRight(strings.TrimSpace(c.JiraBaseURL), "/")
+		systemParts = append(systemParts, "",
+			"IMPORTANTE - Links do Jira:",
+			"- Quando precisar gerar um link completo de uma issue Jira, use SEMPRE este base URL: "+baseURL,
+			"- Formato: "+baseURL+"/browse/KEY (ex: "+baseURL+"/browse/PROJ-123)",
+			"- NUNCA use outros domínios além do base URL fornecido acima.")
+	}
+	if sqlOnlyCtx {
+		systemParts = append(systemParts, "",
+			"CONTEXTO: Esta pergunta é respondida com dados de banco de dados SQL.",
+			"- NÃO mencione JQL em nenhuma hipótese — JQL é exclusivo para perguntas sobre o Jira.",
+			"- NÃO oriente o usuário a usar o Jira ou a fazer buscas no Jira.",
+			"- Se os dados forem insuficientes, pergunte ao usuário como refinar a consulta.")
+	}
+	// Inform the LLM which optional integrations are active so it responds
+	// honestly when users ask about capabilities that are not configured.
+	if !c.JiraEnabled {
+		systemParts = append(systemParts, "",
+			"JIRA NÃO CONFIGURADO: A integração com Jira não está habilitada nesta instalação. Se o usuário pedir algo relacionado a Jira (criar card, buscar issue, roadmap etc.), informe gentilmente que essa integração não está disponível e sugira que o administrador configure as variáveis JIRA_BASE_URL, JIRA_EMAIL e JIRA_API_TOKEN.")
+	}
+	if !c.MetabaseEnabled {
+		systemParts = append(systemParts, "",
+			"METABASE NÃO CONFIGURADO: A integração com Metabase (banco de dados) não está habilitada nesta instalação. Se o usuário pedir consultas de dados, métricas ou relatórios que requeiram SQL, informe gentilmente que essa integração não está disponível e sugira que o administrador configure as variáveis METABASE_BASE_URL e METABASE_API_KEY.")
+	}
+	system := strings.Join(systemParts, "\n")
+	var u strings.Builder
+	if threadHistory != "" {
+		u.WriteString("CONTEXTO DO THREAD:\n")
+		u.WriteString(threadHistory)
+		u.WriteString("\n\n")
+	}
+	if slackCtx != "" {
+		u.WriteString("CONTEXTO DO SLACK (busca):\n")
+		u.WriteString(slackCtx)
+		u.WriteString("\n\n")
+	}
+	if jiraCtx != "" {
+		u.WriteString("CONTEXTO DO JIRA:\n")
+		u.WriteString(jiraCtx)
+		u.WriteString("\n\n")
+	}
+	if dbCtx != "" {
+		u.WriteString("DADOS DO BANCO DE DADOS (resultado de query SQL):\n")
+		u.WriteString(dbCtx)
+		u.WriteString("\n\n")
+	}
+	if fileCtx != "" {
+		u.WriteString("ARQUIVOS ANEXADOS:\n")
+		u.WriteString(fileCtx)
+		u.WriteString("\n\n")
+	}
+	u.WriteString("PERGUNTA:\n")
+	u.WriteString(question)
+	u.WriteString("\n\n")
+	u.WriteString("Use formatação variada e contextual. Issue keys sempre em `código inline` (ex: `PROJ-123`). JQL em bloco de código. Passos numerados quando relevante. Blockquotes para avisos ou notas importantes.")
+	var userMsg OpenAIMessage
+	if len(images) > 0 {
+		// Vision message: text + images as content parts array.
+		parts := []ContentPart{{Type: "text", Text: u.String()}}
+		for _, img := range images {
+			parts = append(parts, ContentPart{
+				Type:     "image_url",
+				ImageURL: &ImageURLPart{URL: img.DataURL(), Detail: "auto"},
+			})
+		}
+		userMsg = OpenAIMessage{Role: "user", ContentParts: parts}
+	} else {
+		userMsg = OpenAIMessage{Role: "user", Content: u.String()}
+	}
+	msgs := []OpenAIMessage{
+		{Role: "system", Content: system},
+		userMsg,
+	}
+	out, err := c.Chat(msgs, model, 0.7, 20000)
+	if err != nil {
+		return "", err
+	}
+	// Convert Markdown to Slack Markdown
+	out = text.MarkdownToMarkdown(strings.TrimSpace(out))
+	return out, nil
 }
 
 // AnswerWithRetry generates an answer using primaryModel, retrying on transient
@@ -87,17 +217,4 @@ func (c *Client) answerWithRetrySingleModel(
 		}
 	}
 	return "", lastErr
-}
-
-func backoffWithJitter(base time.Duration, attempt int) time.Duration {
-	// exponential backoff: base * 2^(attempt-1), capped
-	multi := math.Pow(2, float64(attempt-1))
-	d := time.Duration(float64(base) * multi)
-	const capDelay = 6 * time.Second
-	if d > capDelay {
-		d = capDelay
-	}
-	// full jitter in [0.7..1.3]
-	j := 0.7 + rand.Float64()*0.6
-	return time.Duration(float64(d) * j)
 }

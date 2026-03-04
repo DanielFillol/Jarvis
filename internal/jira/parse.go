@@ -2,24 +2,8 @@ package jira
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 )
-
-var (
-	reHeading = regexp.MustCompile(`^(#{1,6})\s+(.+)$`)
-	reTask    = regexp.MustCompile(`^-\s+\[([xX ])]\s*(.*)$`)
-	reBold    = regexp.MustCompile(`\*\*(.+?)\*\*`)
-	reHR      = regexp.MustCompile(`^-{3,}$|^\*{3,}$|^_{3,}$`)
-)
-
-// isBulletLine returns true for lines like "- text" or "* text" that are NOT task items.
-func isBulletLine(s string) bool {
-	if reTask.MatchString(s) {
-		return false
-	}
-	return strings.HasPrefix(s, "- ") || strings.HasPrefix(s, "* ")
-}
 
 // MarkdownToADF converts Markdown text produced by the LLM into Atlassian
 // Document Format (ADF) for Jira Cloud API v3.
@@ -39,6 +23,14 @@ func MarkdownToADF(text string) map[string]any {
 		nodes = []any{adfParagraph([]any{adfText(" ")})}
 	}
 	return map[string]any{"type": "doc", "version": 1, "content": nodes}
+}
+
+func adfParagraph(content []any) map[string]any {
+	return map[string]any{"type": "paragraph", "content": content}
+}
+
+func adfText(s string) map[string]any {
+	return map[string]any{"type": "text", "text": s}
 }
 
 func parseMDBlocks(lines []string, counter *int) []any {
@@ -138,7 +130,6 @@ func parseMDBlocks(lines []string, counter *int) []any {
 	return nodes
 }
 
-// parseInline converts inline Markdown (**bold**) to ADF text content nodes.
 func parseInline(s string) []any {
 	if strings.TrimSpace(s) == "" {
 		return []any{adfText(" ")}
@@ -165,15 +156,13 @@ func parseInline(s string) []any {
 	return result
 }
 
-func adfParagraph(content []any) map[string]any {
-	return map[string]any{"type": "paragraph", "content": content}
+func isBulletLine(s string) bool {
+	if reTask.MatchString(s) {
+		return false
+	}
+	return strings.HasPrefix(s, "- ") || strings.HasPrefix(s, "* ")
 }
 
-func adfText(s string) map[string]any {
-	return map[string]any{"type": "text", "text": s}
-}
-
-// TextToADF is kept for backwards compatibility but now delegates to MarkdownToADF.
 func TextToADF(text string) map[string]any {
 	return MarkdownToADF(text)
 }

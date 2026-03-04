@@ -65,26 +65,6 @@ type Config struct {
 	MetabaseQueryTimeout time.Duration
 }
 
-// LesserModel returns the lesser/auxiliary model identifier.  When
-// OPENAI_LESSER_MODEL is not set, it falls back to OpenAIModel so that a
-// single-model deployment works without any additional configuration.
-func (c Config) LesserModel() string {
-	if strings.TrimSpace(c.OpenAILesserModel) != "" {
-		return c.OpenAILesserModel
-	}
-	return c.OpenAIModel
-}
-
-// JiraEnabled reports whether Jira credentials have been provided.
-func (c Config) JiraEnabled() bool {
-	return strings.TrimSpace(c.JiraBaseURL) != ""
-}
-
-// MetabaseEnabled reports whether Metabase credentials have been provided.
-func (c Config) MetabaseEnabled() bool {
-	return strings.TrimSpace(c.MetabaseBaseURL) != ""
-}
-
 // Load reads configuration from environment variables.  A .env file in the
 // working directory is loaded automatically if present (godotenv); errors are
 // ignored because variables may already be set in the process environment.
@@ -106,7 +86,7 @@ func Load() Config {
 	cfg.JiraEmail = os.Getenv("JIRA_EMAIL")
 	cfg.JiraAPIToken = os.Getenv("JIRA_API_TOKEN")
 	cfg.JiraCreateEnabled = strings.EqualFold(strings.TrimSpace(getEnv("JIRA_CREATE_ENABLED", "false")), "true")
-	cfg.JiraProjectKeys = parseCSV(getEnv("JIRA_PROJECT_KEYS", ""))
+	cfg.JiraProjectKeys = parseProjectKeys(getEnv("JIRA_PROJECT_KEYS", ""))
 	cfg.JiraProjectNameMap = parseProjectNameMap(os.Getenv("JIRA_PROJECT_NAME_MAP"))
 
 	cfg.MetabaseBaseURL = os.Getenv("METABASE_BASE_URL")
@@ -137,6 +117,18 @@ func getEnv(key, def string) string {
 	return v
 }
 
+// parseProjectKeys splits a comma-separated string into a trimmed, non-empty slice.
+func parseProjectKeys(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // parseProjectNameMap parses "name1:KEY1,name2:KEY2" into a map from
 // the lowercased name to an uppercase Jira project key.
 // Malformed or empty entries are silently ignored.
@@ -160,14 +152,12 @@ func parseProjectNameMap(s string) map[string]string {
 	return m
 }
 
-// parseCSV splits a comma-separated string into a trimmed, non-empty slice.
-func parseCSV(s string) []string {
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+// JiraEnabled reports whether Jira credentials have been provided.
+func (c Config) JiraEnabled() bool {
+	return strings.TrimSpace(c.JiraBaseURL) != ""
+}
+
+// MetabaseEnabled reports whether Metabase credentials have been provided.
+func (c Config) MetabaseEnabled() bool {
+	return strings.TrimSpace(c.MetabaseBaseURL) != ""
 }

@@ -104,13 +104,13 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		deletedTs = msg.Message.Ts
 	}
 	if deletedTs != "" {
-		if botTs := h.Service.Tracker.Get(msg.Channel, deletedTs); botTs != "" {
+		if botTs := h.Service.Slack.Tracker.Get(msg.Channel, deletedTs); botTs != "" {
 			log.Printf("[SLACK] user deleted origin=%q — deleting bot reply ts=%q", deletedTs, botTs)
 			go func() {
 				if err := h.Slack.DeleteMessage(msg.Channel, botTs); err != nil {
 					log.Printf("[WARN] delete bot reply failed: %v", err)
 				}
-				h.Service.Tracker.Delete(msg.Channel, deletedTs)
+				h.Service.Slack.Tracker.Delete(msg.Channel, deletedTs)
 			}()
 		}
 		return
@@ -173,11 +173,11 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[HTTP] /slack/events done dur=%s", time.Since(start))
 }
 
-// preview truncates a string to at most n runes for logging.
+// Helper preview returns a shortened version of a string for logging.
 func preview(s string, n int) string {
 	s = strings.TrimSpace(s)
-	if n <= 0 || len(s) <= n {
-		return s
+	if len(s) > n {
+		return s[:n] + "…"
 	}
-	return s[:n] + "…"
+	return s
 }

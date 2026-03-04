@@ -11,6 +11,7 @@ var (
 	reMDUnderBold = regexp.MustCompile(`__(.+?)__`)
 	reMDTilde     = regexp.MustCompile(`~~(.+?)~~`)
 	reMDHeading   = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
+	reMDCodeBlock = regexp.MustCompile("(?s)```[^`]*```")
 	// Matches blocks of 2+ consecutive lines starting with "|" (Markdown tables).
 	// Slack does not render Markdown tables; we wrap them in a code block so the
 	// columns stay readable in a monospace font.
@@ -52,6 +53,3 @@ func MarkdownToMarkdown(s string) string {
 	}
 	return s
 }
-
-// reMDCodeBlock matches fenced code blocks (``` ... ```) across multiple lines.
-var reMDCodeBlock = regexp.MustCompile("(?s)```[^`]*```")

@@ -2,7 +2,6 @@ package llm
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,83 +14,9 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/config"
 )
 
-// ContentPart is a single element in a multipart message content array,
-// used for vision API calls that mix text and images.
-type ContentPart struct {
-	Type     string        `json:"type"`
-	Text     string        `json:"text,omitempty"`
-	ImageURL *ImageURLPart `json:"image_url,omitempty"`
-}
-
-// ImageURLPart holds the URL (or base64 data URL) and optional detail level
-// for an image in a vision message.
-type ImageURLPart struct {
-	URL    string `json:"url"`
-	Detail string `json:"detail,omitempty"`
-}
-
-// ImageAttachment holds a raw image downloaded from Slack for vision API calls.
-type ImageAttachment struct {
-	MimeType string // e.g. "image/jpeg"
-	Name     string
-	Data     []byte
-}
-
-// DataURL returns the base64-encoded data URL for the image.
-func (a ImageAttachment) DataURL() string {
-	return "data:" + a.MimeType + ";base64," + base64.StdEncoding.EncodeToString(a.Data)
-}
-
-// OpenAIMessage defines the role and content for a message in the
-// Chat Completions API.  When ContentParts are non-empty (vision messages),
-// the content is serialized as an array; otherwise Content is used as a string.
-type OpenAIMessage struct {
-	Role         string
-	Content      string        // used for plain-text messages
-	ContentParts []ContentPart // used for vision messages
-}
-
-// MarshalJSON serialises the message as either a string or array content.
-func (m OpenAIMessage) MarshalJSON() ([]byte, error) {
-	if len(m.ContentParts) > 0 {
-		return json.Marshal(struct {
-			Role    string        `json:"role"`
-			Content []ContentPart `json:"content"`
-		}{m.Role, m.ContentParts})
-	}
-	return json.Marshal(struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}{m.Role, m.Content})
-}
-
-// openAIChatRequest is the request payload for OpenAI's chat
-// completions endpoint.  It allows specifying a model, messages and
-// optional parameters such as temperature and max tokens.
-type openAIChatRequest struct {
-	Model               string          `json:"model"`
-	Messages            []OpenAIMessage `json:"messages"`
-	Temperature         float64         `json:"temperature,omitempty"`
-	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
-}
-
-// openAIChatResponse models the top-level response from the chat
-// completions API.  Only the fields needed by this application are
-// defined here.
-type openAIChatResponse struct {
-	Choices []struct {
-		FinishReason string `json:"finish_reason,omitempty"`
-		Message      struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
-	Error *struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Param   string `json:"param"`
-		Code    string `json:"code"`
-	} `json:"error,omitempty"`
-}
+// ClarificationPrefix is prepended to the return value of GenerateSQL when the
+// LLM needs additional information from the user before generating a query.
+const ClarificationPrefix = "CLARIFICATION_NEEDED:"
 
 // Client encapsulates credentials and capability flags used across all LLM calls.
 type Client struct {
@@ -185,60 +110,287 @@ func (c *Client) chatWithTemperature(messages []OpenAIMessage, model string, tem
 	return content, nil
 }
 
-// ConfirmJiraCreateIntent calls the LLM to verify whether the message
-// genuinely intends to create a Jira issue right now.  threadHistory provides
-// prior conversation context so the LLM can distinguish immediate commands
-// from hypothetical or contextual mentions of creation.
-// The lesserModel is tried first (cheaper/faster); the primaryModel is used on
-// failure.  Returns false on any error to avoid creating unwanted issues.
-func (c *Client) ConfirmJiraCreateIntent(question, threadHistory, lesserModel, primaryModel string) bool {
-	threadSection := ""
-	if t := strings.TrimSpace(threadHistory); t != "" {
-		threadSection = fmt.Sprintf("\nContexto da conversa (use para entender se o pedido é imediato ou hipotético):\n%s\n", clip(t, 2000))
-	}
-	prompt := fmt.Sprintf(`Você é um classificador de intenção. O usuário enviou a mensagem abaixo.
-Ele quer criar um novo card/issue/ticket no Jira AGORA, neste momento?
-
-Responda APENAS "sim" ou "não".
-
-Responda "sim" somente quando a mensagem for um pedido direto e imediato de criação:
-- "crie um card", "abre um bug", "cria uma história", "criar um ticket no Jira"
-
-Responda "não" em todos os outros casos, incluindo:
-- Hipótese / cogitação: "estou pensando em abrir", "acho que deveria criar", "talvez valha criar"
-- Dúvida / pesquisa primeiro: "não sei se já tem um card", "tem uma thread sobre isso?"
-- Menciona criar apenas como contexto ou referência: "criar um serviço dedicado", "criação de demandas"
-- Pede para buscar, resumir, analisar ou verificar algo
-- Menciona criar um relatório, reporte ou documento
-- Contém negação: "não é pra criar", "não quero criar"
-%s
-Mensagem: %q`, threadSection, question)
-
-	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
-
-	model := strings.TrimSpace(lesserModel)
-	if model == "" {
-		model = primaryModel
-	}
-	out, err := c.Chat(messages, model, 0, 10)
-	if err != nil && model != primaryModel {
-		out, err = c.Chat(messages, primaryModel, 0, 10)
-	}
-	if err != nil {
-		log.Printf("[LLM] confirmJiraCreateIntent error: %v — defaulting false", err)
-		return false
-	}
-	answer := strings.ToLower(strings.TrimSpace(out))
-	confirmed := strings.HasPrefix(answer, "sim")
-	log.Printf("[LLM] confirmJiraCreateIntent=%t raw=%q", confirmed, preview(out, 40))
-	return confirmed
+// RetrievalDecision encodes the high-level retrieval routing decision
+// returned by the LLM. It indicates whether Slack, Jira, and/or Metabase
+// context should be fetched and contains any queries supplied by the model.
+type RetrievalDecision struct {
+	NeedSlack          bool   `json:"need_slack"`
+	SlackQuery         string `json:"slack_query"`
+	NeedJira           bool   `json:"need_jira"`
+	JiraIntent         string `json:"jira_intent"`
+	JiraJQL            string `json:"jira_jql"`
+	NeedMetabase       bool   `json:"need_metabase"`
+	MetabaseDatabaseID int    `json:"metabase_database_id"`
+	// ShowSQL is true when the user is asking for the SQL query used in a
+	// prior answer.  HandleMessage will attempt to reconstruct and validate
+	// the query via runMetabaseQuery (with the usual 3-attempt retry logic)
+	// and reply with the SQL directly, bypassing the answer LLM.
+	ShowSQL bool `json:"show_sql"`
+	// WantsAllRows is true when the user wants the full result set without any
+	// row limit (e.g. "todos", "tudo", "sem limite", "lista completa").
+	WantsAllRows bool `json:"wants_all_rows"`
 }
 
-// preview is a helper to truncate long strings for error messages.
-func preview(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n] + "…"
+// DecideRetrieval consults the language model to determine which contexts
+// (Slack, Jira, Metabase) should be retrieved for a given question.
+//
+// jiraEnabled must be true when Jira credentials are configured; when false,
+// the Jira routing section is omitted from the prompt entirely.
+// metabaseDatabases is a list of available databases formatted as
+// "ID: Name (engine)".  Pass an empty slice to disable Metabase routing.
+// DecideRetrieval consults the language model to determine which contexts
+// (Slack, Jira, Metabase) should be retrieved for a given question.
+//
+// storedDBID is the Metabase database ID used in a previous turn of this thread.
+// When > 0, the LLM is informed so it can route follow-up queries correctly
+// without requiring hardcoded keyword matching.
+func (c *Client) DecideRetrieval(question, threadHistory, model string, jiraEnabled bool, projectKeys []string, senderUserID string, metabaseDatabases []string, storedDBID int) (RetrievalDecision, error) {
+	projectsCtx := ""
+	if jiraEnabled && len(projectKeys) > 0 {
+		projectsCtx = fmt.Sprintf("\nProjetos Jira configurados: %s\n", strings.Join(projectKeys, ", "))
 	}
-	return s
+	senderCtx := ""
+	if strings.TrimSpace(senderUserID) != "" {
+		senderCtx = fmt.Sprintf("\nUsuário que está perguntando: <@%s> — quando a pergunta usar \"eu\", \"meu\", \"minha\", \"minhas\", \"me\" refira-se a este usuário.\n", senderUserID)
+	}
+
+	now := time.Now()
+	// Monday of the current week (ISO: Monday = first day)
+	weekday := int(now.Weekday())
+	if weekday == 0 {
+		weekday = 7
+	}
+	monday := now.AddDate(0, 0, -(weekday - 1))
+	dateCtx := fmt.Sprintf("\nData atual: %s (segunda-feira desta semana: %s)\n",
+		now.Format("2006-01-02"),
+		monday.Format("2006-01-02"),
+	)
+
+	metabaseCtx := ""
+	if len(metabaseDatabases) > 0 {
+		metabaseCtx = fmt.Sprintf("\nBancos de dados Metabase disponíveis:\n- %s\n", strings.Join(metabaseDatabases, "\n- "))
+	}
+
+	metabaseFollowUpCtx := ""
+	if storedDBID > 0 {
+		metabaseFollowUpCtx = fmt.Sprintf(
+			"\nEste thread já executou uma consulta no banco de dados Metabase ID=%d. "+
+				"Se a pergunta atual for um follow-up, refinamento ou pedido de execução da consulta anterior, "+
+				"use need_metabase=true e metabase_database_id=%d.\n",
+			storedDBID, storedDBID,
+		)
+	}
+
+	metabaseJSON := ""
+	if len(metabaseDatabases) > 0 {
+		metabaseJSON = `
+  "need_metabase": true/false,
+  "metabase_database_id": <ID do banco acima ou 0>`
+	}
+
+	// Build Jira-specific prompt sections only when Jira is configured.
+	jiraSourceLine := ""
+	jiraRules := ""
+	jiraIntentBlock := ""
+	jiraJQLBlock := ""
+	if jiraEnabled {
+		jiraSourceLine = "- Jira: tickets, status, roadmap, bugs, histórias, épicos, progresso de tarefas.\n"
+		jiraRules = `1. Roadmap, escopo, "o que foi feito", "está no ar", bugs abertos → need_jira=true.
+2. "onde falamos", "qual foi a decisão", "me manda o link", "thread do slack" → need_slack=true.
+3. Resumo/retrospectiva de processo (sprint, fechamento, entrega) → need_jira=true E need_slack=true.
+4. Se need_jira=true para pergunta substantiva (não apenas listagem de tickets), considere need_slack=true também.
+5. Perguntas curtas (≤ 2 palavras) ou que já têm resposta no histórico da thread → need_slack=false, need_jira=false.
+6. Criar card no Jira → need_slack=false, need_jira=false.`
+		jiraIntentBlock = `
+Valores de jira_intent:
+- "listar_bugs_abertos": perguntas sobre bugs em aberto, falhas, erros.
+- "busca_texto": pesquisa de contexto sobre um tema específico no Jira (funcionalidades, épicos, histórias).
+- "default": listagem geral ou roadmap.
+
+Regras para jira_jql:
+- Se souber exatamente o JQL, preencha. Caso contrário, deixe "" e use jira_intent.
+- Use apenas campos padrão do Jira Cloud: project, issuetype, status, statusCategory, text, assignee, priority, labels, sprint, fixVersion, updated, created.
+- Para busca por texto: text ~ "termo"
+- Para bugs abertos: issuetype = Bug AND statusCategory != Done
+- Para busca por sprint: sprint = "Sprint N" ou sprint in openSprints() para sprints ativas.
+- SEMPRE agrupe condições OR com parênteses quando combinadas com AND: project = X AND (text ~ "a" OR text ~ "b") — NUNCA escreva: project = X AND text ~ "a" OR text ~ "b"
+`
+		jiraJQLBlock = `  "need_jira": true/false,
+  "jira_intent": "listar_bugs_abertos|busca_texto|default",
+  "jira_jql": ""`
+	} else {
+		// Jira isn't configured: always output false/empty fields, so the JSON is valid.
+		jiraJQLBlock = `  "need_jira": false,
+  "jira_intent": "",
+  "jira_jql": ""`
+	}
+
+	prompt := fmt.Sprintf(`Você é um roteador de contexto de um assistente de Slack.
+Decida quais fontes buscar para responder a pergunta.
+%s%s%s%s%s
+Retorne APENAS JSON válido:
+{
+  "need_slack": true/false,
+  "slack_query": "...",
+%s%s,
+  "show_sql": true/false,
+  "wants_all_rows": true/false
+}
+
+Fontes disponíveis:
+%s- Slack: discussões, decisões, links de threads, contexto operacional, conversas sobre um tema.
+- Metabase (banco de dados): qualquer consulta que necessite de dados estruturados do banco de dados operacional. Isso inclui TANTO agregações/métricas (contagens, totais, médias, KPIs, receita, "quantos") QUANTO listas de registros filtrados (ex: "quero todas as coletas", "me traz coletas do transportador X", "coletas sem rota", "MTRs emitidos na semana passada", "status planned"). Se a pergunta filtra, lista ou consulta entidades operacionais (coletas, MTRs, geradores, transportadores, rotas, pedidos, clientes), use need_metabase=true. NÃO use need_slack para buscar dados estruturados que vivem no banco de dados.
+
+Regras de roteamento:
+%s
+7. Se o histórico da thread contém blocos de código SQL ou resultados de banco de dados, E o usuário pede para executar/rodar/modificar a consulta ou faz uma pergunta de follow-up sobre os mesmos dados → need_metabase=true. Use o metabase_database_id da linha "Query executada (db=N):" se existir, senão use 0.
+8. show_sql=true SOMENTE quando o usuário pede EXPLICITAMENTE para ver o SQL/query/código que o bot usou — palavras como "SQL", "query", "consulta que você rodou", "me mostra o código", "qual foi a query". Pedidos de dados ("me traga", "quero ver", "lista de", "quantas", "quais coletas") → show_sql=false, need_metabase=true. Quando show_sql=true, também defina need_metabase=true com o metabase_database_id da linha "Query executada (db=N):" do histórico (ou 0 se não houver), need_slack=false, need_jira=false.
+9. Perguntas de follow-up de dados (pronomes como "dessas", "desses", referindo a entidades já consultadas) → need_metabase=true com o mesmo database_id do turno anterior.
+10. wants_all_rows=true quando o usuário quer todos os dados sem limitação de linhas (ex: "todos", "tudo", "sem limite", "lista completa", "traz tudo", "quero todas", "sem limitar").
+%s
+Regras para slack_query (IMPORTANTE):
+- slack_query NUNCA pode ficar vazio quando need_slack=true — sempre gere uma query útil.
+- Se a pergunta mencionar canais (ex: #nome-do-canal), inclua in:#nome-do-canal na query.
+- Use apenas 2–4 palavras-chave do tema, sem filtros extras.
+- NÃO use has:thread, has:link, has:reaction — reduzem o recall drasticamente.
+- Prefira termos sem aspas; use aspas apenas para frases exatas críticas.
+- Quando a pergunta é "o que X falou/disse/escreveu/postou", use from:@username. Ex: "o que o @alice falou" → from:@alice
+- Se a pergunta menciona um usuário Slack (<@USERID>) em contexto de busca geral, inclua o identificador EXATO: ex. "<@U09FJSKP407>"
+
+Regras para datas na slack_query:
+- NÃO inclua expressões como "essa semana" ou "esta semana" como termos de busca — a API do Slack não as interpreta.
+- Converta expressões de tempo em filtros de data:
+  - "essa semana" / "esta semana" → after:SEGUNDA-DESTA-SEMANA (use a data de segunda calculada acima)
+  - "essa semana" como período exato → after:SEGUNDA-DESTA-SEMANA
+  - "entre dia X e Y de mês" → after:ANO-MÊS-X before:ANO-MÊS-Y
+  - "ontem" → after:DATA-ONTEM before:DATA-HOJE
+  - "mês passado" → after:ANO-MÊS-01 before:ANO-MÊS-01 do mês atual
+- Exemplo: "o que foi dito essa semana" → slack_query: "termo-relevante after:2026-02-17"
+
+Thread (contexto recente):
+%s
+
+Pergunta:
+%s
+`, projectsCtx, senderCtx, dateCtx, metabaseCtx, metabaseFollowUpCtx, jiraJQLBlock, metabaseJSON, jiraSourceLine, jiraRules, jiraIntentBlock, clip(threadHistory, 1200), question)
+
+	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
+	// Use 4000 tokens: reasoning models (e.g., gpt-5-mini) consume invisible thinking
+	// tokens before producing output; 600 was not enough and caused empty responses.
+	out, err := c.Chat(messages, model, 0.2, 4000)
+	if err != nil {
+		return RetrievalDecision{}, err
+	}
+
+	out = strings.TrimSpace(stripCodeFences(out))
+
+	var d RetrievalDecision
+	if err := json.Unmarshal([]byte(out), &d); err != nil {
+		return RetrievalDecision{}, fmt.Errorf("bad decision json: %v raw=%q", err, preview(out, 300))
+	}
+
+	d.SlackQuery = strings.TrimSpace(d.SlackQuery)
+	d.JiraIntent = strings.TrimSpace(d.JiraIntent)
+	d.JiraJQL = strings.TrimSpace(d.JiraJQL)
+
+	// Disable Metabase if no databases were provided.
+	if len(metabaseDatabases) == 0 {
+		d.NeedMetabase = false
+		d.MetabaseDatabaseID = 0
+	}
+
+	// Enforce that Jira is never routed when not configured.
+	if !jiraEnabled {
+		d.NeedJira = false
+		d.JiraIntent = ""
+		d.JiraJQL = ""
+	}
+
+	// Normalize Slack query quirks.
+	d.SlackQuery = normalizeSlackQuery(d.SlackQuery)
+
+	return d, nil
+}
+
+// GenerateSQL uses the LLM to produce a native SQL query for the given question.
+// schemaCtx should contain the compact schema documentation for the target database.
+// baseSQL may be a prior query to use as a starting point for follow-up questions.
+// lastErr, if non-empty, is the database error from the previous attempt — the LLM
+// will use it to correct the query rather than regenerating from scratch.
+// Returns the SQL string, or a string prefixed with ClarificationPrefix when the
+// LLM needs more information from the user before it can generate a valid query.
+func (c *Client) GenerateSQL(question, threadHist, schemaCtx, baseSQL, lastErr, dbEngine, model string) (string, error) {
+	if strings.TrimSpace(model) == "" {
+		model = "gpt-4o-mini"
+	}
+	baseCtx := ""
+	if strings.TrimSpace(baseSQL) != "" {
+		if strings.TrimSpace(lastErr) != "" {
+			baseCtx = fmt.Sprintf(
+				"\n\nQuery anterior que falhou com erro — CORRIJA o erro abaixo antes de responder:\n```sql\n%s\n```\nErro retornado pelo banco:\n%s\n",
+				strings.TrimSpace(baseSQL), strings.TrimSpace(lastErr),
+			)
+		} else {
+			baseCtx = fmt.Sprintf(
+				"\n\nQuery anterior (use como base para follow-ups, preservando todos os filtros existentes):\n```sql\n%s\n```\n",
+				strings.TrimSpace(baseSQL),
+			)
+		}
+	}
+
+	now := time.Now()
+	weekday := int(now.Weekday())
+	if weekday == 0 {
+		weekday = 7
+	}
+	thisMonday := now.AddDate(0, 0, -(weekday - 1))
+	lastMonday := thisMonday.AddDate(0, 0, -7)
+	lastSunday := thisMonday.AddDate(0, 0, -1)
+	dateCtx := fmt.Sprintf(
+		"\nReferências de data (use estas ao interpretar expressões relativas):\n"+
+			"- Hoje: %s\n"+
+			"- Segunda desta semana: %s\n"+
+			"- Semana passada: %s a %s (inclusive)\n",
+		now.Format("2006-01-02"),
+		thisMonday.Format("2006-01-02"),
+		lastMonday.Format("2006-01-02"),
+		lastSunday.Format("2006-01-02"),
+	)
+
+	engineCtx := strings.TrimSpace(dbEngine)
+	if engineCtx == "" {
+		engineCtx = "desconhecido"
+	}
+	prompt := fmt.Sprintf(`Você é um especialista em SQL que gera queries nativas para o Metabase.
+Engine do banco de dados: %s
+%s
+Schema do banco de dados:
+%s
+%s
+Histórico da conversa (para contexto):
+%s
+
+Pergunta do usuário: %s
+
+INSTRUÇÕES:
+- Responda APENAS com a query SQL pura, sem texto extra, sem explicações, sem blocos de código markdown.
+- Se a pergunta for ambígua ou carecer de informação essencial que não pode ser inferida do histórico (ex: período de tempo obrigatório não especificado), responda APENAS com: %s<pergunta de esclarecimento em português>
+- Use somente tabelas e colunas que existem no schema acima.
+- Inclua ORDER BY quando relevante para a pergunta.
+- Limite a 1000 linhas por padrão, a menos que o usuário tenha pedido todos os dados.
+
+REGRAS DE SQL:
+- Buscas textuais: use ILIKE '%%termo%%'. Redshift ILIKE é insensível a maiúsculas mas NÃO a acentos — use substrings curtas e sem caracteres acentuados para maior abrangência.
+- Atributos de entidades referenciadas por ID estão em tabelas separadas — sempre use JOIN, nunca assuma que o valor existe como coluna direta.
+- Prefira tabelas base/normalizadas em vez de views ou tabelas de staging.
+- Datas: use os tipos corretos da coluna (Date vs DateTime) e filtre com >= / < ou BETWEEN conforme a sintaxe do engine acima.
+- Use as referências de data acima para expressões relativas como "semana passada", "hoje", "mês passado".`,
+		engineCtx, dateCtx, clip(schemaCtx, 120000), baseCtx, clip(threadHist, 800), question, ClarificationPrefix)
+
+	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}
+	out, err := c.Chat(msgs, model, 0.1, 2000)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(stripCodeFences(out)), nil
 }

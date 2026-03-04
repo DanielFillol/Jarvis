@@ -33,12 +33,6 @@ type Store struct {
 	ttl      time.Duration
 }
 
-// NewStore creates a new pending store with the given time-to-live.  A
-// zero or negative duration disables expiration entirely.
-func NewStore(ttl time.Duration) *Store {
-	return &Store{byThread: make(map[string]*PendingIssue), ttl: ttl}
-}
-
 func (s *Store) key(channel, threadTs string) string {
 	return channel + ":" + threadTs
 }
