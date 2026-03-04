@@ -23,10 +23,11 @@ type Client struct {
 	APIKey      string
 	JiraBaseURL string
 	BotName     string
-	// JiraEnabled and MetabaseEnabled tell the answer LLM which integrations
-	// are available so it can respond accurately when users ask about them.
+	// JiraEnabled, MetabaseEnabled, and OutlineEnabled tell the answer LLM which
+	// integrations are active so it can respond accurately when asked.
 	JiraEnabled     bool
 	MetabaseEnabled bool
+	OutlineEnabled  bool
 }
 
 // NewClient constructs a new LLM client from the provided configuration.
@@ -37,6 +38,7 @@ func NewClient(cfg config.Config) *Client {
 		BotName:         cfg.BotName,
 		JiraEnabled:     cfg.JiraEnabled(),
 		MetabaseEnabled: cfg.MetabaseEnabled(),
+		OutlineEnabled:  cfg.OutlineEnabled(),
 	}
 }
 
@@ -134,15 +136,21 @@ type RetrievalDecision struct {
 	// "traz tudo", "exportar", "planilha", "csv", "baixar").
 	// When true, wants_all_rows is also expected to be true.
 	WantsCSVExport bool `json:"wants_csv_export"`
+	// NeedOutline is true when the question likely requires documentation from
+	// the Outline wiki (processes, how-to guides, product specs, technical docs,
+	// onboarding material, runbooks).
+	NeedOutline  bool   `json:"need_outline"`
+	OutlineQuery string `json:"outline_query"`
 }
 
 // DecideRetrieval consults the language model to determine which contexts
-// (Slack, Jira, Metabase) should be retrieved for a given question.
+// (Slack, Jira, Metabase, Outline) should be retrieved for a given question.
 //
 // jiraCatalog is the compact project catalog generated at startup
 // (e.g. "INV=Faturamento [Bug, Task] | TPTDR=Transporte [Bug, Epic]").
 // storedDBID is the Metabase database ID used in a previous turn of this thread.
-func (c *Client) DecideRetrieval(question, threadHistory, model string, jiraEnabled bool, jiraCatalog string, senderUserID string, metabaseDatabases []string, storedDBID int) (RetrievalDecision, error) {
+// outlineEnabled indicates whether the Outline wiki integration is configured.
+func (c *Client) DecideRetrieval(question, threadHistory, model string, jiraEnabled bool, jiraCatalog string, senderUserID string, metabaseDatabases []string, storedDBID int, outlineEnabled bool) (RetrievalDecision, error) {
 	projectsCtx := ""
 	if jiraEnabled && strings.TrimSpace(jiraCatalog) != "" {
 		projectsCtx = fmt.Sprintf("\nProjetos Jira disponíveis (formato CHAVE=Nome [tipos de issue]):\n%s\n", jiraCatalog)
@@ -167,6 +175,11 @@ func (c *Client) DecideRetrieval(question, threadHistory, model string, jiraEnab
 	metabaseCtx := ""
 	if len(metabaseDatabases) > 0 {
 		metabaseCtx = fmt.Sprintf("\nBancos de dados Metabase disponíveis:\n- %s\n", strings.Join(metabaseDatabases, "\n- "))
+	}
+
+	outlineCtxStr := ""
+	if outlineEnabled {
+		outlineCtxStr = "\nOutline Wiki está configurado e disponível para busca de documentação.\n"
 	}
 
 	metabaseFollowUpCtx := ""
@@ -223,9 +236,20 @@ Regras para jira_jql:
   "jira_jql": ""`
 	}
 
+	outlineSourceLine := ""
+	outlineJSONBlock := ""
+	outlineRule := ""
+	if outlineEnabled {
+		outlineSourceLine = "- Outline Wiki: documentação interna, processos, guias, runbooks, especificações de produto, onboarding, políticas.\n"
+		outlineJSONBlock = `,
+  "need_outline": true/false,
+  "outline_query": "..."`
+		outlineRule = "12. need_outline=true quando a pergunta busca documentação interna, processos, como-fazer, guias, runbooks, especificações técnicas ou de produto, políticas, onboarding, ou qualquer conteúdo que normalmente estaria em uma wiki. outline_query deve capturar os termos-chave da busca em 2–5 palavras.\n"
+	}
+
 	prompt := fmt.Sprintf(`Você é um roteador de contexto de um assistente de Slack.
 Decida quais fontes buscar para responder a pergunta.
-%s%s%s%s%s
+%s%s%s%s%s%s
 Retorne APENAS JSON válido:
 {
   "need_slack": true/false,
@@ -233,11 +257,11 @@ Retorne APENAS JSON válido:
 %s%s,
   "show_sql": true/false,
   "wants_all_rows": true/false,
-  "wants_csv_export": true/false
+  "wants_csv_export": true/false%s
 }
 
 Fontes disponíveis:
-%s- Slack: discussões, decisões, links de threads, contexto operacional, conversas sobre um tema.
+%s%s- Slack: discussões, decisões, links de threads, contexto operacional, conversas sobre um tema.
 - Metabase (banco de dados): qualquer consulta que necessite de dados estruturados do banco de dados operacional. Isso inclui TANTO agregações/métricas (contagens, totais, médias, KPIs, receita, "quantos") QUANTO listas de registros filtrados (ex: "quero todas as coletas", "me traz coletas do transportador X", "coletas sem rota", "MTRs emitidos na semana passada", "status planned"). Se a pergunta filtra, lista ou consulta entidades operacionais (coletas, MTRs, geradores, transportadores, rotas, pedidos, clientes), use need_metabase=true. NÃO use need_slack para buscar dados estruturados que vivem no banco de dados.
 
 Regras de roteamento:
@@ -247,7 +271,7 @@ Regras de roteamento:
 9. Perguntas de follow-up de dados (pronomes como "dessas", "desses", referindo a entidades já consultadas) → need_metabase=true com o mesmo database_id do turno anterior.
 10. wants_all_rows=true quando o usuário quer todos os dados sem limitação de linhas (ex: "todos", "tudo", "sem limite", "lista completa", "traz tudo", "quero todas", "sem limitar").
 11. wants_csv_export=true quando o usuário pede exportação explícita ("exportar", "csv", "planilha", "download", "baixar", "excel") OU quando pede todos os dados sem limitação (mesmos casos de wants_all_rows=true). Quando wants_csv_export=true, também defina wants_all_rows=true.
-%s
+%s%s
 Regras para slack_query (IMPORTANTE):
 - slack_query NUNCA pode ficar vazio quando need_slack=true — sempre gere uma query útil.
 - Se a pergunta mencionar canais (ex: #nome-do-canal), inclua in:#nome-do-canal na query.
@@ -272,7 +296,7 @@ Thread (contexto recente):
 
 Pergunta:
 %s
-`, projectsCtx, senderCtx, dateCtx, metabaseCtx, metabaseFollowUpCtx, jiraJQLBlock, metabaseJSON, jiraSourceLine, jiraRules, jiraIntentBlock, clip(threadHistory, 1200), question)
+`, projectsCtx, senderCtx, dateCtx, metabaseCtx, metabaseFollowUpCtx, outlineCtxStr, jiraJQLBlock, metabaseJSON, outlineJSONBlock, jiraSourceLine, outlineSourceLine, jiraRules, jiraIntentBlock, outlineRule, clip(threadHistory, 1200), question)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
 	// Use 4000 tokens: reasoning models (e.g., gpt-5-mini) consume invisible thinking
@@ -292,6 +316,7 @@ Pergunta:
 	d.SlackQuery = strings.TrimSpace(d.SlackQuery)
 	d.JiraIntent = strings.TrimSpace(d.JiraIntent)
 	d.JiraJQL = strings.TrimSpace(d.JiraJQL)
+	d.OutlineQuery = strings.TrimSpace(d.OutlineQuery)
 
 	// Disable Metabase if no databases were provided.
 	if len(metabaseDatabases) == 0 {
@@ -304,6 +329,12 @@ Pergunta:
 		d.NeedJira = false
 		d.JiraIntent = ""
 		d.JiraJQL = ""
+	}
+
+	// Enforce that Outline is never routed when not configured.
+	if !outlineEnabled {
+		d.NeedOutline = false
+		d.OutlineQuery = ""
 	}
 
 	// Normalize Slack query quirks.
