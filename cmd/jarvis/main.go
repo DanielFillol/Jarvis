@@ -11,6 +11,7 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
 	"github.com/DanielFillol/Jarvis/internal/metabase"
+	"github.com/DanielFillol/Jarvis/internal/outline"
 	"github.com/DanielFillol/Jarvis/internal/slack"
 )
 
@@ -26,6 +27,13 @@ func main() {
 	metabaseClient := metabase.NewClient(cfg)
 	fs := fileserver.New()
 
+	// Initialize optional Outline client (nil when not configured).
+	var outlineClient *outline.Client
+	if cfg.OutlineEnabled() {
+		outlineClient = outline.NewClient(cfg.OutlineBaseURL, cfg.OutlineAPIKey)
+		log.Printf("[BOOT] Outline enabled base_url=%q", cfg.OutlineBaseURL)
+	}
+
 	// Generate Jira project catalog asynchronously (enriches CatalogCompact from raw keys).
 	if cfg.JiraEnabled() {
 		go func() {
@@ -35,7 +43,7 @@ func main() {
 	}
 
 	// Construct core service
-	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs)
+	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs, outlineClient)
 
 	// Slack events endpoint
 	slackHandler := httpinternal.NewSlackHandler(slackClient, service)
