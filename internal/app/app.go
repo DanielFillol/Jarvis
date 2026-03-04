@@ -132,6 +132,12 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		return err
 	}
 
+	// 4b) Jira edit flows: transition, assign, update, set parent.
+	if handled, err := s.maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist); handled {
+		log.Printf("[JARVIS] jiraEditFlow handled dur=%s", time.Since(start))
+		return err
+	}
+
 	// 5) Post a "searching…" placeholder so the user knows Jarvis is working.
 	busyTs, busyErr := s.Slack.PostMessageAndGetTS(channel, threadTs, "_buscando..._")
 	if busyErr != nil {
@@ -265,27 +271,33 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// 8b) Outline wiki documentation search.
 	// Always runs when Outline is configured — it is a knowledge base and any
 	// question may benefit from internal documentation context.
-	// The router's OutlineQuery is used when available; otherwise the user's
-	// question is used directly as the search query.
+	// The router's OutlineQuery is used when available; otherwise a dedicated
+	// LLM call extracts clean 2–4 keywords from the question.  The raw user
+	// question is never sent directly to the wiki search API.
 	var outlineCtx string
 	var outlineSources string
 	if s.Outline != nil {
 		outlineQuery := strings.TrimSpace(decision.OutlineQuery)
 		if outlineQuery == "" {
-			outlineQuery = questionForLLM
+			outlineQuery = s.LLM.GenerateOutlineQuery(questionForLLM, s.Cfg.OpenAILesserModel)
+			if outlineQuery != "" {
+				log.Printf("[JARVIS] outlineQuery generated=%q", outlineQuery)
+			}
 		}
-		log.Printf("[JARVIS] outlineSearch query=%q (needOutline=%t)", outlineQuery, decision.NeedOutline)
-		results, err := s.Outline.SearchDocuments(outlineQuery, 5)
-		if err != nil {
-			log.Printf("[WARN] outline search failed: %v", err)
+		if outlineQuery == "" {
+			log.Printf("[JARVIS] outlineSearch skipped: could not generate query")
 		} else {
-			outlineCtx = outline.FormatContext(results, 8000)
-			outlineSources = outline.FormatSources(results)
-			log.Printf("[JARVIS] outlineContext docs=%d chars=%d", len(results), len(outlineCtx))
-			// Only warn the LLM when the router specifically identified this as
-			// a documentation question but nothing was found.
-			if outlineCtx == "" && decision.NeedOutline {
-				outlineCtx = "[AVISO: A busca no Outline não retornou documentos. Informe ao usuário que não foram encontrados docs relevantes para a consulta realizada.]"
+			log.Printf("[JARVIS] outlineSearch query=%q", outlineQuery)
+			results, err := s.Outline.SearchDocuments(outlineQuery, 5)
+			if err != nil {
+				log.Printf("[WARN] outline search failed: %v", err)
+			} else {
+				outlineCtx = outline.FormatContext(results, 8000)
+				outlineSources = outline.FormatSources(results)
+				log.Printf("[JARVIS] outlineContext docs=%d chars=%d", len(results), len(outlineCtx))
+				if outlineCtx == "" && decision.NeedOutline {
+					outlineCtx = "[AVISO: A busca no Outline não retornou documentos. Informe ao usuário que não foram encontrados docs relevantes para a consulta realizada.]"
+				}
 			}
 		}
 	}
