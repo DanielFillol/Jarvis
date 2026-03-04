@@ -46,6 +46,9 @@ type Config struct {
 	// JiraCreateEnabled allows the bot to create Jira issues on behalf of
 	// users.  Disabled by default.  Set via JIRA_CREATE_ENABLED=true.
 	JiraCreateEnabled bool
+	// JiraProjectsPath is the output path for the generated Jira project
+	// catalog Markdown file.  Defaults to "./docs/jira_projects.md".
+	JiraProjectsPath string
 
 	// ── Optional: Metabase ───────────────────────────────────────────────────
 	// Configure METABASE_BASE_URL + METABASE_API_KEY to enable Metabase
@@ -92,6 +95,7 @@ func Load() Config {
 	cfg.JiraCreateEnabled = strings.EqualFold(strings.TrimSpace(getEnv("JIRA_CREATE_ENABLED", "false")), "true")
 	cfg.JiraProjectKeys = parseProjectKeys(getEnv("JIRA_PROJECT_KEYS", ""))
 	cfg.JiraProjectNameMap = parseProjectNameMap(os.Getenv("JIRA_PROJECT_NAME_MAP"))
+	cfg.JiraProjectsPath = getEnv("JIRA_PROJECTS_PATH", "./docs/jira_projects.md")
 
 	cfg.MetabaseBaseURL = os.Getenv("METABASE_BASE_URL")
 	cfg.MetabaseAPIKey = os.Getenv("METABASE_API_KEY")
