@@ -26,6 +26,10 @@ type Client struct {
 	Token    string
 	Store    time.Duration
 	Projects []string
+	// CatalogCompact is a one-line summary of all configured projects
+	// (e.g. "INV=Faturamento [Bug, Task] | TPTDR=Transporte [Bug, Epic]").
+	// Pre-populated with raw keys at construction; overwritten by GenerateCatalog.
+	CatalogCompact string
 }
 
 // NewClient constructs a Jira client from the supplied configuration.  If
@@ -38,11 +42,12 @@ func NewClient(cfg config.Config) *Client {
 	parse.SetProjectNameMap(cfg.JiraProjectNameMap)
 
 	return &Client{
-		BaseURL:  strings.TrimRight(cfg.JiraBaseURL, "/"),
-		Email:    cfg.JiraEmail,
-		Token:    cfg.JiraAPIToken,
-		Store:    store.ttl,
-		Projects: cfg.JiraProjectKeys,
+		BaseURL:        strings.TrimRight(cfg.JiraBaseURL, "/"),
+		Email:          cfg.JiraEmail,
+		Token:          cfg.JiraAPIToken,
+		Store:          store.ttl,
+		Projects:       cfg.JiraProjectKeys,
+		CatalogCompact: strings.Join(cfg.JiraProjectKeys, ", "),
 	}
 }
 
