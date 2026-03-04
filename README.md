@@ -6,13 +6,13 @@ Jarvis é um bot em Go que conecta **Slack + Jira + Metabase + LLM** para transf
 
 ## O que é o Jarvis
 
-Jarvis é um copiloto operacional para times de produto e engenharia dentro do Slack. Ele responde perguntas em linguagem natural consultando o Jira, o histórico do Slack e os bancos de dados via Metabase em tempo real, cria cards no Jira direto pelo chat, lê e analisa arquivos anexados (PDFs, planilhas, documentos e imagens via API de visão) e mantém todas as respostas em thread para não poluir os canais.
+Jarvis é um copiloto operacional para times de produto e engenharia dentro do Slack. Ele responde perguntas em linguagem natural consultando o Jira, o histórico do Slack, os bancos de dados via Metabase e a wiki do Outline em tempo real, cria cards no Jira direto pelo chat, lê e analisa arquivos anexados (PDFs, planilhas, documentos e imagens via API de visão) e mantém todas as respostas em thread para não poluir os canais.
 
 ---
 
 ## ✨ Funcionalidades
 
-- Responde perguntas sempre em **thread**, usando contexto do Slack + Jira + Metabase + LLM
+- Responde perguntas sempre em **thread**, usando contexto do Slack + Jira + Metabase + Outline + LLM
 - **Consultas analíticas ao banco de dados** via Metabase: gera SQL automaticamente e retorna os dados formatados
 - **Exportação de resultados como CSV**: quando o usuário pede um export, o bot gera o arquivo e posta um link de download com validade de 1 hora
 - Busca de mensagens no Slack com filtros avançados (`from:`, `in:`, `after:`, `before:`)
@@ -22,6 +22,7 @@ Jarvis é um copiloto operacional para times de produto e engenharia dentro do S
 - Criação de cards Jira via linguagem natural (simples, múltiplos, baseado em thread)
 - **Catálogo de projetos Jira**: ao iniciar, o bot documenta automaticamente todos os projetos configurados (nome, tipos de issue disponíveis) e usa esse catálogo para resolver referências em linguagem natural
 - **Apresentação dinâmica**: ao perguntar "o que você faz?", o bot gera uma introdução personalizada com os projetos, canais e capacidades reais do ambiente
+- **Busca na wiki do Outline**: consulta documentação interna, processos, guias e runbooks para enriquecer respostas
 - Suporte a **modelo primário + modelo leve** com retry automático para erros transientes
 - **Cascata de exclusão**: exclui a resposta do bot quando o usuário apaga a mensagem original
 - Funciona via **menção direta** (`@Jarvis`) ou **DMs** sem necessidade de prefixo
@@ -38,11 +39,11 @@ HTTP Handler (verifica assinatura HMAC-SHA256)
       ↓
 Jarvis Service
       ↓ (roteamento via LLM)
- ┌──────────────┬──────────────┬──────────────┬──────────────┐
- │ Slack Search │ Jira Client  │ Metabase     │ File Parser  │
- │ (mensagens)  │ (JQL/issues) │ (SQL + dados)│ PDF/DOCX/    │
- │              │              │              │ XLSX/imagens │
- └──────────────┴──────────────┴──────────────┴──────────────┘
+ ┌──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
+ │ Slack Search │ Jira Client  │ Metabase     │ Outline Wiki │ File Parser  │
+ │ (mensagens)  │ (JQL/issues) │ (SQL + dados)│ (docs/guias) │ PDF/DOCX/    │
+ │              │              │              │              │ XLSX/imagens │
+ └──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘
       ↓
      LLM (primary + fallback)
       ↓
@@ -79,6 +80,8 @@ Crie um `.env` baseado no `Example.env`:
 | `METABASE_ENV` | Label de ambiente escrito no cabeçalho do schema | `production` |
 | `METABASE_QUERY_TIMEOUT` | Timeout para execução de queries SQL (ex: `5m`, `120s`) | `5m` |
 | `PUBLIC_BASE_URL` | URL pública do servidor (ex: URL do ngrok) para links de download de CSV | — |
+| `OUTLINE_BASE_URL` | URL raiz da API do Outline (ex: `https://app.getoutline.com/api` para cloud; `https://wiki.yourcompany.com/api` para self-hosted) | — |
+| `OUTLINE_API_KEY` | Personal access token do Outline (Settings → API → Create token) | — |
 
 ### Resolução de projetos em linguagem natural
 
@@ -169,6 +172,39 @@ O arquivo `./docs/metabase_schema.md` é regenerado a cada restart e tem o forma
 | `user_id` | Integer | FK | FK | — | — |
 | `total` | Decimal | — | — | — | Valor total do pedido |
 ```
+
+---
+
+## 📖 Integração com Outline
+
+O Jarvis pode consultar a wiki do **Outline** para responder perguntas sobre documentação interna, processos, guias e runbooks.
+
+### Como funciona
+
+Quando o roteador LLM identifica que a resposta requer documentação interna (`need_outline=true`), o bot:
+
+1. Gera uma query de busca com os termos-chave da pergunta
+2. Consulta `POST /api/documents.search` no Outline (apenas documentos publicados)
+3. Inclui os documentos mais relevantes (até 5) como contexto para a resposta final
+
+### Exemplos de uso
+
+```
+como funciona o processo de onboarding?
+qual é a política de aprovação de pull requests?
+me explica o runbook de deploy em produção
+quais são as convenções de nomenclatura de branches?
+como configurar o ambiente de desenvolvimento?
+qual é o processo de criação de um novo cliente?
+```
+
+### Configuração
+
+1. Acesse **Outline → Settings → API**
+2. Clique em **Create token** e nomeie (ex: `jarvis-bot`)
+3. Configure `OUTLINE_BASE_URL` e `OUTLINE_API_KEY` no `.env`
+
+O Outline é opcional — quando não configurado, o bot informa ao usuário quando há perguntas sobre documentação interna.
 
 ---
 
@@ -309,6 +345,16 @@ qual o ticket médio por categoria de produto?
 exportar todos os registros do mês como csv
 quero a lista completa sem limitação de linhas
 baixar planilha com os resultados
+```
+
+### Busca na wiki (Outline)
+
+```
+como funciona o processo de onboarding?
+qual é a política de deploy em produção?
+me explica o runbook de rollback
+quais são as convenções de branches do repositório?
+como configurar o ambiente local de desenvolvimento?
 ```
 
 ### Análise de arquivos
