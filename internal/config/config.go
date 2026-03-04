@@ -70,6 +70,16 @@ type Config struct {
 	// PublicBaseURL is the externally reachable base URL (e.g. ngrok URL).
 	// Used to construct download links for CSV exports. Set via PUBLIC_BASE_URL.
 	PublicBaseURL string
+
+	// ── Optional: Outline ────────────────────────────────────────────────────
+	// Configure OUTLINE_BASE_URL + OUTLINE_API_KEY to enable Outline wiki
+	// integration (documentation search, process docs, how-to guides).
+	// OUTLINE_BASE_URL is the API root:
+	//   - Cloud:       https://app.getoutline.com/api
+	//   - Self-hosted: https://wiki.yourcompany.com/api
+	// OUTLINE_API_KEY is a personal access token from Outline → Settings → API.
+	OutlineBaseURL string
+	OutlineAPIKey  string
 }
 
 // Load reads configuration from environment variables.  A .env file in the
@@ -108,6 +118,9 @@ func Load() Config {
 	}
 
 	cfg.PublicBaseURL = strings.TrimRight(getEnv("PUBLIC_BASE_URL", ""), "/")
+
+	cfg.OutlineBaseURL = strings.TrimRight(getEnv("OUTLINE_BASE_URL", ""), "/")
+	cfg.OutlineAPIKey = os.Getenv("OUTLINE_API_KEY")
 
 	pages := getEnv("SLACK_SEARCH_MAX_PAGES", "10")
 	if n, err := strconv.Atoi(pages); err == nil {
@@ -170,4 +183,9 @@ func (c Config) JiraEnabled() bool {
 // MetabaseEnabled reports whether Metabase credentials have been provided.
 func (c Config) MetabaseEnabled() bool {
 	return strings.TrimSpace(c.MetabaseBaseURL) != ""
+}
+
+// OutlineEnabled reports whether Outline credentials have been provided.
+func (c Config) OutlineEnabled() bool {
+	return strings.TrimSpace(c.OutlineBaseURL) != "" && strings.TrimSpace(c.OutlineAPIKey) != ""
 }
