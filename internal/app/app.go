@@ -12,6 +12,7 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
 	"github.com/DanielFillol/Jarvis/internal/metabase"
+	"github.com/DanielFillol/Jarvis/internal/outline"
 	"github.com/DanielFillol/Jarvis/internal/parse"
 	"github.com/DanielFillol/Jarvis/internal/slack"
 	"github.com/DanielFillol/Jarvis/internal/state"
@@ -43,12 +44,14 @@ type Service struct {
 
 	Store      state.Store
 	FileServer *fileserver.FileServer
+	Outline    *outline.Client
 }
 
 // NewService constructs a new Jarvis service from its dependencies.
 // metabaseClient may be nil when Metabase integration is not configured.
 // fs may be nil when CSV export is not needed.
-func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, metabaseClient *metabase.Client, fs *fileserver.FileServer) *Service {
+// outlineClient may be nil when Outline integration is not configured.
+func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, metabaseClient *metabase.Client, fs *fileserver.FileServer, outlineClient *outline.Client) *Service {
 	return &Service{
 		Slack:      slackClient,
 		Jira:       jiraClient,
@@ -57,6 +60,7 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 		Cfg:        cfg,
 		FileServer: fs,
 		Store:      *state.NewStore(2 * time.Hour),
+		Outline:    outlineClient,
 	}
 }
 
@@ -154,6 +158,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		questionForLLM, threadHist, s.Cfg.OpenAILesserModel,
 		s.Cfg.JiraEnabled(), s.Jira.CatalogCompact, senderUserID,
 		s.formattedMetabaseDatabases(), storedDBID,
+		s.Cfg.OutlineEnabled(),
 	)
 	if err != nil {
 		log.Printf("[WARN] decideRetrieval failed: %v", err)
@@ -169,11 +174,12 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		decision.NeedSlack = false
 		decision.SlackQuery = ""
 	}
-	log.Printf("[JARVIS] needSlack=%t slackQuery=%q needJira=%t jiraJQL=%q needMetabase=%t dbID=%d showSQL=%t wantsAllRows=%t wantsCSV=%t",
+	log.Printf("[JARVIS] needSlack=%t slackQuery=%q needJira=%t jiraJQL=%q needMetabase=%t dbID=%d showSQL=%t wantsAllRows=%t wantsCSV=%t needOutline=%t outlineQuery=%q",
 		decision.NeedSlack, preview(decision.SlackQuery, 120),
 		decision.NeedJira, preview(decision.JiraJQL, 120),
 		decision.NeedMetabase, decision.MetabaseDatabaseID,
-		decision.ShowSQL, decision.WantsAllRows, decision.WantsCSVExport)
+		decision.ShowSQL, decision.WantsAllRows, decision.WantsCSVExport,
+		decision.NeedOutline, preview(decision.OutlineQuery, 80))
 
 	// 7) Slack context retrieval.
 	var slackCtx string
@@ -253,6 +259,34 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			jiraIssuesFound = len(issues)
 			jiraCtx = buildJiraContext(issues, 40)
 			log.Printf("[JARVIS] jiraContext issues=%d chars=%d", jiraIssuesFound, len(jiraCtx))
+		}
+	}
+
+	// 8b) Outline wiki documentation search.
+	// Always runs when Outline is configured — it is a knowledge base and any
+	// question may benefit from internal documentation context.
+	// The router's OutlineQuery is used when available; otherwise the user's
+	// question is used directly as the search query.
+	var outlineCtx string
+	var outlineSources string
+	if s.Outline != nil {
+		outlineQuery := strings.TrimSpace(decision.OutlineQuery)
+		if outlineQuery == "" {
+			outlineQuery = questionForLLM
+		}
+		log.Printf("[JARVIS] outlineSearch query=%q (needOutline=%t)", outlineQuery, decision.NeedOutline)
+		results, err := s.Outline.SearchDocuments(outlineQuery, 5)
+		if err != nil {
+			log.Printf("[WARN] outline search failed: %v", err)
+		} else {
+			outlineCtx = outline.FormatContext(results, 8000)
+			outlineSources = outline.FormatSources(results)
+			log.Printf("[JARVIS] outlineContext docs=%d chars=%d", len(results), len(outlineCtx))
+			// Only warn the LLM when the router specifically identified this as
+			// a documentation question but nothing was found.
+			if outlineCtx == "" && decision.NeedOutline {
+				outlineCtx = "[AVISO: A busca no Outline não retornou documentos. Informe ao usuário que não foram encontrados docs relevantes para a consulta realizada.]"
+			}
 		}
 	}
 
@@ -408,7 +442,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 
 	// 11) Generate the answer with the primary LLM (with retry and fallback).
 	answer, err := s.LLM.AnswerWithRetry(
-		questionForLLM, threadHist, slackCtx, jiraCtx, dbCtx, fileCtx, images,
+		questionForLLM, threadHist, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images,
 		s.Cfg.OpenAIModel, s.Cfg.OpenAILesserModel, 2, 0,
 	)
 	if err != nil || strings.TrimSpace(answer) == "" {
@@ -423,6 +457,11 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// Append CSV download link when a file was generated.
 	if csvDownloadLine != "" {
 		answer += csvDownloadLine
+	}
+
+	// Append Outline source links when documentation was used.
+	if outlineSources != "" {
+		answer += "\n\n" + outlineSources
 	}
 
 	// Append full data table when bypassing LLM for large result formatting.
