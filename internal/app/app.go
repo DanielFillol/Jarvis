@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/DanielFillol/Jarvis/internal/config"
+	"github.com/DanielFillol/Jarvis/internal/fileserver"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
 	"github.com/DanielFillol/Jarvis/internal/metabase"
@@ -40,18 +41,21 @@ type Service struct {
 	// long answers awaiting user confirmation before being posted to the thread.
 	pendingReplies sync.Map
 
-	Store state.Store
+	Store      state.Store
+	FileServer *fileserver.FileServer
 }
 
 // NewService constructs a new Jarvis service from its dependencies.
 // metabaseClient may be nil when Metabase integration is not configured.
-func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, metabaseClient *metabase.Client) *Service {
+// fs may be nil when CSV export is not needed.
+func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, metabaseClient *metabase.Client, fs *fileserver.FileServer) *Service {
 	return &Service{
-		Slack:    slackClient,
-		Jira:     jiraClient,
-		LLM:      llmClient,
-		Metabase: metabaseClient,
-		Cfg:      cfg,
+		Slack:      slackClient,
+		Jira:       jiraClient,
+		LLM:        llmClient,
+		Metabase:   metabaseClient,
+		Cfg:        cfg,
+		FileServer: fs,
 	}
 }
 
@@ -164,11 +168,11 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		decision.NeedSlack = false
 		decision.SlackQuery = ""
 	}
-	log.Printf("[JARVIS] needSlack=%t slackQuery=%q needJira=%t jiraJQL=%q needMetabase=%t dbID=%d showSQL=%t wantsAllRows=%t",
+	log.Printf("[JARVIS] needSlack=%t slackQuery=%q needJira=%t jiraJQL=%q needMetabase=%t dbID=%d showSQL=%t wantsAllRows=%t wantsCSV=%t",
 		decision.NeedSlack, preview(decision.SlackQuery, 120),
 		decision.NeedJira, preview(decision.JiraJQL, 120),
 		decision.NeedMetabase, decision.MetabaseDatabaseID,
-		decision.ShowSQL, decision.WantsAllRows)
+		decision.ShowSQL, decision.WantsAllRows, decision.WantsCSVExport)
 
 	// 7) Slack context retrieval.
 	var slackCtx string
@@ -314,11 +318,40 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		log.Printf("[JARVIS] imageAttachments count=%d", len(images))
 	}
 
-	// 10b) For large result sets where the user wants all rows, skip LLM data
-	// formatting: ask LLM for one intro sentence only, then append the full table.
+	// 10b) CSV export or large result set.
 	const largeResultThreshold = 30
 	var appendDataTable string
-	if dbQueryResult != nil && len(dbQueryResult.Data.Rows) > largeResultThreshold && decision.WantsAllRows {
+	var csvDownloadLine string
+
+	if dbQueryResult != nil && decision.WantsCSVExport && s.FileServer != nil && strings.TrimSpace(s.Cfg.PublicBaseURL) != "" {
+		// Generate CSV for download; give LLM only a sample for the intro sentence.
+		nRows := len(dbQueryResult.Data.Rows)
+		cols := make([]string, len(dbQueryResult.Data.Cols))
+		for i, c := range dbQueryResult.Data.Cols {
+			if c.DisplayName != "" {
+				cols[i] = c.DisplayName
+			} else {
+				cols[i] = c.Name
+			}
+		}
+		csvBytes := []byte(metabase.FormatQueryResultAsCSV(*dbQueryResult))
+		if len(csvBytes) > 0 {
+			fileID := s.FileServer.Store("resultado.csv", csvBytes, time.Hour)
+			csvURL := s.Cfg.PublicBaseURL + "/files/" + fileID
+			csvDownloadLine = fmt.Sprintf("\n\n:page_facing_up: *Download CSV:* <%s|resultado.csv> _(expira em 1 hora)_", csvURL)
+			log.Printf("[JARVIS] CSV generated rows=%d id=%s", nRows, fileID)
+		}
+		sample := metabase.FormatQueryResult(*dbQueryResult, 3)
+		dbCtx = fmt.Sprintf(
+			"Query SQL retornou %d registros com os campos: %s.\n\n"+
+				"INSTRUÇÃO INTERNA: Escreva APENAS 1 frase curta de introdução descrevendo o resultado "+
+				"(ex: \"Encontrei %d registros...\"). Não exiba a tabela de dados. Finalize a resposta aí.\n\n"+
+				"Amostra (3 de %d registros):\n%s",
+			nRows, strings.Join(cols, ", "), nRows, nRows, sample,
+		)
+		log.Printf("[JARVIS] CSV export: rows=%d", nRows)
+	} else if dbQueryResult != nil && len(dbQueryResult.Data.Rows) > largeResultThreshold && decision.WantsAllRows {
+		// Large result inline display (no CSV requested).
 		nRows := len(dbQueryResult.Data.Rows)
 		cols := make([]string, len(dbQueryResult.Data.Cols))
 		for i, c := range dbQueryResult.Data.Cols {
@@ -352,6 +385,11 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	answer = strings.TrimSpace(answer)
 	if answer == "" {
 		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, decision.NeedJira, jiraIssuesFound, "")
+	}
+
+	// Append CSV download link when a file was generated.
+	if csvDownloadLine != "" {
+		answer += csvDownloadLine
 	}
 
 	// Append full data table when bypassing LLM for large result formatting.

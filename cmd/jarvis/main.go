@@ -6,6 +6,7 @@ import (
 
 	"github.com/DanielFillol/Jarvis/internal/app"
 	"github.com/DanielFillol/Jarvis/internal/config"
+	"github.com/DanielFillol/Jarvis/internal/fileserver"
 	httpinternal "github.com/DanielFillol/Jarvis/internal/http"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
@@ -23,15 +24,17 @@ func main() {
 	jiraClient := jira.NewClient(cfg)
 	llmClient := llm.NewClient(cfg)
 	metabaseClient := metabase.NewClient(cfg)
+	fs := fileserver.New()
 
 	// Construct core service
-	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient)
+	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs)
 
 	// Slack events endpoint
 	slackHandler := httpinternal.NewSlackHandler(slackClient, service)
 
 	mux := http.NewServeMux()
 	mux.Handle("/slack/events", slackHandler)
+	mux.Handle("/files/", fs)
 
 	// Start HTTP server
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {

@@ -129,6 +129,11 @@ type RetrievalDecision struct {
 	// WantsAllRows is true when the user wants the full result set without any
 	// row limit (e.g. "todos", "tudo", "sem limite", "lista completa").
 	WantsAllRows bool `json:"wants_all_rows"`
+	// WantsCSVExport is true when the user explicitly requests a CSV/spreadsheet
+	// download OR when the query is expected to return a large dataset (e.g. "todos",
+	// "traz tudo", "exportar", "planilha", "csv", "baixar").
+	// When true, wants_all_rows is also expected to be true.
+	WantsCSVExport bool `json:"wants_csv_export"`
 }
 
 // DecideRetrieval consults the language model to determine which contexts
@@ -234,7 +239,8 @@ Retorne APENAS JSON válido:
   "slack_query": "...",
 %s%s,
   "show_sql": true/false,
-  "wants_all_rows": true/false
+  "wants_all_rows": true/false,
+  "wants_csv_export": true/false
 }
 
 Fontes disponíveis:
@@ -247,6 +253,7 @@ Regras de roteamento:
 8. show_sql=true SOMENTE quando o usuário pede EXPLICITAMENTE para ver o SQL/query/código que o bot usou — palavras como "SQL", "query", "consulta que você rodou", "me mostra o código", "qual foi a query". Pedidos de dados ("me traga", "quero ver", "lista de", "quantas", "quais coletas") → show_sql=false, need_metabase=true. Quando show_sql=true, também defina need_metabase=true com o metabase_database_id da linha "Query executada (db=N):" do histórico (ou 0 se não houver), need_slack=false, need_jira=false.
 9. Perguntas de follow-up de dados (pronomes como "dessas", "desses", referindo a entidades já consultadas) → need_metabase=true com o mesmo database_id do turno anterior.
 10. wants_all_rows=true quando o usuário quer todos os dados sem limitação de linhas (ex: "todos", "tudo", "sem limite", "lista completa", "traz tudo", "quero todas", "sem limitar").
+11. wants_csv_export=true quando o usuário pede exportação explícita ("exportar", "csv", "planilha", "download", "baixar", "excel") OU quando pede todos os dados sem limitação (mesmos casos de wants_all_rows=true). Quando wants_csv_export=true, também defina wants_all_rows=true.
 %s
 Regras para slack_query (IMPORTANTE):
 - slack_query NUNCA pode ficar vazio quando need_slack=true — sempre gere uma query útil.

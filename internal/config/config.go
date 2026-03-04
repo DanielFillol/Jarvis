@@ -63,6 +63,10 @@ type Config struct {
 	// Analytical databases can be slow; tune this as needed.
 	// Defaults to 5 minutes.  Set via METABASE_QUERY_TIMEOUT=300s.
 	MetabaseQueryTimeout time.Duration
+
+	// PublicBaseURL is the externally reachable base URL (e.g. ngrok URL).
+	// Used to construct download links for CSV exports. Set via PUBLIC_BASE_URL.
+	PublicBaseURL string
 }
 
 // Load reads configuration from environment variables.  A .env file in the
@@ -98,6 +102,8 @@ func Load() Config {
 	} else {
 		cfg.MetabaseQueryTimeout = 5 * time.Minute
 	}
+
+	cfg.PublicBaseURL = strings.TrimRight(getEnv("PUBLIC_BASE_URL", ""), "/")
 
 	pages := getEnv("SLACK_SEARCH_MAX_PAGES", "10")
 	if n, err := strconv.Atoi(pages); err == nil {

@@ -1,6 +1,7 @@
 package metabase
 
 import (
+	"encoding/csv"
 	"fmt"
 	"log"
 	"sort"
@@ -292,5 +293,36 @@ func FormatQueryResult(r QueryResult, maxRows int) string {
 	} else {
 		sb.WriteString(fmt.Sprintf("\n_%d linha(s)_\n", total))
 	}
+	return sb.String()
+}
+
+// FormatQueryResultAsCSV converts a QueryResult into RFC 4180 CSV (UTF-8, BOM-prefixed
+// for Excel compatibility). Returns an empty string on error or empty result.
+func FormatQueryResultAsCSV(r QueryResult) string {
+	if r.Error != "" || len(r.Data.Cols) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\xef\xbb\xbf") // UTF-8 BOM for Excel
+	w := csv.NewWriter(&sb)
+	headers := make([]string, len(r.Data.Cols))
+	for i, col := range r.Data.Cols {
+		h := col.DisplayName
+		if h == "" {
+			h = col.Name
+		}
+		headers[i] = h
+	}
+	_ = w.Write(headers)
+	for _, row := range r.Data.Rows {
+		cells := make([]string, len(r.Data.Cols))
+		for i := range r.Data.Cols {
+			if i < len(row) && row[i] != nil {
+				cells[i] = fmt.Sprintf("%v", row[i])
+			}
+		}
+		_ = w.Write(cells)
+	}
+	w.Flush()
 	return sb.String()
 }
