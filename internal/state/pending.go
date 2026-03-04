@@ -33,6 +33,12 @@ type Store struct {
 	ttl      time.Duration
 }
 
+// NewStore creates a Store with the given TTL for pending issue expiry.
+// Pass 0 to disable TTL-based expiry.
+func NewStore(ttl time.Duration) *Store {
+	return &Store{byThread: make(map[string]*PendingIssue), ttl: ttl}
+}
+
 func (s *Store) key(channel, threadTs string) string {
 	return channel + ":" + threadTs
 }
