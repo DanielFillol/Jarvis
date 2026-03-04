@@ -139,20 +139,13 @@ type RetrievalDecision struct {
 // DecideRetrieval consults the language model to determine which contexts
 // (Slack, Jira, Metabase) should be retrieved for a given question.
 //
-// jiraEnabled must be true when Jira credentials are configured; when false,
-// the Jira routing section is omitted from the prompt entirely.
-// metabaseDatabases is a list of available databases formatted as
-// "ID: Name (engine)".  Pass an empty slice to disable Metabase routing.
-// DecideRetrieval consults the language model to determine which contexts
-// (Slack, Jira, Metabase) should be retrieved for a given question.
-//
+// jiraCatalog is the compact project catalog generated at startup
+// (e.g. "INV=Faturamento [Bug, Task] | TPTDR=Transporte [Bug, Epic]").
 // storedDBID is the Metabase database ID used in a previous turn of this thread.
-// When > 0, the LLM is informed so it can route follow-up queries correctly
-// without requiring hardcoded keyword matching.
-func (c *Client) DecideRetrieval(question, threadHistory, model string, jiraEnabled bool, projectKeys []string, senderUserID string, metabaseDatabases []string, storedDBID int) (RetrievalDecision, error) {
+func (c *Client) DecideRetrieval(question, threadHistory, model string, jiraEnabled bool, jiraCatalog string, senderUserID string, metabaseDatabases []string, storedDBID int) (RetrievalDecision, error) {
 	projectsCtx := ""
-	if jiraEnabled && len(projectKeys) > 0 {
-		projectsCtx = fmt.Sprintf("\nProjetos Jira configurados: %s\n", strings.Join(projectKeys, ", "))
+	if jiraEnabled && strings.TrimSpace(jiraCatalog) != "" {
+		projectsCtx = fmt.Sprintf("\nProjetos Jira disponíveis (formato CHAVE=Nome [tipos de issue]):\n%s\n", jiraCatalog)
 	}
 	senderCtx := ""
 	if strings.TrimSpace(senderUserID) != "" {
