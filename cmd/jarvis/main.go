@@ -26,6 +26,14 @@ func main() {
 	metabaseClient := metabase.NewClient(cfg)
 	fs := fileserver.New()
 
+	// Generate Jira project catalog asynchronously (enriches CatalogCompact from raw keys).
+	if cfg.JiraEnabled() {
+		go func() {
+			catalog := jiraClient.GenerateCatalog(cfg.JiraProjectsPath)
+			jiraClient.CatalogCompact = catalog
+		}()
+	}
+
 	// Construct core service
 	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs)
 
