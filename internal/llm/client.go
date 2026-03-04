@@ -244,7 +244,7 @@ Regras para jira_jql:
 		outlineJSONBlock = `,
   "need_outline": true/false,
   "outline_query": "..."`
-		outlineRule = "12. need_outline=true quando a pergunta busca documentação interna, processos, como-fazer, guias, runbooks, especificações técnicas ou de produto, políticas, onboarding, ou qualquer conteúdo que normalmente estaria em uma wiki. outline_query deve capturar os termos-chave da busca em 2–5 palavras.\n"
+		outlineRule = "12. Quando Outline está configurado, SEMPRE preencha outline_query com os 2–4 termos-chave mais relevantes da pergunta (sem artigos, preposições ou saudações — apenas as palavras que melhor descrevem o assunto para busca na wiki). outline_query NUNCA pode ficar vazio. Defina need_outline=true apenas quando a resposta depende principalmente de documentação interna (processos, guias, runbooks, especificações, políticas, onboarding, benefícios, RH).\n"
 	}
 
 	prompt := fmt.Sprintf(`Você é um roteador de contexto de um assistente de Slack.
@@ -341,6 +341,39 @@ Pergunta:
 	d.SlackQuery = normalizeSlackQuery(d.SlackQuery)
 
 	return d, nil
+}
+
+// GenerateOutlineQuery uses the LLM to produce a concise, effective search
+// query (2–4 keywords) for the Outline wiki from the user's question.
+// It extracts the core subject, stripping greetings, articles, prepositions,
+// and conversational filler.  Returns an empty string on error.
+func (c *Client) GenerateOutlineQuery(question, model string) string {
+	if strings.TrimSpace(model) == "" {
+		model = "gpt-4o-mini"
+	}
+	prompt := fmt.Sprintf(`Gere uma query de busca para uma wiki interna com 2 a 4 termos-chave em português.
+
+RETORNE APENAS os termos, sem pontuação, sem aspas, sem explicações.
+
+Regras:
+- Extraia apenas substantivos e adjetivos centrais do assunto.
+- Omita saudações, artigos, preposições, verbos auxiliares e pronomes.
+- Exemplos:
+  "quanto eu ganho de vale alimentação por mês?" → "vale alimentação benefício"
+  "como funciona o processo de deploy em produção?" → "deploy produção processo"
+  "quais são as políticas de férias da empresa?" → "férias políticas empresa"
+  "quanto eu ganho de flash por mes?" → "benefícios flash"
+  "cria uma tarefa no transportador com base nessa thread" → "transportador tarefa fluxo"
+  "me explica o onboarding de novos engenheiros" → "onboarding engenheiros"
+
+Pergunta: %s`, question)
+
+	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}
+	out, err := c.Chat(msgs, model, 0, 50)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
 }
 
 // GenerateSQL uses the LLM to produce a native SQL query for the given question.
