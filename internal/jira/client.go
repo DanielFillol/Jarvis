@@ -30,6 +30,10 @@ type Client struct {
 	// (e.g. "INV=Faturamento [Bug, Task] | TPTDR=Transporte [Bug, Epic]").
 	// Pre-populated with raw keys at construction; overwritten by GenerateCatalog.
 	CatalogCompact string
+	// WorkflowStatuses maps project key → deduplicated list of all statuses
+	// in that project's workflow.  Populated by GenerateCatalog.
+	// Used to bound the number of transition steps when chaining statuses.
+	WorkflowStatuses map[string][]string
 }
 
 // NewClient constructs a Jira client from the supplied configuration.  If
