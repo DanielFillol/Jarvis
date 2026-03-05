@@ -3,60 +3,183 @@ package app
 import (
 	"fmt"
 	"log"
+	"os"
 	"strings"
 )
 
-// introOptions carries the feature-gate flags used to tailor the intro message
-// to the current deployment configuration.
+// introOptions carries the feature-gate flags used to tailor the intro message.
 type introOptions struct {
 	jiraEnabled        bool
 	jiraCreateEnabled  bool
 	jiraProjectKeys    []string
+	jiraKeyToName      map[string]string
 	metabaseEnabled    bool
-	csvEnabled         bool // requires PUBLIC_BASE_URL
+	csvEnabled         bool
 	outlineEnabled     bool
-	slackSearchEnabled bool // requires SLACK_USER_TOKEN
+	slackSearchEnabled bool
 }
 
-// handleIntroRequest posts a static capabilities presentation to the thread.
-func (s *Service) handleIntroRequest(channel, threadTs, originTs string) error {
-	busyTs, busyErr := s.Slack.PostMessageAndGetTS(channel, threadTs, "_preparando apresentação..._")
-	if busyErr != nil {
-		log.Printf("[JARVIS] intro: could not post busy indicator: %v", busyErr)
+// isIntroRequest returns true when the message is asking the bot to introduce
+// itself or list its capabilities.  Uses keyword matching — no LLM call.
+func isIntroRequest(question string) bool {
+	q := strings.ToLower(question)
+	q = strings.NewReplacer("?", "", "!", "", ".", "", "-", " ", "_", " ").Replace(q)
+	triggers := []string{
+		"se apresente", "apresente se", "apresenta se", "apresenta te",
+		"se apresenta", "quem é você", "quem e voce", "quem é voce",
+		"o que você faz", "o que voce faz", "o que você pode fazer", "o que voce pode fazer",
+		"o que sabe fazer", "o que consegue fazer",
+		"quais são suas funcionalidades", "quais sao suas funcionalidades",
+		"quais são suas capacidades", "quais sao suas capacidades",
+		"quais são suas habilidades", "quais sao suas habilidades",
+		"me apresente", "me dê uma apresentação", "me de uma apresentacao",
+		"suas funções", "suas funcoes", "suas opções", "suas opcoes",
+		"como pode me ajudar", "como você pode me ajudar", "como voce pode me ajudar",
+		"o que é o jarvis", "o que e o jarvis",
+		"me mostra o que faz", "me mostra o que você faz",
 	}
-
-	replyFn := func(text string) error {
-		if busyTs != "" {
-			if err := s.Slack.UpdateMessage(channel, busyTs, text); err != nil {
-				return s.Slack.PostMessage(channel, threadTs, text)
-			}
-			return nil
+	for _, t := range triggers {
+		if strings.Contains(q, t) {
+			return true
 		}
-		return s.Slack.PostMessage(channel, threadTs, text)
+	}
+	return false
+}
+
+// handleIntroRequest generates and posts a capabilities presentation.
+// The LLM writes the message using real context from the configured integrations
+// (docs/jira_projects.md, docs/metabase_schema_compact.md, etc.).
+// Falls back to a static message if the LLM call fails.
+func (s *Service) handleIntroRequest(channel, threadTs, originTs string) error {
+	// Invert JiraProjectNameMap ("transportador" → "TPTDR") to ("TPTDR" → "Transportador").
+	keyToName := make(map[string]string)
+	for name, key := range s.Cfg.JiraProjectNameMap {
+		display := strings.Title(strings.ToLower(name)) //nolint:staticcheck
+		keyToName[strings.ToUpper(key)] = display
 	}
 
 	opts := introOptions{
 		jiraEnabled:        s.Cfg.JiraEnabled(),
 		jiraCreateEnabled:  s.Cfg.JiraCreateEnabled,
 		jiraProjectKeys:    s.Cfg.JiraProjectKeys,
+		jiraKeyToName:      keyToName,
 		metabaseEnabled:    s.Cfg.MetabaseEnabled(),
 		csvEnabled:         strings.TrimSpace(s.Cfg.PublicBaseURL) != "",
 		outlineEnabled:     s.Cfg.OutlineEnabled(),
 		slackSearchEnabled: strings.TrimSpace(s.Cfg.SlackUserToken) != "",
 	}
-	answer := buildIntroMessage(s.Cfg.BotName, opts)
 
-	if err := replyFn(answer); err != nil {
+	// Build feature description for the LLM prompt.
+	featuresDesc := buildFeaturesDesc(opts)
+
+	// Collect context from generated docs — the LLM uses these to write
+	// realistic examples with real project and table names.
+	docsContext := buildDocsContext(s.Cfg.JiraProjectsPath, s.Cfg.MetabaseSchemaPath)
+
+	// Generate with LLM; static message is the fallback.
+	fallback := buildIntroMessage(s.Cfg.BotName, opts)
+	answer := s.LLM.GenerateIntroMessage(s.Cfg.BotName, featuresDesc, docsContext, s.Cfg.OpenAIModel, fallback)
+
+	msgTs, err := s.Slack.PostMessageAndGetTS(channel, threadTs, answer)
+	if err != nil {
+		log.Printf("[JARVIS] intro: PostMessage failed: %v", err)
 		return err
 	}
-	if busyTs != "" {
-		s.Slack.Tracker.Track(channel, originTs, busyTs)
+	if msgTs != "" {
+		s.Slack.Tracker.Track(channel, originTs, msgTs)
 	}
 	return nil
 }
 
-// buildIntroMessage returns a Slack mrkdwn-formatted presentation of all
-// capabilities, adapted to the active feature flags.
+// buildFeaturesDesc returns a human-readable bullet list of active features
+// for inclusion in the LLM prompt.
+func buildFeaturesDesc(opts introOptions) string {
+	var lines []string
+
+	if opts.jiraEnabled {
+		proj := projectList(opts.jiraProjectKeys, opts.jiraKeyToName)
+		lines = append(lines, fmt.Sprintf("- Consultas no Jira: busca de cards, sprints, status, responsáveis (projetos configurados: %s)", proj))
+	}
+	if opts.jiraCreateEnabled {
+		lines = append(lines, "- Edição de cards no Jira: mudar status (com encadeamento automático de etapas), atribuir responsável, definir card pai, mover para sprint, atualizar campos")
+		lines = append(lines, "- Criação de cards no Jira: por linguagem natural, a partir da thread atual, ou em formato explícito")
+	}
+	if opts.slackSearchEnabled {
+		lines = append(lines, "- Busca no Slack: encontrar mensagens, decisões e discussões anteriores por tema, pessoa ou canal; suporte a links de thread")
+	}
+	if opts.metabaseEnabled {
+		line := "- Consultas de dados: perguntas em português viram consultas no banco de dados automaticamente; suporte a filtros, agrupamentos e totalizações"
+		if opts.csvEnabled {
+			line += "; exportação de resultados em CSV"
+		}
+		lines = append(lines, line)
+	}
+	if opts.outlineEnabled {
+		lines = append(lines, "- Documentação interna: busca na wiki da empresa (Outline) por processos, políticas e guias; inclui links para as páginas relevantes nas respostas")
+	}
+	lines = append(lines, "- Análise de arquivos: PDF, Excel, Word, CSV e imagens — basta anexar junto com a pergunta")
+	lines = append(lines, "- Contexto de conversa: lembra do histórico da thread; aceita links de conversas do Slack para buscar contexto")
+
+	return strings.Join(lines, "\n")
+}
+
+// buildDocsContext reads available generated docs from disk and returns a
+// trimmed excerpt suitable for injection into the LLM prompt.
+func buildDocsContext(jiraProjectsPath, metabaseSchemaPath string) string {
+	var parts []string
+
+	if content := readDocFile(jiraProjectsPath, 4000); content != "" {
+		parts = append(parts, "--- Projetos Jira ---\n"+content)
+	}
+
+	// Use the compact schema (much smaller than the full one).
+	compactPath := strings.TrimSuffix(metabaseSchemaPath, ".md") + "_compact.md"
+	if content := readDocFile(compactPath, 3000); content != "" {
+		parts = append(parts, "--- Schema do banco de dados (resumo) ---\n"+content)
+	}
+
+	return strings.Join(parts, "\n\n")
+}
+
+// readDocFile reads a file and returns up to maxChars characters, or "" on error.
+func readDocFile(path string, maxChars int) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	s := strings.TrimSpace(string(data))
+	if len(s) > maxChars {
+		s = s[:maxChars]
+	}
+	return s
+}
+
+// ── Static fallback ───────────────────────────────────────────────────────────
+
+// projectName returns the human-readable name for a project key.
+func projectName(key string, keyToName map[string]string) string {
+	if name, ok := keyToName[strings.ToUpper(key)]; ok && name != "" {
+		return name
+	}
+	return key
+}
+
+// projectList returns a readable comma-separated list of project names.
+func projectList(keys []string, keyToName map[string]string) string {
+	names := make([]string, 0, len(keys))
+	for _, k := range keys {
+		names = append(names, projectName(k, keyToName))
+	}
+	return strings.Join(names, ", ")
+}
+
+// c wraps a phrase in Slack inline-code backticks.
+func c(s string) string { return "`" + s + "`" }
+
+// buildIntroMessage is the static fallback used when the LLM call fails.
 func buildIntroMessage(botName string, opts introOptions) string {
 	if botName == "" {
 		botName = "Jarvis"
@@ -64,98 +187,88 @@ func buildIntroMessage(botName string, opts introOptions) string {
 
 	var sections []string
 
-	// ── Jira: queries ────────────────────────────────────────────────────────
 	if opts.jiraEnabled {
 		projCtx := ""
 		if len(opts.jiraProjectKeys) > 0 {
-			projCtx = " _(projetos: " + strings.Join(opts.jiraProjectKeys, ", ") + ")_"
+			projCtx = " _(projetos: " + projectList(opts.jiraProjectKeys, opts.jiraKeyToName) + ")_"
 		}
-		sections = append(sections, fmt.Sprintf(`*Consultas no Jira* 🎯%s
-• _"roadmap do projeto TPTDR"_ — veja épicos, histórias e o planejamento
-• _"quais bugs estão abertos no INV?"_ — lista issues filtradas por status
-• _"o que está na sprint atual do transportador?"_ — issues da sprint ativa
-• _"o que o David está trabalhando?"_ — busca por assignee
-• _"me mostra o TPTDR-522"_ — detalhes completos de um card específico
-• _"cards bloqueados com prioridade alta"_ — filtros combinados por JQL`, projCtx))
+		sections = append(sections, fmt.Sprintf(
+			"*Consultas no Jira* 🎯%s\n"+
+				"• %s — planejamento, épicos e histórias do projeto\n"+
+				"• %s — cards em aberto por tipo ou status\n"+
+				"• %s — o que está sendo feito na sprint atual\n"+
+				"• %s — tudo que uma pessoa está trabalhando\n"+
+				"• %s — detalhes completos de um card específico",
+			projCtx,
+			c(`"roadmap do projeto"`),
+			c(`"quais bugs estão abertos?"`),
+			c(`"o que está na sprint atual?"`),
+			c(`"o que o David está trabalhando?"`),
+			c(`"me mostra o PROJ-100"`),
+		))
 	}
 
-	// ── Jira: editing ────────────────────────────────────────────────────────
 	if opts.jiraCreateEnabled {
-		sections = append(sections, `*Edição de cards no Jira* ✏️
-• _"pode concluir o TPTDR-522"_ — muda o status (passa pelos intermediários automaticamente)
-• _"atribui o TPTDR-522 ao David"_ — atribui a um colega
-• _"atribui o TPTDR-100 a mim"_ — atribui a você mesmo
-• _"muda a prioridade do INV-88 para alta"_ — atualiza campos
-• _"vincula o TPTDR-300 ao pai TPTDR-200"_ — define issue pai
-• _"fecha e atribui o TPTDR-522 ao David"_ — combina várias ações em uma mensagem`)
+		sections = append(sections,
+			"*Edição de cards no Jira* ✏️\n"+
+				"• "+c(`"pode concluir o PROJ-100"`)+" — muda o status passando pelas etapas automaticamente\n"+
+				"• "+c(`"atribui o PROJ-100 ao David"`)+" — define o responsável\n"+
+				"• "+c(`"manda o PROJ-100 pra sprint atual"`)+" — move para a sprint em andamento\n"+
+				"• "+c(`"muda a prioridade do PROJ-100 para alta"`)+" — atualiza campos do card")
+
+		sections = append(sections,
+			"*Criação de cards no Jira* 📝\n"+
+				"• "+c(`"crie um bug com título '...'"`)+" — criação por linguagem natural\n"+
+				"• "+c(`"com base nessa conversa, abre uma tarefa"`)+" — extrai da thread atual\n"+
+				"• "+c("confirmar")+" — confirma o rascunho e cria o card")
 	}
 
-	// ── Jira: creation ───────────────────────────────────────────────────────
-	if opts.jiraCreateEnabled {
-		sections = append(sections, `*Criação de cards no Jira* 🆕
-• _"crie um bug no TPTDR com título 'Erro no cálculo de frete'"_ — criação por linguagem natural
-• _"com base nessa thread, abre uma história no INV"_ — extrai o card da conversa atual
-• _"com base nessa thread crie dois cards: um bug e uma tarefa"_ — múltiplos cards de uma vez
-• _"jira criar | TPTDR | Bug | Título | Descrição detalhada"_ — formato explícito
-• _confirmar_ — confirma o rascunho pendente e cria o card
-• _cancelar card_ — descarta o rascunho atual`)
-	}
-
-	// ── Slack search ─────────────────────────────────────────────────────────
 	if opts.slackSearchEnabled {
-		sections = append(sections, `*Busca no Slack* 🔍
-• _"onde falamos sobre integração com o transportador?"_ — encontra threads e discussões
-• _"o que foi decidido sobre a migração do banco?"_ — recupera contexto de decisões passadas
-• _"o que o @fulano disse essa semana sobre deploy?"_ — filtra por usuário e período
-• _"tem alguma discussão sobre autenticação no #backend?"_ — busca direcionada por canal
-• Cole um link de thread do Slack e eu busco e resumo o contexto daquela conversa`)
+		sections = append(sections,
+			"*Busca no Slack* 🔍\n"+
+				"• "+c(`"onde falamos sobre X?"`)+" — encontra discussões anteriores\n"+
+				"• "+c(`"o que foi decidido sobre Y?"`)+" — recupera contexto de decisões\n"+
+				"• Cole um link de thread e eu busco e resumo aquela conversa")
 	}
 
-	// ── Metabase / data queries ──────────────────────────────────────────────
 	if opts.metabaseEnabled {
-		csvExample := ""
+		csvLine := ""
 		if opts.csvEnabled {
-			csvExample = "\n• _\"exporta isso em CSV\"_ — baixe os resultados em planilha (link com validade de 1h)"
+			csvLine = "\n• " + c(`"exporta isso em planilha"`) + " — resultados em CSV"
 		}
-		sections = append(sections, fmt.Sprintf(`*Consultas de dados* 📊
-• _"quantas coletas foram realizadas essa semana?"_ — pergunta em linguagem natural, eu gero a query SQL
-• _"lista os 10 geradores com mais ocorrências em fevereiro"_ — filtros por período e ordenação
-• _"qual o volume de notas emitidas por estado?"_ — agrupamentos e totalizações
-• _"mostre todos os motoristas ativos"_ — resultados completos sem limitação de linhas
-• _"qual foi a query que você usou?"_ — exibe o SQL executado na resposta anterior%s`, csvExample))
+		sections = append(sections,
+			"*Consultas de dados* 📊\n"+
+				"• "+c(`"quantos registros temos essa semana?"`)+" — pergunta em português, eu monto a consulta\n"+
+				"• "+c(`"lista os 10 maiores por volume em fevereiro"`)+" — filtros e ordenações\n"+
+				"• "+c(`"qual foi a consulta que você usou?"`)+" — exibe a busca anterior"+csvLine)
 	}
 
-	// ── Outline wiki ─────────────────────────────────────────────────────────
 	if opts.outlineEnabled {
-		sections = append(sections, `*Documentação interna* 📚
-• _"como funciona o processo de onboarding de transportadores?"_ — busca na wiki interna
-• _"qual é a política de SLA para reclamações?"_ — recupera docs de processo
-• _"me explica o fluxo de faturamento"_ — entende e resume documentos internos
-• Quando relevante, incluo links diretos para as páginas do Outline nas respostas`)
+		sections = append(sections,
+			"*Documentação interna* 📚\n"+
+				"• "+c(`"como funciona o processo de X?"`)+" — busca na wiki da empresa\n"+
+				"• Incluo links diretos para as páginas relevantes nas respostas")
 	}
 
-	// ── File analysis ────────────────────────────────────────────────────────
-	sections = append(sections, `*Análise de arquivos* 📎
-• *PDF* — resumo, extração de dados, perguntas sobre o conteúdo
-• *Excel / CSV* — análise de planilhas, totalizações, identificação de padrões
-• *Word (DOCX)* — leitura e resumo de documentos
-• *Imagens* — descrição e extração de texto via visão computacional
-• Basta anexar o arquivo na mensagem junto com sua pergunta`)
+	sections = append(sections,
+		"*Análise de arquivos* 📎\n"+
+			"• PDF, Excel, Word, imagens — basta anexar junto com sua pergunta")
 
-	// ── Conversation context ─────────────────────────────────────────────────
-	sections = append(sections, `*Contexto da conversa* 💬
-• Entendo o histórico da thread — pode perguntar em sequência sem repetir contexto
-• _"e no mês passado?"_ — filtro de acompanhamento sem reformular a pergunta inteira
-• _"pode exportar isso?"_ — referência à resposta anterior de dados
-• Cole um link de thread do Slack e busco o contexto completo daquela conversa`)
+	sections = append(sections,
+		"*Contexto da conversa* 💬\n"+
+			"• Lembro do histórico da thread — pergunte em sequência sem repetir contexto\n"+
+			"• Cole um link de conversa do Slack e busco o contexto completo")
 
-	// ── Summoning ────────────────────────────────────────────────────────────
-	howToCall := fmt.Sprintf(`*Como me chamar:*
-• Mencione *@%s* em qualquer canal
-• Em DMs, basta enviar a mensagem diretamente — sem prefixo`, botName)
+	howToCall := fmt.Sprintf(
+		"*Como me chamar:*\n"+
+			"• Mencione *@%s* em qualquer canal\n"+
+			"• Em conversas diretas, basta enviar a mensagem diretamente",
+		botName,
+	)
 
-	body := strings.Join(sections, "\n\n")
-
-	return fmt.Sprintf("Oi! Sou o *%s*, seu assistente operacional no Slack. 👋\n\nAqui está o que posso fazer por você:\n\n%s\n\n%s\n\nPode perguntar à vontade! 🚀",
-		botName, body, howToCall)
+	body := strings.Join(sections, "\n\n\n")
+	return fmt.Sprintf(
+		"Oi! Sou o *%s*, seu assistente operacional no Slack. 👋\n\nAqui está o que posso fazer por você:\n\n%s\n\n\n%s\n\nPode perguntar à vontade! 🚀",
+		botName, body, howToCall,
+	)
 }

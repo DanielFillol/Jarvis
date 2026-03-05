@@ -125,6 +125,12 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	}
 	log.Printf("[JARVIS] thread history chars=%d", len(threadHist))
 
+	// 3b) Intro request: user asked the bot to introduce itself.
+	if isIntroRequest(question) {
+		log.Printf("[JARVIS] introFlow handled dur=%s", time.Since(start))
+		return s.handleIntroRequest(channel, threadTs, originTs)
+	}
+
 	// 4) High-priority: Jira creation flows (always use the original thread).
 	handled, err := s.maybeHandleJiraCreateFlows(channel, threadTs, originTs, originalText, question, threadHist)
 	if handled {
