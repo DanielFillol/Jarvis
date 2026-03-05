@@ -171,6 +171,7 @@ Responda "sim" para:
 - Atribuição: "atribuir", "assign", "designar", "responsável", "atribui para mim", "atribui ao David"
 - Atualização de campos: "mudar prioridade", "alterar summary", "atualizar labels", "mudar título"
 - Definir pai: "vincular ao pai", "pai é", "definir pai", "parent é", "set parent"
+- Sprint: "mover para sprint", "manda pra sprint atual", "deixa pra próxima sprint", "move para sprint 5", "coloca na sprint corrente"
 
 Responda "não" para:
 - Consultas / pesquisas / resumos
@@ -224,11 +225,18 @@ Retorne JSON exatamente neste formato (deixe campos vazios/null quando não menc
   "summary": "",
   "description": "",
   "priority": "",
-  "labels": []
+  "labels": [],
+  "target_sprint": ""
 }
 
 Regras:
 - issue_key: chave do card (ex: TPTDR-522). Obrigatório.
+- target_sprint: preencha quando o usuário quiser mover para uma sprint.
+  Use exatamente um destes valores:
+  "current" → sprint atual/corrente/ativa
+  "next"    → próxima sprint / sprint seguinte / deixar para depois
+  "<nome>"  → sprint específica por nome ou número (ex: "Sprint 5", "5", "Sprint Março")
+  Vazio quando nenhuma movimentação de sprint for pedida.
 - target_status: status desejado em palavras. SEMPRE preencha quando o usuário usar verbos de transição:
   "concluir"/"fechar"/"pode concluir"/"marcar como feito"/"done"/"concluído" → "Done"
   "iniciar"/"começar"/"em andamento"/"in progress" → "In Progress"
@@ -260,6 +268,36 @@ Regras:
 	req.Description = strings.TrimSpace(req.Description)
 	req.Priority = strings.TrimSpace(req.Priority)
 	return req, nil
+}
+
+// PickBestSprintByName selects the sprint ID from candidates that best matches
+// the user's desired sprint name or number.  Returns 0 when no match is found.
+func (c *Client) PickBestSprintByName(sprints []jira.Sprint, desired string, model string) int {
+	if len(sprints) == 0 || desired == "" {
+		return 0
+	}
+	var lines []string
+	for _, sp := range sprints {
+		lines = append(lines, fmt.Sprintf("id=%d name=%q state=%s", sp.ID, sp.Name, sp.State))
+	}
+	prompt := fmt.Sprintf(`Qual sprint abaixo corresponde melhor ao pedido do usuário?
+Retorne SOMENTE o ID numérico da sprint. Se nenhuma corresponder, retorne 0.
+
+Sprint pedida: %q
+Sprints disponíveis:
+%s`, desired, strings.Join(lines, "\n"))
+
+	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
+	out, err := c.Chat(messages, model, 0, 10)
+	if err != nil {
+		log.Printf("[LLM] pickBestSprintByName error: %v", err)
+		return 0
+	}
+	out = strings.TrimSpace(out)
+	var id int
+	fmt.Sscanf(out, "%d", &id)
+	log.Printf("[LLM] pickBestSprintByName desired=%q → id=%d", desired, id)
+	return id
 }
 
 // MapStatusName maps a user-provided status name (possibly in a different language

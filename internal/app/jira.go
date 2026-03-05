@@ -138,6 +138,20 @@ func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, ques
 		}
 	}
 
+	// Move to sprint
+	if req.TargetSprint != "" {
+		sprint, err := s.resolveTargetSprint(req.IssueKey, req.TargetSprint)
+		if err != nil {
+			log.Printf("[JARVIS] resolveTargetSprint %s target=%q: %v", req.IssueKey, req.TargetSprint, err)
+			results = append(results, fmt.Sprintf("⚠️ Não consegui resolver a sprint: %v", err))
+		} else if err := s.Jira.MoveIssueToSprint(sprint.ID, req.IssueKey); err != nil {
+			log.Printf("[JARVIS] MoveIssueToSprint %s → sprint %d: %v", req.IssueKey, sprint.ID, err)
+			results = append(results, fmt.Sprintf("⚠️ Não consegui mover para a sprint *%s*: %v", sprint.Name, err))
+		} else {
+			results = append(results, fmt.Sprintf("✅ Movido para a sprint *%s*", sprint.Name))
+		}
+	}
+
 	if len(results) == 0 {
 		_ = s.Slack.PostMessage(channel, threadTs, "Nenhuma alteração foi aplicada.")
 		return true, nil
@@ -201,6 +215,76 @@ func (s *Service) transitionToStatus(issueKey, desiredStatus string) (finalStatu
 		log.Printf("[JARVIS] transitionToStatus %s step=%d via=%q toward=%q", issueKey, i+1, transName, desiredStatus)
 	}
 	return "", steps, fmt.Errorf("não atingiu %q em %d passos", desiredStatus, maxSteps)
+}
+
+// resolveTargetSprint finds the right sprint for the issue's project board
+// based on the LLM's extracted target ("current", "next", or a sprint name/number).
+func (s *Service) resolveTargetSprint(issueKey, target string) (*jira.Sprint, error) {
+	// Derive project key from issue key (e.g. "TPTDR-522" → "TPTDR").
+	idx := strings.Index(issueKey, "-")
+	if idx <= 0 {
+		return nil, fmt.Errorf("invalid issue key: %q", issueKey)
+	}
+	projectKey := issueKey[:idx]
+
+	boards, err := s.Jira.GetBoards(projectKey)
+	if err != nil {
+		return nil, fmt.Errorf("GetBoards(%s): %w", projectKey, err)
+	}
+	if len(boards) == 0 {
+		return nil, fmt.Errorf("nenhum board encontrado para o projeto %s", projectKey)
+	}
+	boardID := boards[0].ID // use the first board for the project
+
+	switch strings.ToLower(strings.TrimSpace(target)) {
+	case "current", "atual", "corrente", "ativa":
+		sprints, err := s.Jira.GetSprints(boardID, "active")
+		if err != nil {
+			return nil, fmt.Errorf("GetSprints(active): %w", err)
+		}
+		if len(sprints) == 0 {
+			return nil, fmt.Errorf("nenhuma sprint ativa encontrada no board do projeto %s", projectKey)
+		}
+		return &sprints[0], nil
+
+	case "next", "next sprint", "próxima", "proxima", "seguinte":
+		sprints, err := s.Jira.GetSprints(boardID, "future")
+		if err != nil {
+			return nil, fmt.Errorf("GetSprints(future): %w", err)
+		}
+		if len(sprints) == 0 {
+			return nil, fmt.Errorf("nenhuma sprint futura encontrada no board do projeto %s", projectKey)
+		}
+		return &sprints[0], nil
+
+	default:
+		// Search by name/number across active + future sprints.
+		var candidates []jira.Sprint
+		for _, state := range []string{"active", "future"} {
+			ss, err := s.Jira.GetSprints(boardID, state)
+			if err == nil {
+				candidates = append(candidates, ss...)
+			}
+		}
+		if len(candidates) == 0 {
+			return nil, fmt.Errorf("nenhuma sprint ativa ou futura encontrada para o projeto %s", projectKey)
+		}
+		// Use LLM to pick the best match among candidate names.
+		sprintID := s.LLM.PickBestSprintByName(candidates, target, s.Cfg.OpenAILesserModel)
+		if sprintID == 0 {
+			var names []string
+			for _, sp := range candidates {
+				names = append(names, sp.Name)
+			}
+			return nil, fmt.Errorf("sprint %q não encontrada. Disponíveis: %s", target, strings.Join(names, ", "))
+		}
+		for i := range candidates {
+			if candidates[i].ID == sprintID {
+				return &candidates[i], nil
+			}
+		}
+		return nil, fmt.Errorf("sprint ID %d não encontrado", sprintID)
+	}
 }
 
 // pickBestUser selects the most relevant user from assignable search results.
