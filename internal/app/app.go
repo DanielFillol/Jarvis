@@ -145,53 +145,67 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		return s.handleIntroRequest(channel, threadTs, originTs)
 	}
 
-	// 4) Jira action flows: detect all required actions in a single LLM call so
-	// a message like "crie um card e adicione para X" runs both flows in sequence.
-	{
-		// Detect all Jira actions needed (create, edit, or both).
-		// The pending-issue state machine inside the create flow may activate
-		// independently of intent detection, so we also check the store.
-		hasPending := s.Cfg.JiraEnabled() && s.Store.Load(channel, threadTs) != nil
-		jiraActions := s.LLM.DetectJiraActions(
-			s.Slack.ResolveUserMentions(parse.StripSlackPermalinks(question)),
-			threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel,
-		)
-		log.Printf("[JARVIS] jiraActions=%v hasPending=%t", jiraActions, hasPending)
+	// 4) Unified action dispatcher: one LLM call determines every skill needed.
+	// Resolve Slack mentions before passing to the router.
+	questionForLLM := s.Slack.ResolveUserMentions(s.Slack.ResolveChannelMentions(parse.StripSlackPermalinks(question)))
+	hasPending := s.Cfg.JiraEnabled() && s.Store.Load(channel, threadTs) != nil
+	storedDBID, _ := s.loadThreadDBID(contextChannel, contextThreadTs)
 
-		wantsCreate := containsStr(jiraActions, "jira_create")
-		wantsEdit := containsStr(jiraActions, "jira_edit")
-
-		var createdKey string
-		var anyHandled bool
-
-		if wantsCreate || hasPending {
-			res, createErr := s.maybeHandleJiraCreateFlows(channel, threadTs, originTs, originalText, question, threadHist, wantsCreate)
-			if res.Handled {
-				anyHandled = true
-				createdKey = res.CreatedKey
-				if createErr != nil {
-					log.Printf("[JARVIS] jiraCreateFlow handled dur=%s", time.Since(start))
-					return createErr
-				}
+	actions, actErr := s.LLM.DecideActions(
+		questionForLLM, threadHist, s.Cfg.OpenAILesserModel,
+		s.Cfg.JiraEnabled(), s.Jira.CatalogCompact, senderUserID,
+		s.formattedMetabaseDatabases(), storedDBID,
+		s.Cfg.OutlineEnabled(),
+	)
+	if actErr != nil {
+		log.Printf("[WARN] decideActions failed: %v", actErr)
+		actions = fallbackActions(hasThreadPermalink)
+	}
+	// Explicit permalink → thread is already the authoritative context; drop Slack searches.
+	if hasThreadPermalink {
+		filtered := actions[:0]
+		for _, a := range actions {
+			if a.Kind != llm.ActionSlackSearch {
+				filtered = append(filtered, a)
 			}
 		}
+		actions = filtered
+	}
+	log.Printf("[JARVIS] actions=%v hasPending=%t", actionKinds(actions), hasPending)
 
-		if wantsEdit {
-			// Pass the newly created key (if any) so the edit applies to it.
-			handled, editErr := s.maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist, createdKey, true)
-			if handled {
-				anyHandled = true
-				if editErr != nil {
-					log.Printf("[JARVIS] jiraEditFlow handled dur=%s", time.Since(start))
-					return editErr
-				}
+	handlerActions, contextActions := splitActions(actions)
+
+	// Pass 1 — handler actions run before the busy placeholder and may consume the message.
+	var createdKey string
+	var anyHandled bool
+
+	if containsKind(handlerActions, llm.ActionJiraCreate) || hasPending {
+		res, createErr := s.maybeHandleJiraCreateFlows(channel, threadTs, originTs, originalText, question, threadHist,
+			containsKind(handlerActions, llm.ActionJiraCreate))
+		if res.Handled {
+			anyHandled = true
+			createdKey = res.CreatedKey
+			if createErr != nil {
+				log.Printf("[JARVIS] jiraCreateFlow handled dur=%s", time.Since(start))
+				return createErr
 			}
 		}
+	}
 
-		if anyHandled {
-			log.Printf("[JARVIS] jiraFlows handled dur=%s", time.Since(start))
-			return nil
+	if containsKind(handlerActions, llm.ActionJiraEdit) {
+		handled, editErr := s.maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist, createdKey, true)
+		if handled {
+			anyHandled = true
+			if editErr != nil {
+				log.Printf("[JARVIS] jiraEditFlow handled dur=%s", time.Since(start))
+				return editErr
+			}
 		}
+	}
+
+	if anyHandled && len(contextActions) == 0 {
+		log.Printf("[JARVIS] handlerFlows handled dur=%s", time.Since(start))
+		return nil
 	}
 
 	// 5) Post a "searching…" placeholder so the user knows Jarvis is working.
@@ -212,48 +226,32 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		return s.Slack.PostMessage(channel, threadTs, text)
 	}
 
-	// 6) Routing decision via LLM (lesser model).
-	// Resolve Slack mentions first so the router sees readable names.
-	questionForLLM := s.Slack.ResolveUserMentions(s.Slack.ResolveChannelMentions(parse.StripSlackPermalinks(question)))
-	storedDBID, _ := s.loadThreadDBID(contextChannel, contextThreadTs)
-	decision, err := s.LLM.DecideRetrieval(
-		questionForLLM, threadHist, s.Cfg.OpenAILesserModel,
-		s.Cfg.JiraEnabled(), s.Jira.CatalogCompact, senderUserID,
-		s.formattedMetabaseDatabases(), storedDBID,
-		s.Cfg.OutlineEnabled(),
-	)
-	if err != nil {
-		log.Printf("[WARN] decideRetrieval failed: %v", err)
-		if hasThreadPermalink {
-			decision = llm.RetrievalDecision{}
-		} else {
-			decision = llm.RetrievalDecision{NeedSlack: false, NeedJira: true, JiraIntent: "default"}
-		}
-	}
-	// Explicit permalink → thread content is already the authoritative context;
-	// no need for an additional Slack search.
-	if hasThreadPermalink {
-		decision.NeedSlack = false
-		decision.SlackQuery = ""
-	}
-	log.Printf("[JARVIS] needSlack=%t slackQuery=%q needJira=%t jiraJQL=%q needMetabase=%t dbID=%d showSQL=%t wantsAllRows=%t wantsCSV=%t needOutline=%t outlineQuery=%q",
-		decision.NeedSlack, preview(decision.SlackQuery, 120),
-		decision.NeedJira, preview(decision.JiraJQL, 120),
-		decision.NeedMetabase, decision.MetabaseDatabaseID,
-		decision.ShowSQL, decision.WantsAllRows, decision.WantsCSVExport,
-		decision.NeedOutline, preview(decision.OutlineQuery, 80))
+	// Pass 2 — context actions: fetch external data, then call the answer LLM.
+	var slackCtxParts []string
+	var jiraCtxParts []string
+	var dbCtxParts []string
+	var dbQueryResults []*metabase.QueryResult
+	var dbQueryActions []llm.ActionDescriptor
+	var outlineCtx, outlineSources string
+	var executedSlackSearch, executedJiraSearch bool
+	var slackMatches, jiraIssuesFound int
 
-	// 7) Slack context retrieval.
-	var slackCtx string
-	var slackMatches int
-	if decision.NeedSlack && strings.TrimSpace(decision.SlackQuery) != "" && s.Cfg.SlackUserToken != "" {
-		unresolvedUserIDs := extractFromUserIDs(decision.SlackQuery)
-		decision.SlackQuery = s.Slack.ResolveUserIDsInQuery(decision.SlackQuery)
-		log.Printf("[JARVIS] slackSearch query=%q", decision.SlackQuery)
-		matches, err := s.Slack.SearchMessagesAll(decision.SlackQuery)
-		if err != nil {
-			log.Printf("[WARN] slack search failed: %v", err)
-		} else {
+	for _, action := range contextActions {
+		switch action.Kind {
+
+		case llm.ActionSlackSearch:
+			if strings.TrimSpace(action.Query) == "" || s.Cfg.SlackUserToken == "" {
+				continue
+			}
+			executedSlackSearch = true
+			unresolvedUserIDs := extractFromUserIDs(action.Query)
+			resolvedQuery := s.Slack.ResolveUserIDsInQuery(action.Query)
+			log.Printf("[JARVIS] slackSearch query=%q", resolvedQuery)
+			matches, sErr := s.Slack.SearchMessagesAll(resolvedQuery)
+			if sErr != nil {
+				log.Printf("[WARN] slack search failed: %v", sErr)
+				break
+			}
 			if len(unresolvedUserIDs) > 0 {
 				filtered := matches[:0]
 				for _, m := range matches {
@@ -267,18 +265,177 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 				log.Printf("[JARVIS] clientSideUserFilter from=%v reduced %d→%d", unresolvedUserIDs, len(matches), len(filtered))
 				matches = filtered
 			}
-			slackMatches = len(matches)
-			slackCtx = buildSlackContext(matches, 25)
-			if slackMatches == 0 {
-				slackCtx = "[AVISO: A busca no Slack não retornou mensagens. NÃO invente conteúdo de canais ou mensagens. Informe ao usuário que não foram encontrados dados para a busca realizada e sugira alternativas.]"
+			if len(matches) > 0 {
+				slackMatches += len(matches)
+				ctx := buildSlackContext(matches, 25)
+				log.Printf("[JARVIS] slackContext matches=%d chars=%d", len(matches), len(ctx))
+				slackCtxParts = append(slackCtxParts, ctx)
+			} else {
+				log.Printf("[JARVIS] slackSearch query=%q returned 0 results", resolvedQuery)
 			}
-			log.Printf("[JARVIS] slackContext matches=%d chars=%d", slackMatches, len(slackCtx))
+
+		case llm.ActionJiraSearch:
+			executedJiraSearch = true
+			jql := strings.TrimSpace(action.JQL)
+			if jql == "" {
+				jql = defaultJQLForIntent(action.JiraIntent, question, s.Cfg.JiraProjectKeys)
+			}
+			jql = sanitizeJQL(jql)
+			log.Printf("[JARVIS] jiraJQL=%q", jql)
+			issues, jErr := s.Jira.FetchAll(jql, 200)
+			if jErr != nil {
+				log.Printf("[WARN] jira search failed: %v", jErr)
+				break
+			}
+			jiraIssuesFound += len(issues)
+			ctx := buildJiraContext(issues, 40)
+			log.Printf("[JARVIS] jiraContext issues=%d chars=%d", len(issues), len(ctx))
+			jiraCtxParts = append(jiraCtxParts, ctx)
+
+		case llm.ActionOutlineSearch:
+			outlineQuery := strings.TrimSpace(action.Query)
+			if outlineQuery == "" {
+				outlineQuery = s.LLM.GenerateOutlineQuery(questionForLLM, s.Cfg.OpenAILesserModel)
+				if outlineQuery != "" {
+					log.Printf("[JARVIS] outlineQuery generated=%q", outlineQuery)
+				}
+			}
+			if s.Outline != nil && outlineQuery != "" {
+				log.Printf("[JARVIS] outlineSearch query=%q", outlineQuery)
+				results, oErr := s.Outline.SearchDocuments(outlineQuery, 5)
+				if oErr != nil {
+					log.Printf("[WARN] outline search failed: %v", oErr)
+				} else {
+					outlineCtx = outline.FormatContext(results, 8000)
+					outlineSources = outline.FormatSources(results)
+					log.Printf("[JARVIS] outlineContext docs=%d chars=%d", len(results), len(outlineCtx))
+					if outlineCtx == "" {
+						outlineCtx = "[AVISO: A busca no Outline não retornou documentos. Informe ao usuário que não foram encontrados docs relevantes para a consulta realizada.]"
+					}
+				}
+			}
+
+		case llm.ActionMetabaseQuery:
+			if s.Metabase == nil {
+				break
+			}
+			var baseSQL string
+			if v, ok := s.threadLastSQL.Load(contextChannel + ":" + contextThreadTs); ok {
+				if sql, ok2 := v.(string); ok2 {
+					baseSQL = sql
+				}
+			}
+			thisDBCtx, thisQR, thisSql := s.runMetabaseQuery(questionForLLM, threadHist, action.MetabaseDatabaseID, baseSQL)
+			if strings.HasPrefix(thisDBCtx, llm.ClarificationPrefix) {
+				clarificationQ := strings.TrimPrefix(thisDBCtx, llm.ClarificationPrefix)
+				if replyErr := replyFn(clarificationQ); replyErr != nil {
+					log.Printf("[ERR] clarification reply failed: %v", replyErr)
+					return replyErr
+				}
+				if busyTs != "" {
+					s.Slack.Tracker.Track(channel, originTs, busyTs)
+				}
+				log.Printf("[JARVIS] clarification requested dur=%s", time.Since(start))
+				return nil
+			}
+			if thisSql != "" {
+				s.threadLastSQL.Store(contextChannel+":"+contextThreadTs, thisSql)
+				s.storeThreadDBID(contextChannel, contextThreadTs, action.MetabaseDatabaseID)
+			}
+
+			// CSV export or large result handling.
+			const largeResultThreshold = 30
+			if thisQR != nil && action.WantsCSVExport && s.FileServer != nil && strings.TrimSpace(s.Cfg.PublicBaseURL) != "" {
+				nRows := len(thisQR.Data.Rows)
+				cols := make([]string, len(thisQR.Data.Cols))
+				for i, c := range thisQR.Data.Cols {
+					if c.DisplayName != "" {
+						cols[i] = c.DisplayName
+					} else {
+						cols[i] = c.Name
+					}
+				}
+				csvBytes := []byte(metabase.FormatQueryResultAsCSV(*thisQR))
+				if len(csvBytes) > 0 {
+					fileID := s.FileServer.Store("resultado.csv", csvBytes, time.Hour)
+					csvURL := s.Cfg.PublicBaseURL + "/files/" + fileID
+					dbCtxParts = append(dbCtxParts, fmt.Sprintf(
+						"Query SQL retornou %d registros com os campos: %s.\n\n"+
+							"INSTRUÇÃO INTERNA: Escreva APENAS 1 frase curta de introdução descrevendo o resultado "+
+							"(ex: \"Encontrei %d registros...\"). Não exiba a tabela de dados. Finalize a resposta aí.\n\n"+
+							"Amostra (3 de %d registros):\n%s\n\n:page_facing_up: *Download CSV:* <%s|resultado.csv> _(expira em 1 hora)_",
+						nRows, strings.Join(cols, ", "), nRows, nRows,
+						metabase.FormatQueryResult(*thisQR, 3), csvURL,
+					))
+					log.Printf("[JARVIS] CSV generated rows=%d id=%s", nRows, fileID)
+				}
+				dbQueryResults = append(dbQueryResults, nil) // placeholder; CSV handled in context
+				dbQueryActions = append(dbQueryActions, action)
+				break
+			} else if thisQR != nil && len(thisQR.Data.Rows) > largeResultThreshold && action.WantsAllRows {
+				nRows := len(thisQR.Data.Rows)
+				cols := make([]string, len(thisQR.Data.Cols))
+				for i, c := range thisQR.Data.Cols {
+					if c.DisplayName != "" {
+						cols[i] = c.DisplayName
+					} else {
+						cols[i] = c.Name
+					}
+				}
+				dbCtxParts = append(dbCtxParts, fmt.Sprintf(
+					"Query SQL retornou %d registros com os campos: %s.\n\n"+
+						"INSTRUÇÃO INTERNA: Escreva APENAS 1 frase curta de introdução descrevendo o resultado "+
+						"(ex: \"Encontrei %d registros...\"). Finalize com o marcador exato [TABLE] e nada mais.\n\n"+
+						"Amostra (3 de %d registros):\n%s",
+					nRows, strings.Join(cols, ", "), nRows, nRows,
+					metabase.FormatQueryResult(*thisQR, 3),
+				))
+				log.Printf("[JARVIS] large result bypass: rows=%d", nRows)
+				dbQueryResults = append(dbQueryResults, thisQR)
+				dbQueryActions = append(dbQueryActions, action)
+				break
+			}
+
+			if thisDBCtx == "" {
+				thisDBCtx = "[ERRO: A consulta ao banco de dados falhou ou não retornou dados. NÃO invente métricas, nomes ou valores. Informe ao usuário que não foi possível obter os dados neste momento e sugira tentar novamente.]"
+			}
+			dbCtxParts = append(dbCtxParts, thisDBCtx)
+			dbQueryResults = append(dbQueryResults, thisQR)
+			dbQueryActions = append(dbQueryActions, action)
+
+		case llm.ActionShowSQL:
+			var baseSQL string
+			if v, ok := s.threadLastSQL.Load(contextChannel + ":" + contextThreadTs); ok {
+				if sql, ok2 := v.(string); ok2 {
+					baseSQL = sql
+				}
+			}
+			dbID := action.MetabaseDatabaseID
+			_, _, executedSQL := s.runMetabaseQuery(questionForLLM, threadHist, dbID, baseSQL)
+			var showSQLReply string
+			if executedSQL != "" {
+				showSQLReply = fmt.Sprintf(
+					"Reconstruí e validei a query com base no contexto desta conversa:\n```sql\n%s\n```\n\n> _Nota: esta é uma reconstrução — pode diferir levemente da query original, mas foi executada com sucesso no banco de dados._",
+					executedSQL,
+				)
+			} else {
+				showSQLReply = "Não consegui reconstruir uma query válida para esta conversa após várias tentativas. Tente reformular a pergunta original para que eu possa buscar os dados novamente."
+			}
+			if replyErr := replyFn(showSQLReply); replyErr != nil {
+				log.Printf("[ERR] show SQL reply failed: %v", replyErr)
+				return replyErr
+			}
+			if busyTs != "" {
+				s.Slack.Tracker.Track(channel, originTs, busyTs)
+			}
+			log.Printf("[JARVIS] show SQL handled executedSQL_len=%d dur=%s", len(executedSQL), time.Since(start))
+			return nil
 		}
 	}
 
-	// Direct channel history fallback for raw <#CHANID> mentions that cannot
-	// be resolved to names for Slack search.
-	if decision.NeedSlack {
+	// Channel history fallback: runs once after all slack_search actions are done,
+	// for raw <#CHANID> mentions that cannot be resolved to names for the search API.
+	if executedSlackSearch {
 		if chanIDs := extractChannelIDsFromText(question); len(chanIDs) > 0 {
 			now := time.Now()
 			weekday := int(now.Weekday())
@@ -288,128 +445,61 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			weekStart := now.AddDate(0, 0, -(weekday - 1)).Truncate(24 * time.Hour)
 			var directMsgs []slack.SearchMessage
 			for _, cid := range chanIDs {
-				msgs, err := s.Slack.GetChannelHistoryForPeriod(cid, weekStart, now, 80)
-				if err != nil {
-					log.Printf("[JARVIS] channelHistory %s failed: %v", cid, err)
+				msgs, chErr := s.Slack.GetChannelHistoryForPeriod(cid, weekStart, now, 80)
+				if chErr != nil {
+					log.Printf("[JARVIS] channelHistory %s failed: %v", cid, chErr)
 					continue
 				}
 				log.Printf("[JARVIS] channelHistory %s messages=%d", cid, len(msgs))
 				directMsgs = append(directMsgs, msgs...)
 			}
 			if len(directMsgs) > 0 {
-				slackCtx = buildSlackContext(directMsgs, 40)
-				slackMatches = len(directMsgs)
-				log.Printf("[JARVIS] channelHistory total=%d chars=%d", slackMatches, len(slackCtx))
+				histCtx := buildSlackContext(directMsgs, 40)
+				slackCtxParts = append(slackCtxParts, histCtx)
+				slackMatches += len(directMsgs)
+				log.Printf("[JARVIS] channelHistory total=%d chars=%d", len(directMsgs), len(histCtx))
 			}
+		}
+		// If all searches returned nothing, inject a single warning.
+		if slackMatches == 0 {
+			slackCtxParts = append(slackCtxParts, "[AVISO: A busca no Slack não retornou mensagens. NÃO invente conteúdo de canais ou mensagens. Informe ao usuário que não foram encontrados dados para a busca realizada e sugira alternativas.]")
 		}
 	}
 
-	// 8) Jira context via LLM-generated JQL.
-	var jiraCtx string
-	var jiraIssuesFound int
-	if decision.NeedJira {
-		jql := strings.TrimSpace(decision.JiraJQL)
-		if jql == "" {
-			jql = defaultJQLForIntent(decision.JiraIntent, question, s.Cfg.JiraProjectKeys)
-		}
-		jql = sanitizeJQL(jql)
-		log.Printf("[JARVIS] jiraJQL=%q", jql)
-		issues, err := s.Jira.FetchAll(jql, 200)
-		if err != nil {
-			log.Printf("[WARN] jira search failed: %v", err)
-		} else {
-			jiraIssuesFound = len(issues)
-			jiraCtx = buildJiraContext(issues, 40)
-			log.Printf("[JARVIS] jiraContext issues=%d chars=%d", jiraIssuesFound, len(jiraCtx))
-		}
-	}
-
-	// 8b) Outline wiki documentation search.
-	// Always runs when Outline is configured — it is a knowledge base and any
-	// question may benefit from internal documentation context.
-	// The router's OutlineQuery is used when available; otherwise a dedicated
-	// LLM call extracts clean 2–4 keywords from the question.  The raw user
-	// question is never sent directly to the wiki search API.
-	var outlineCtx string
-	var outlineSources string
-	if s.Outline != nil {
-		outlineQuery := strings.TrimSpace(decision.OutlineQuery)
-		if outlineQuery == "" {
-			outlineQuery = s.LLM.GenerateOutlineQuery(questionForLLM, s.Cfg.OpenAILesserModel)
-			if outlineQuery != "" {
-				log.Printf("[JARVIS] outlineQuery generated=%q", outlineQuery)
-			}
-		}
+	// Outline: always run when configured, even without an outline_search action.
+	if s.Outline != nil && outlineCtx == "" {
+		outlineQuery := s.LLM.GenerateOutlineQuery(questionForLLM, s.Cfg.OpenAILesserModel)
 		if outlineQuery == "" {
 			log.Printf("[JARVIS] outlineSearch skipped: could not generate query")
 		} else {
-			log.Printf("[JARVIS] outlineSearch query=%q", outlineQuery)
-			results, err := s.Outline.SearchDocuments(outlineQuery, 5)
-			if err != nil {
-				log.Printf("[WARN] outline search failed: %v", err)
+			log.Printf("[JARVIS] outlineSearch query=%q (fallback)", outlineQuery)
+			results, oErr := s.Outline.SearchDocuments(outlineQuery, 5)
+			if oErr != nil {
+				log.Printf("[WARN] outline search failed: %v", oErr)
 			} else {
 				outlineCtx = outline.FormatContext(results, 8000)
 				outlineSources = outline.FormatSources(results)
 				log.Printf("[JARVIS] outlineContext docs=%d chars=%d", len(results), len(outlineCtx))
-				if outlineCtx == "" && decision.NeedOutline {
-					outlineCtx = "[AVISO: A busca no Outline não retornou documentos. Informe ao usuário que não foram encontrados docs relevantes para a consulta realizada.]"
-				}
 			}
 		}
 	}
 
-	// 9) Metabase database query.
-	var dbCtx string
-	var dbQueryResult *metabase.QueryResult
-	var executedSQL string
-	if decision.NeedMetabase && s.Metabase != nil {
-		dbCtx, dbQueryResult, executedSQL = s.runMetabaseQuery(
-			questionForLLM, threadHist, decision.MetabaseDatabaseID, "",
-		)
-		// LLM requested clarification — ask the user and stop processing here.
-		if strings.HasPrefix(dbCtx, llm.ClarificationPrefix) {
-			clarificationQ := strings.TrimPrefix(dbCtx, llm.ClarificationPrefix)
-			if replyErr := replyFn(clarificationQ); replyErr != nil {
-				log.Printf("[ERR] clarification reply failed: %v", replyErr)
-				return replyErr
-			}
-			if busyTs != "" {
-				s.Slack.Tracker.Track(channel, originTs, busyTs)
-			}
-			log.Printf("[JARVIS] clarification requested dur=%s", time.Since(start))
-			return nil
-		}
-		// Persist DB ID so the LLM router can identify future follow-ups.
-		if executedSQL != "" {
-			s.storeThreadDBID(contextChannel, contextThreadTs, decision.MetabaseDatabaseID)
-		}
-		if dbCtx == "" {
-			dbCtx = "[ERRO: A consulta ao banco de dados falhou ou não retornou dados. NÃO invente métricas, nomes ou valores. Informe ao usuário que não foi possível obter os dados neste momento e sugira tentar novamente.]"
-		}
-	}
+	// Merge multi-source contexts.
+	slackCtx := strings.Join(slackCtxParts, "\n\n")
+	jiraCtx := strings.Join(jiraCtxParts, "\n\n")
+	dbCtx := strings.Join(dbCtxParts, "\n\n")
 
-	// 9b) ShowSQL: user asked for the query used in a prior answer.
-	// runMetabaseQuery above already reconstructed and validated it.
-	if decision.ShowSQL {
-		var showSQLReply string
-		if executedSQL != "" {
-			showSQLReply = fmt.Sprintf(
-				"Reconstruí e validei a query com base no contexto desta conversa:\n```sql\n%s\n```\n\n> _Nota: esta é uma reconstrução — pode diferir levemente da query original, mas foi executada com sucesso no banco de dados._",
-				executedSQL,
-			)
-		} else {
-			showSQLReply = "Não consegui reconstruir uma query válida para esta conversa após várias tentativas. Tente reformular a pergunta original para que eu possa buscar os dados novamente."
+	// Build appendDataTable for large inline results.
+	var appendDataTable string
+	for i, qr := range dbQueryResults {
+		if qr == nil {
+			continue
 		}
-		if replyErr := replyFn(showSQLReply); replyErr != nil {
-			log.Printf("[ERR] show SQL reply failed: %v", replyErr)
-			return replyErr
+		if i < len(dbQueryActions) && dbQueryActions[i].WantsAllRows && len(qr.Data.Rows) > 30 {
+			appendDataTable += metabase.FormatQueryResult(*qr, len(qr.Data.Rows))
 		}
-		if busyTs != "" {
-			s.Slack.Tracker.Track(channel, originTs, busyTs)
-		}
-		log.Printf("[JARVIS] show SQL handled executedSQL_len=%d dur=%s", len(executedSQL), time.Since(start))
-		return nil
 	}
+	_ = dbQueryActions // suppress unused warning if no large results
 
 	// 10) File context from attachments (current message + thread history files).
 	// When the user references a file shared in an earlier reply, we collect all
@@ -453,61 +543,6 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		log.Printf("[JARVIS] imageAttachments count=%d", len(images))
 	}
 
-	// 10b) CSV export or large result set.
-	const largeResultThreshold = 30
-	var appendDataTable string
-	var csvDownloadLine string
-
-	if dbQueryResult != nil && decision.WantsCSVExport && s.FileServer != nil && strings.TrimSpace(s.Cfg.PublicBaseURL) != "" {
-		// Generate CSV for download; give LLM only a sample for the intro sentence.
-		nRows := len(dbQueryResult.Data.Rows)
-		cols := make([]string, len(dbQueryResult.Data.Cols))
-		for i, c := range dbQueryResult.Data.Cols {
-			if c.DisplayName != "" {
-				cols[i] = c.DisplayName
-			} else {
-				cols[i] = c.Name
-			}
-		}
-		csvBytes := []byte(metabase.FormatQueryResultAsCSV(*dbQueryResult))
-		if len(csvBytes) > 0 {
-			fileID := s.FileServer.Store("resultado.csv", csvBytes, time.Hour)
-			csvURL := s.Cfg.PublicBaseURL + "/files/" + fileID
-			csvDownloadLine = fmt.Sprintf("\n\n:page_facing_up: *Download CSV:* <%s|resultado.csv> _(expira em 1 hora)_", csvURL)
-			log.Printf("[JARVIS] CSV generated rows=%d id=%s", nRows, fileID)
-		}
-		sample := metabase.FormatQueryResult(*dbQueryResult, 3)
-		dbCtx = fmt.Sprintf(
-			"Query SQL retornou %d registros com os campos: %s.\n\n"+
-				"INSTRUÇÃO INTERNA: Escreva APENAS 1 frase curta de introdução descrevendo o resultado "+
-				"(ex: \"Encontrei %d registros...\"). Não exiba a tabela de dados. Finalize a resposta aí.\n\n"+
-				"Amostra (3 de %d registros):\n%s",
-			nRows, strings.Join(cols, ", "), nRows, nRows, sample,
-		)
-		log.Printf("[JARVIS] CSV export: rows=%d", nRows)
-	} else if dbQueryResult != nil && len(dbQueryResult.Data.Rows) > largeResultThreshold && decision.WantsAllRows {
-		// Large result inline display (no CSV requested).
-		nRows := len(dbQueryResult.Data.Rows)
-		cols := make([]string, len(dbQueryResult.Data.Cols))
-		for i, c := range dbQueryResult.Data.Cols {
-			if c.DisplayName != "" {
-				cols[i] = c.DisplayName
-			} else {
-				cols[i] = c.Name
-			}
-		}
-		appendDataTable = metabase.FormatQueryResult(*dbQueryResult, nRows)
-		sample := metabase.FormatQueryResult(*dbQueryResult, 3)
-		dbCtx = fmt.Sprintf(
-			"Query SQL retornou %d registros com os campos: %s.\n\n"+
-				"INSTRUÇÃO INTERNA: Escreva APENAS 1 frase curta de introdução descrevendo o resultado "+
-				"(ex: \"Encontrei %d registros...\"). Finalize com o marcador exato [TABLE] e nada mais.\n\n"+
-				"Amostra (3 de %d registros):\n%s",
-			nRows, strings.Join(cols, ", "), nRows, nRows, sample,
-		)
-		log.Printf("[JARVIS] large result bypass: rows=%d", nRows)
-	}
-
 	// 11) Generate the answer with the primary LLM (with retry and fallback).
 	answer, err := s.LLM.AnswerWithRetry(
 		questionForLLM, threadHist, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images,
@@ -515,16 +550,11 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	)
 	if err != nil || strings.TrimSpace(answer) == "" {
 		log.Printf("[ERR] llmAnswer failed: %v", err)
-		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, decision.NeedJira, jiraIssuesFound, "")
+		answer = buildInformativeFallback(executedSlackSearch, slackMatches, executedJiraSearch, jiraIssuesFound, "")
 	}
 	answer = strings.TrimSpace(answer)
 	if answer == "" {
-		answer = buildInformativeFallback(decision.NeedSlack, slackMatches, decision.NeedJira, jiraIssuesFound, "")
-	}
-
-	// Append CSV download link when a file was generated.
-	if csvDownloadLine != "" {
-		answer += csvDownloadLine
+		answer = buildInformativeFallback(executedSlackSearch, slackMatches, executedJiraSearch, jiraIssuesFound, "")
 	}
 
 	// Append Outline source links when documentation was used.
@@ -582,12 +612,43 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	return nil
 }
 
-// containsStr reports whether s is present in the slice.
-func containsStr(slice []string, s string) bool {
-	for _, v := range slice {
-		if v == s {
+// splitActions partitions actions into handler actions (reply directly, no busy
+// placeholder) and context actions (feed into the answer LLM).
+func splitActions(actions []llm.ActionDescriptor) (handlers, context []llm.ActionDescriptor) {
+	for _, a := range actions {
+		switch a.Kind {
+		case llm.ActionJiraCreate, llm.ActionJiraEdit:
+			handlers = append(handlers, a)
+		default:
+			context = append(context, a)
+		}
+	}
+	return
+}
+
+// containsKind reports whether any action in the slice has the given kind.
+func containsKind(actions []llm.ActionDescriptor, kind string) bool {
+	for _, a := range actions {
+		if a.Kind == kind {
 			return true
 		}
 	}
 	return false
+}
+
+// actionKinds extracts the Kind strings from a slice of ActionDescriptors for logging.
+func actionKinds(actions []llm.ActionDescriptor) []string {
+	kinds := make([]string, len(actions))
+	for i, a := range actions {
+		kinds[i] = a.Kind
+	}
+	return kinds
+}
+
+// fallbackActions returns the default action set when DecideActions fails.
+func fallbackActions(hasThreadPermalink bool) []llm.ActionDescriptor {
+	if hasThreadPermalink {
+		return nil // thread content is already the context
+	}
+	return []llm.ActionDescriptor{{Kind: llm.ActionJiraSearch, JiraIntent: "default"}}
 }
