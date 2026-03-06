@@ -55,21 +55,21 @@ type PostMessageRequest struct {
 }
 
 // MessageTracker keeps a mapping from originTs (the user's triggering message)
-// to botTs (the bot's reply) so that when a user deletes their message, the bot
-// can delete its own reply automatically.
+// to one or more bot reply timestamps so that when a user deletes their message,
+// the bot can delete ALL of its replies automatically (including multi-chunk long replies).
 type MessageTracker struct {
 	mu   sync.RWMutex
-	data map[string]string // key: channel+":"+originTs → botTs
+	data map[string][]string // key: channel+":"+originTs → []botTs
 }
 
 // NewMessageTracker constructs an empty MessageTracker.
 func NewMessageTracker() *MessageTracker {
-	return &MessageTracker{data: make(map[string]string)}
+	return &MessageTracker{data: make(map[string][]string)}
 }
 func key(channel, originTs string) string { return channel + ":" + originTs }
 
-// Get returns the bot reply ts for a given origin message, or "" if not found.
-func (t *MessageTracker) Get(channel, originTs string) string {
+// GetAll returns all bot reply timestamps for a given origin message.
+func (t *MessageTracker) GetAll(channel, originTs string) []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.data[key(channel, originTs)]
@@ -82,10 +82,12 @@ func (t *MessageTracker) Delete(channel, originTs string) {
 	t.mu.Unlock()
 }
 
-// Track records that botTs is the bot reply to the user message at originTs.
+// Track appends botTs to the list of bot replies for the user message at originTs.
+// Multiple calls accumulate all reply timestamps so every chunk can be deleted.
 func (t *MessageTracker) Track(channel, originTs, botTs string) {
 	t.mu.Lock()
-	t.data[key(channel, originTs)] = botTs
+	k := key(channel, originTs)
+	t.data[k] = append(t.data[k], botTs)
 	t.mu.Unlock()
 }
 
