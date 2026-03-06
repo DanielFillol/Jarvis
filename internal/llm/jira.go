@@ -9,65 +9,6 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/jira"
 )
 
-// DetectJiraActions returns the list of Jira-related actions required by the
-// message, performing a single LLM call.  Possible values are "jira_create"
-// (create a new issue), "jira_edit" (edit an existing issue), or both when
-// the message requests multiple operations (e.g. "crie um card e atribua para X").
-// Returns an empty slice when neither action is needed.
-func (c *Client) DetectJiraActions(question, threadHistory, lesserModel, primaryModel string) []string {
-	threadSection := ""
-	if t := strings.TrimSpace(threadHistory); t != "" {
-		threadSection = fmt.Sprintf("\nContexto da conversa:\n%s\n", clip(t, 2000))
-	}
-	prompt := fmt.Sprintf(`Você é um classificador de intenção para ações no Jira.
-Analise a mensagem do usuário e retorne um JSON array com as ações necessárias.
-
-Ações possíveis:
-- "jira_create": criar um novo card/issue/ticket no Jira agora
-- "jira_edit": editar um card existente (mudar status, atribuir, atualizar campos, mover para sprint)
-
-Uma única mensagem pode exigir várias ações. Exemplos:
-- "crie um card de bug e adicione para o João" → ["jira_create", "jira_edit"]
-- "crie um card no transportador" → ["jira_create"]
-- "feche o card TPTDR-123" → ["jira_edit"]
-- "mude o status do TPTDR-99 e crie um card de acompanhamento" → ["jira_create", "jira_edit"]
-- "qual é o roadmap?" → []
-- "faça um resumo da thread" → []
-
-Regras:
-- "jira_create": verbo de criação EXPLÍCITO (criar/cria/abre/abrir/gera/gerar) + tipo de issue
-- "jira_edit": mudar status, atribuir, alterar campos, mover para sprint, ou mencionar "adicione para", "atribua", "assign"
-- Hipóteses ("estou pensando em criar") → []
-- Negações ("não quero criar") → []
-- Se houver criação + atribuição na mesma mensagem → ["jira_create", "jira_edit"]
-
-Retorne APENAS um JSON array válido, sem markdown. Exemplos de resposta: [] ou ["jira_create"] ou ["jira_create", "jira_edit"]
-%s
-Mensagem: %q`, threadSection, question)
-
-	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
-	model := strings.TrimSpace(lesserModel)
-	if model == "" {
-		model = primaryModel
-	}
-	out, err := c.Chat(messages, model, 0, 50)
-	if err != nil && model != primaryModel {
-		out, err = c.Chat(messages, primaryModel, 0, 50)
-	}
-	if err != nil {
-		log.Printf("[LLM] detectJiraActions error: %v — defaulting []", err)
-		return nil
-	}
-	out = strings.TrimSpace(stripCodeFences(out))
-	var actions []string
-	if err := json.Unmarshal([]byte(out), &actions); err != nil {
-		log.Printf("[LLM] detectJiraActions bad json: %v raw=%q", err, preview(out, 80))
-		return nil
-	}
-	log.Printf("[LLM] detectJiraActions=%v raw=%q", actions, preview(out, 80))
-	return actions
-}
-
 // ConfirmJiraCreateIntent calls the LLM to verify whether the message
 // genuinely intends to create a Jira issue right now.  threadHistory provides
 // prior conversation context so the LLM can distinguish immediate commands
