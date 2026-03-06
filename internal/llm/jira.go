@@ -9,6 +9,65 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/jira"
 )
 
+// DetectJiraActions returns the list of Jira-related actions required by the
+// message, performing a single LLM call.  Possible values are "jira_create"
+// (create a new issue), "jira_edit" (edit an existing issue), or both when
+// the message requests multiple operations (e.g. "crie um card e atribua para X").
+// Returns an empty slice when neither action is needed.
+func (c *Client) DetectJiraActions(question, threadHistory, lesserModel, primaryModel string) []string {
+	threadSection := ""
+	if t := strings.TrimSpace(threadHistory); t != "" {
+		threadSection = fmt.Sprintf("\nContexto da conversa:\n%s\n", clip(t, 2000))
+	}
+	prompt := fmt.Sprintf(`Você é um classificador de intenção para ações no Jira.
+Analise a mensagem do usuário e retorne um JSON array com as ações necessárias.
+
+Ações possíveis:
+- "jira_create": criar um novo card/issue/ticket no Jira agora
+- "jira_edit": editar um card existente (mudar status, atribuir, atualizar campos, mover para sprint)
+
+Uma única mensagem pode exigir várias ações. Exemplos:
+- "crie um card de bug e adicione para o João" → ["jira_create", "jira_edit"]
+- "crie um card no transportador" → ["jira_create"]
+- "feche o card TPTDR-123" → ["jira_edit"]
+- "mude o status do TPTDR-99 e crie um card de acompanhamento" → ["jira_create", "jira_edit"]
+- "qual é o roadmap?" → []
+- "faça um resumo da thread" → []
+
+Regras:
+- "jira_create": verbo de criação EXPLÍCITO (criar/cria/abre/abrir/gera/gerar) + tipo de issue
+- "jira_edit": mudar status, atribuir, alterar campos, mover para sprint, ou mencionar "adicione para", "atribua", "assign"
+- Hipóteses ("estou pensando em criar") → []
+- Negações ("não quero criar") → []
+- Se houver criação + atribuição na mesma mensagem → ["jira_create", "jira_edit"]
+
+Retorne APENAS um JSON array válido, sem markdown. Exemplos de resposta: [] ou ["jira_create"] ou ["jira_create", "jira_edit"]
+%s
+Mensagem: %q`, threadSection, question)
+
+	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
+	model := strings.TrimSpace(lesserModel)
+	if model == "" {
+		model = primaryModel
+	}
+	out, err := c.Chat(messages, model, 0, 50)
+	if err != nil && model != primaryModel {
+		out, err = c.Chat(messages, primaryModel, 0, 50)
+	}
+	if err != nil {
+		log.Printf("[LLM] detectJiraActions error: %v — defaulting []", err)
+		return nil
+	}
+	out = strings.TrimSpace(stripCodeFences(out))
+	var actions []string
+	if err := json.Unmarshal([]byte(out), &actions); err != nil {
+		log.Printf("[LLM] detectJiraActions bad json: %v raw=%q", err, preview(out, 80))
+		return nil
+	}
+	log.Printf("[LLM] detectJiraActions=%v raw=%q", actions, preview(out, 80))
+	return actions
+}
+
 // ConfirmJiraCreateIntent calls the LLM to verify whether the message
 // genuinely intends to create a Jira issue right now.  threadHistory provides
 // prior conversation context so the LLM can distinguish immediate commands
@@ -219,6 +278,7 @@ Mensagem: %q
 Retorne JSON exatamente neste formato (deixe campos vazios/null quando não mencionados):
 {
   "issue_key": "",
+  "additional_issue_keys": [],
   "target_status": "",
   "assignee_name": "",
   "parent_key": "",
@@ -226,11 +286,13 @@ Retorne JSON exatamente neste formato (deixe campos vazios/null quando não menc
   "description": "",
   "priority": "",
   "labels": [],
-  "target_sprint": ""
+  "target_sprint": "",
+  "generate_description": false
 }
 
 Regras:
-- issue_key: chave do card (ex: TPTDR-522). Obrigatório.
+- issue_key: chave do PRIMEIRO card mencionado (ex: TPTDR-522). Obrigatório. Use o contexto da conversa para inferir a chave completa quando o usuário mencionar apenas o número (ex: "card 521" → "TPTDR-521").
+- additional_issue_keys: array com os demais cards quando o usuário mencionar múltiplos (ex: "faça o mesmo para o 509", "e também o 512"). Mesmas regras de inferência de chave do issue_key. Array vazio quando houver apenas um card.
 - target_sprint: preencha quando o usuário quiser mover para uma sprint.
   Use exatamente um destes valores:
   "current" → sprint atual/corrente/ativa
@@ -246,7 +308,11 @@ Regras:
   Vazio SOMENTE se nenhuma mudança de status for pedida.
 - assignee_name: nome do assignee. Use "@me" quando o usuário disser "para mim", "a mim", "me atribuir". Vazio se não mencionado.
 - parent_key: chave do card pai (ex: TPTDR-100). Vazio se não mencionado.
-- summary/description/priority/labels: só preencha quando explicitamente pedido.
+- summary/description/priority/labels: só preencha quando o usuário fornecer o texto EXPLICITAMENTE.
+- generate_description: true em DOIS casos:
+  1. O usuário pede que o bot ESCREVA, GERE, CRIE ou DOCUMENTE a descrição/história/story sem fornecer o texto final (ex: "escreva a história", "documente esse card", "crie a descrição", "escreva o que é necessário").
+  2. O usuário fornece CONTEXTO/REQUISITOS por card (ex: "O 521: hoje temos dois campos... O 509: o problema é que...") — quando o usuário passa o contexto/problema mas não o texto formatado da descrição Jira. Nesse caso o bot usa esse contexto + histórico da thread para gerar a descrição de cada card.
+  Em ambos os casos, deixe "description" vazio — o bot vai gerar o conteúdo individualmente por card.
 - priority em português (ex: alta, média, baixa, crítica) deve ser mantida como está — a conversão ocorre depois.
 - labels: array de strings, vazio [] quando não mencionado.`, threadSection, senderLine, question)
 
@@ -268,6 +334,63 @@ Regras:
 	req.Description = strings.TrimSpace(req.Description)
 	req.Priority = strings.TrimSpace(req.Priority)
 	return req, nil
+}
+
+// GenerateIssueDescription uses the LLM to write a description for an existing
+// Jira issue based on the user instruction and thread history.
+// issueKey, issueType, and currentSummary provide context about the card.
+// currentDesc may be empty or contain an existing (possibly thin) description.
+func (c *Client) GenerateIssueDescription(issueKey, issueType, currentSummary, currentDesc, instruction, threadHistory, model string) (string, error) {
+	system := `Você é um Product Manager sênior especializado em escrever issues Jira de alta qualidade.
+Escreva uma descrição completa e bem estruturada para o card indicado.
+Retorne APENAS o texto da descrição em markdown. Não inclua o título nem metadados do card.`
+
+	currentDescBlock := ""
+	if strings.TrimSpace(currentDesc) != "" {
+		currentDescBlock = fmt.Sprintf("\nDescrição atual do card (use como base, expanda se necessário):\n%s\n", clip(currentDesc, 1000))
+	}
+
+	threadBlock := ""
+	if t := strings.TrimSpace(threadHistory); t != "" {
+		threadBlock = fmt.Sprintf("\nContexto da conversa (use para entender o que o card deve resolver):\n%s\n", clip(t, 3000))
+	}
+
+	structureHint := ""
+	switch strings.ToLower(strings.TrimSpace(issueType)) {
+	case "história", "historia", "story", "história (story)":
+		structureHint = "## Contexto\n## Objetivo\n## Escopo (MVP)\n## Critérios de aceitação (lista \"- [ ] ...\")"
+	case "bug":
+		structureHint = "## Contexto\n## Evidências\n## Ambiente / Onde ocorreu\n## Passos para reproduzir\n## Resultado atual\n## Resultado esperado\n## Impacto"
+	case "epic", "épico", "épico (epic)":
+		structureHint = "## Contexto\n## Objetivo\n## Escopo (MVP)\n## Fora de escopo\n## KPIs\n## Fluxos-chave\n## Requisitos não-funcionais\n## Riscos\n## DoD"
+	default:
+		structureHint = "## Contexto\n## Problema\n## Impacto\n## Critérios de aceite"
+	}
+
+	user := fmt.Sprintf(`Card: %s (%s)
+Título: %s
+%s%s
+Instrução do usuário: %s
+
+Escreva a descrição completa seguindo esta estrutura:
+%s
+
+Regras:
+- Use markdown. Seções como ## Contexto, ## Critérios de aceitação, etc.
+- NÃO invente fatos. Se faltar informação escreva "A confirmar:" seguido de bullets.
+- Critérios de aceitação como checkboxes: - [ ] ...
+- Seja objetivo e claro.`,
+		issueKey, issueType, currentSummary, currentDescBlock, threadBlock, instruction, structureHint)
+
+	messages := []OpenAIMessage{
+		{Role: "system", Content: system},
+		{Role: "user", Content: user},
+	}
+	out, err := c.Chat(messages, model, 0.3, 1500)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
 }
 
 // PickBestSprintByName selects the sprint ID from candidates that best matches
