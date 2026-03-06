@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DanielFillol/Jarvis/internal/jira"
@@ -15,19 +16,23 @@ import (
 
 // maybeHandleJiraEditFlows handles requests to edit existing Jira issues:
 // transition status, assign, update fields, and set parent.
-func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist string) (bool, error) {
+// overrideIssueKey, when non-empty, is used as the target issue key instead of
+// extracting it from the message (used when a card was just created in the same turn).
+// intentConfirmed skips the ConfirmJiraEditIntent LLM call when the caller has
+// already verified the intent via DetectJiraActions.
+func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist, overrideIssueKey string, intentConfirmed bool) (bool, error) {
 	// Strip Slack markup (permalinks, mentions) so the LLM sees clean text.
 	cleanQ := s.Slack.ResolveUserMentions(parse.StripSlackPermalinks(question))
 
 	if !s.Cfg.JiraCreateEnabled {
-		if s.LLM.ConfirmJiraEditIntent(cleanQ, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
+		if intentConfirmed || s.LLM.ConfirmJiraEditIntent(cleanQ, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
 			_ = s.Slack.PostMessage(channel, threadTs, "Edição de issues no Jira está desabilitada.")
 			return true, nil
 		}
 		return false, nil
 	}
 
-	if !s.LLM.ConfirmJiraEditIntent(cleanQ, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
+	if !intentConfirmed && !s.LLM.ConfirmJiraEditIntent(cleanQ, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
 		return false, nil
 	}
 
@@ -39,27 +44,95 @@ func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, ques
 		return true, nil
 	}
 
+	// When a card was just created in the same turn, use that key directly.
+	if overrideIssueKey != "" {
+		req.IssueKey = overrideIssueKey
+		req.AdditionalIssueKeys = nil // override applies to the newly created card only
+	}
+
 	if req.IssueKey == "" {
 		_ = s.Slack.PostMessage(channel, threadTs, "Não consegui identificar o número do card. Informe a chave (ex: TPTDR-522).")
 		return true, nil
 	}
 
-	log.Printf("[JARVIS] jiraEdit key=%s targetStatus=%q assignee=%q parent=%q priority=%q summary=%q labels=%v",
-		req.IssueKey, req.TargetStatus, req.AssigneeName, req.ParentKey, req.Priority, req.Summary, req.Labels)
+	allKeys := append([]string{req.IssueKey}, req.AdditionalIssueKeys...)
+	log.Printf("[JARVIS] jiraEdit keys=%v targetStatus=%q assignee=%q parent=%q priority=%q summary=%q labels=%v generateDesc=%v",
+		allKeys, req.TargetStatus, req.AssigneeName, req.ParentKey, req.Priority, req.Summary, req.Labels, req.GenerateDescription)
 
 	base := strings.TrimRight(s.Cfg.JiraBaseURL, "/")
-	link := base + "/browse/" + req.IssueKey
+
+	// Process all cards in parallel — each may require LLM generation (~10s).
+	type result struct {
+		idx   int
+		key   string
+		lines []string
+	}
+	results := make([]result, len(allKeys))
+	var wg sync.WaitGroup
+	for i, key := range allKeys {
+		wg.Add(1)
+		go func(i int, key string) {
+			defer wg.Done()
+			lines := s.applyJiraEditToIssue(key, req, senderName, cleanQ, threadHist)
+			results[i] = result{idx: i, key: key, lines: lines}
+		}(i, key)
+	}
+	wg.Wait()
+
+	var parts []string
+	for _, r := range results {
+		if len(r.lines) == 0 {
+			parts = append(parts, fmt.Sprintf("*%s*: nenhuma alteração aplicada.", r.key))
+		} else {
+			link := base + "/browse/" + r.key
+			parts = append(parts, fmt.Sprintf("*%s* atualizado:\n%s\n%s", r.key, strings.Join(r.lines, "\n"), link))
+		}
+	}
+	_ = s.Slack.PostMessage(channel, threadTs, strings.Join(parts, "\n\n"))
+	return true, nil
+}
+
+// applyJiraEditToIssue applies all edits from req to a single issueKey and
+// returns human-readable result lines.  When req.GenerateDescription is true
+// and req.Description is empty, the description is generated via LLM using
+// the individual card context.
+func (s *Service) applyJiraEditToIssue(issueKey string, req jira.EditRequest, senderName, cleanQ, threadHist string) []string {
 	var results []string
+
+	// Resolve generated description per card (each card gets its own content).
+	description := req.Description
+	if req.GenerateDescription && description == "" {
+		issue, err := s.Jira.GetIssue(issueKey)
+		if err != nil {
+			log.Printf("[JARVIS] GenerateDescription GetIssue %s: %v", issueKey, err)
+			results = append(results, fmt.Sprintf("⚠️ Não consegui buscar o card para gerar descrição: %v", err))
+			return results
+		}
+		generated, err := s.LLM.GenerateIssueDescription(
+			issueKey,
+			issue.Fields.IssueType.Name,
+			issue.Fields.Summary,
+			issue.RenderedFields.Description,
+			cleanQ,
+			threadHist,
+			s.Cfg.OpenAIModel,
+		)
+		if err != nil {
+			log.Printf("[JARVIS] GenerateIssueDescription %s: %v", issueKey, err)
+			results = append(results, fmt.Sprintf("⚠️ Não consegui gerar a descrição: %v", err))
+			return results
+		}
+		description = generated
+		log.Printf("[JARVIS] GenerateIssueDescription %s generated len=%d", issueKey, len(generated))
+	}
 
 	// Transition (multi-step: chains through intermediates if needed)
 	if req.TargetStatus != "" {
-		finalStatus, steps, err := s.transitionToStatus(req.IssueKey, req.TargetStatus)
+		finalStatus, steps, err := s.transitionToStatus(issueKey, req.TargetStatus)
 		if err != nil {
-			log.Printf("[JARVIS] transitionToStatus %s → %q: %v", req.IssueKey, req.TargetStatus, err)
-			_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Não consegui transicionar o card %s: %v", req.IssueKey, err))
-			return true, nil
-		}
-		if len(steps) > 1 {
+			log.Printf("[JARVIS] transitionToStatus %s → %q: %v", issueKey, req.TargetStatus, err)
+			results = append(results, fmt.Sprintf("⚠️ Não consegui transicionar: %v", err))
+		} else if len(steps) > 1 {
 			results = append(results, fmt.Sprintf("✅ Status alterado para *%s* (via: %s)", finalStatus, strings.Join(steps, " → ")))
 		} else if len(steps) == 1 {
 			results = append(results, fmt.Sprintf("✅ Status alterado para *%s*", finalStatus))
@@ -74,17 +147,17 @@ func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, ques
 		if req.AssigneeName == "@me" {
 			searchName = senderName
 		}
-		users, err := s.Jira.SearchAssignableUsers(req.IssueKey, searchName, 5)
+		users, err := s.Jira.SearchAssignableUsers(issueKey, searchName, 5)
 		if err != nil {
-			log.Printf("[JARVIS] SearchAssignableUsers %s query=%q: %v", req.IssueKey, searchName, err)
+			log.Printf("[JARVIS] SearchAssignableUsers %s query=%q: %v", issueKey, searchName, err)
 			results = append(results, fmt.Sprintf("⚠️ Não consegui buscar usuários para *%s*: %v", searchName, err))
 		} else {
 			user := pickBestUser(users, searchName)
 			if user == nil {
-				results = append(results, fmt.Sprintf("⚠️ Usuário *%s* não encontrado como assignável no card %s", searchName, req.IssueKey))
-			} else if err := s.Jira.AssignIssue(req.IssueKey, user.AccountID); err != nil {
-				log.Printf("[JARVIS] AssignIssue %s → %s: %v", req.IssueKey, user.AccountID, err)
-				results = append(results, fmt.Sprintf("⚠️ Não consegui atribuir o card a *%s*: %v", user.DisplayName, err))
+				results = append(results, fmt.Sprintf("⚠️ Usuário *%s* não encontrado como assignável", searchName))
+			} else if err := s.Jira.AssignIssue(issueKey, user.AccountID); err != nil {
+				log.Printf("[JARVIS] AssignIssue %s → %s: %v", issueKey, user.AccountID, err)
+				results = append(results, fmt.Sprintf("⚠️ Não consegui atribuir a *%s*: %v", user.DisplayName, err))
 			} else {
 				results = append(results, fmt.Sprintf("✅ Atribuído a *%s*", user.DisplayName))
 			}
@@ -94,8 +167,8 @@ func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, ques
 	// Set parent
 	if req.ParentKey != "" {
 		fields := map[string]any{"parent": map[string]any{"key": req.ParentKey}}
-		if err := s.Jira.UpdateIssue(req.IssueKey, fields); err != nil {
-			log.Printf("[JARVIS] SetParent %s → %s: %v", req.IssueKey, req.ParentKey, err)
+		if err := s.Jira.UpdateIssue(issueKey, fields); err != nil {
+			log.Printf("[JARVIS] SetParent %s → %s: %v", issueKey, req.ParentKey, err)
 			results = append(results, fmt.Sprintf("⚠️ Não consegui definir o pai como *%s*: %v", req.ParentKey, err))
 		} else {
 			results = append(results, fmt.Sprintf("✅ Pai definido como *%s*", req.ParentKey))
@@ -107,8 +180,8 @@ func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, ques
 	if req.Summary != "" {
 		updateFields["summary"] = req.Summary
 	}
-	if req.Description != "" {
-		updateFields["description"] = jira.TextToADF(req.Description)
+	if description != "" {
+		updateFields["description"] = jira.TextToADF(description)
 	}
 	if req.Priority != "" {
 		updateFields["priority"] = map[string]any{"name": normalizePriority(req.Priority)}
@@ -117,15 +190,16 @@ func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, ques
 		updateFields["labels"] = req.Labels
 	}
 	if len(updateFields) > 0 {
-		if err := s.Jira.UpdateIssue(req.IssueKey, updateFields); err != nil {
-			log.Printf("[JARVIS] UpdateIssue %s fields: %v", req.IssueKey, err)
+		log.Printf("[JARVIS] UpdateIssue %s fields=%v", issueKey, fieldKeys(updateFields))
+		if err := s.Jira.UpdateIssue(issueKey, updateFields); err != nil {
+			log.Printf("[JARVIS] UpdateIssue %s FAILED: %v", issueKey, err)
 			results = append(results, fmt.Sprintf("⚠️ Não consegui atualizar campos: %v", err))
 		} else {
 			var changed []string
 			if req.Summary != "" {
 				changed = append(changed, "summary")
 			}
-			if req.Description != "" {
+			if description != "" {
 				changed = append(changed, "description")
 			}
 			if req.Priority != "" {
@@ -140,25 +214,19 @@ func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, ques
 
 	// Move to sprint
 	if req.TargetSprint != "" {
-		sprint, err := s.resolveTargetSprint(req.IssueKey, req.TargetSprint)
+		sprint, err := s.resolveTargetSprint(issueKey, req.TargetSprint)
 		if err != nil {
-			log.Printf("[JARVIS] resolveTargetSprint %s target=%q: %v", req.IssueKey, req.TargetSprint, err)
+			log.Printf("[JARVIS] resolveTargetSprint %s target=%q: %v", issueKey, req.TargetSprint, err)
 			results = append(results, fmt.Sprintf("⚠️ Não consegui resolver a sprint: %v", err))
-		} else if err := s.Jira.MoveIssueToSprint(sprint.ID, req.IssueKey); err != nil {
-			log.Printf("[JARVIS] MoveIssueToSprint %s → sprint %d: %v", req.IssueKey, sprint.ID, err)
+		} else if err := s.Jira.MoveIssueToSprint(sprint.ID, issueKey); err != nil {
+			log.Printf("[JARVIS] MoveIssueToSprint %s → sprint %d: %v", issueKey, sprint.ID, err)
 			results = append(results, fmt.Sprintf("⚠️ Não consegui mover para a sprint *%s*: %v", sprint.Name, err))
 		} else {
 			results = append(results, fmt.Sprintf("✅ Movido para a sprint *%s*", sprint.Name))
 		}
 	}
 
-	if len(results) == 0 {
-		_ = s.Slack.PostMessage(channel, threadTs, "Nenhuma alteração foi aplicada.")
-		return true, nil
-	}
-	msg := fmt.Sprintf("*%s* atualizado:\n%s\n%s", req.IssueKey, strings.Join(results, "\n"), link)
-	_ = s.Slack.PostMessage(channel, threadTs, msg)
-	return true, nil
+	return results
 }
 
 // transitionToStatus moves issueKey toward desiredStatus, chaining through
@@ -307,6 +375,15 @@ func pickBestUser(users []jira.JiraUser, query string) *jira.JiraUser {
 	return nil
 }
 
+// fieldKeys returns the map keys for logging purposes.
+func fieldKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // normalizePriority maps Portuguese priority names to Jira English names.
 func normalizePriority(p string) string {
 	switch strings.ToLower(strings.TrimSpace(p)) {
@@ -325,14 +402,26 @@ func normalizePriority(p string) string {
 	}
 }
 
+// jiraCreateResult holds the outcome of maybeHandleJiraCreateFlows.
+type jiraCreateResult struct {
+	// Handled is true when the create flow consumed the message (even if creation
+	// was skipped due to missing fields or disabled config).
+	Handled bool
+	// CreatedKey is the Jira issue key of the newly created card (e.g. "TPTDR-526").
+	// Empty when the card was not created in this turn (pending state, disabled, etc.).
+	CreatedKey string
+}
+
 // maybeHandleJiraCreateFlows orchestrates the state machine for Jira creation commands.
-func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, originalText, question, threadHist string) (bool, error) {
+// intentConfirmed skips the ConfirmJiraCreateIntent LLM call when the caller has
+// already verified the intent via DetectJiraActions.
+func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, originalText, question, threadHist string, intentConfirmed bool) (jiraCreateResult, error) {
 	if !s.Cfg.JiraCreateEnabled {
-		if s.LLM.ConfirmJiraCreateIntent(question, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
+		if intentConfirmed || s.LLM.ConfirmJiraCreateIntent(question, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
 			_ = s.Slack.PostMessage(channel, threadTs, "Criação de issues no Jira está desabilitada.")
-			return true, nil
+			return jiraCreateResult{Handled: true}, nil
 		}
-		return false, nil
+		return jiraCreateResult{}, nil
 	}
 
 	// 1. Check for a pending draft first — a previous turn asked for missing fields.
@@ -340,11 +429,11 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 	//    and try to fill in what was missing.
 	if pending := s.Store.Load(channel, threadTs); pending != nil {
 		log.Printf("[JARVIS] pending Jira draft found for thread=%s, re-extracting", threadTs)
-		draft, err := s.LLM.ExtractIssueFromThread(threadHist, pending.OriginalText, s.Cfg.OpenAIModel, nil, s.Cfg.JiraProjectNameMap)
-		if err != nil {
-			_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Não consegui interpretar o card: %v", err))
+		draft, extractErr := s.LLM.ExtractIssueFromThread(threadHist, pending.OriginalText, s.Cfg.OpenAIModel, nil, s.Cfg.JiraProjectNameMap)
+		if extractErr != nil {
+			_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Não consegui interpretar o card: %v", extractErr))
 			s.Store.Delete(channel, threadTs)
-			return true, nil
+			return jiraCreateResult{Handled: true}, nil
 		}
 		if missing := missingFields(draft); len(missing) > 0 {
 			// Still missing — update store and ask again.
@@ -353,23 +442,24 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 				OriginTs: pending.OriginTs, OriginalText: pending.OriginalText, Draft: draft,
 			})
 			_ = s.Slack.PostMessage(channel, threadTs, askForMissingFields(missing))
-			return true, nil
+			return jiraCreateResult{Handled: true}, nil
 		}
 		s.Store.Delete(channel, threadTs)
 		s.appendSlackOrigin(&draft, channel, threadTs, pending.OriginTs, pending.OriginalText)
-		return true, s.createIssueAndReply(channel, threadTs, draft)
+		key, createErr := s.createIssueAndReply(channel, threadTs, draft)
+		return jiraCreateResult{Handled: true, CreatedKey: key}, createErr
 	}
 
 	// 2. Detect new Jira create intent.
-	if !s.LLM.ConfirmJiraCreateIntent(question, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
-		return false, nil
+	if !intentConfirmed && !s.LLM.ConfirmJiraCreateIntent(question, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
+		return jiraCreateResult{}, nil
 	}
 
 	// 3. Extract draft using the primary model for better accuracy.
-	draft, err := s.LLM.ExtractIssueFromThread(threadHist, question, s.Cfg.OpenAIModel, nil, s.Cfg.JiraProjectNameMap)
-	if err != nil {
-		_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Não consegui entender o card a partir da thread: %v", err))
-		return true, nil
+	draft, extractErr := s.LLM.ExtractIssueFromThread(threadHist, question, s.Cfg.OpenAIModel, nil, s.Cfg.JiraProjectNameMap)
+	if extractErr != nil {
+		_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Não consegui entender o card a partir da thread: %v", extractErr))
+		return jiraCreateResult{Handled: true}, nil
 	}
 
 	// 4. If essential fields are missing, ask the user and save state.
@@ -381,12 +471,13 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 			Draft: draft,
 		})
 		_ = s.Slack.PostMessage(channel, threadTs, askForMissingFields(missing))
-		return true, nil
+		return jiraCreateResult{Handled: true}, nil
 	}
 
 	// 5. All fields present — create the card.
 	s.appendSlackOrigin(&draft, channel, threadTs, originTs, originalText)
-	return true, s.createIssueAndReply(channel, threadTs, draft)
+	key, createErr := s.createIssueAndReply(channel, threadTs, draft)
+	return jiraCreateResult{Handled: true, CreatedKey: key}, createErr
 }
 
 // fetchExampleIssues is a helper that fetches real Jira cards from the same project/type
@@ -436,26 +527,27 @@ func (s *Service) appendSlackOrigin(d *jira.IssueDraft, channel, threadTs, origi
 
 // createIssueAndReply creates a Jira issue via the Jira client, posts a
 // confirmation message to Slack, and attaches any images or videos found in
-// the thread to the newly created issue.
-func (s *Service) createIssueAndReply(channel, threadTs string, d jira.IssueDraft) error {
+// the thread to the newly created issue.  Returns the key of the created issue
+// (e.g. "TPTDR-526") so callers can chain further operations on the same card.
+func (s *Service) createIssueAndReply(channel, threadTs string, d jira.IssueDraft) (string, error) {
 	d.Project = strings.TrimSpace(d.Project)
 	d.IssueType = strings.TrimSpace(d.IssueType)
 	d.Summary = strings.TrimSpace(d.Summary)
 	d.Description = strings.TrimSpace(d.Description)
 	if d.Project == "" || d.IssueType == "" {
 		_ = s.Slack.PostMessage(channel, threadTs, missingFieldsMsg(d, d.Project == "", d.IssueType == ""))
-		return nil
+		return "", nil
 	}
 	created, err := s.Jira.CreateIssue(d)
 	if err != nil {
 		_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Não consegui criar o card no Jira: %v", err))
-		return nil
+		return "", nil
 	}
 	base := strings.TrimRight(s.Cfg.JiraBaseURL, "/")
 	link := base + "/browse/" + created.Key
 	_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Card criado ✅ *%s*\n%s", created.Key, link))
 	s.attachThreadMediaToIssue(created.Key, channel, threadTs)
-	return nil
+	return created.Key, nil
 }
 
 // attachThreadMediaToIssue fetches all files from the Slack thread and uploads
