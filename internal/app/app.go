@@ -18,6 +18,15 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/state"
 )
 
+// pendingReply holds the message chunks for a long answer awaiting confirmation
+// together with the originTs of the original question that triggered the answer.
+// Storing originalOriginTs allows all posted chunks to be tracked for deletion
+// cascade even when the user confirms with a separate "sim" message.
+type pendingReply struct {
+	chunks           []string
+	originalOriginTs string
+}
+
 // Service encapsulates the core orchestration logic of Jarvis.  It
 // coordinates between Slack, Jira, Metabase, and the language model to answer
 // questions and handle issue creation flows.  The Service does not depend on
@@ -38,8 +47,8 @@ type Service struct {
 	// contain the full LLM response (which may be truncated by Slack).
 	threadLastSQL sync.Map
 
-	// pendingReplies maps "channel:threadTs" → []string (message chunks) for
-	// long answers awaiting user confirmation before being posted to the thread.
+	// pendingReplies maps "channel:threadTs" → pendingReply for long answers
+	// awaiting user confirmation before being posted to the thread.
 	pendingReplies sync.Map
 
 	Store      state.Store
@@ -90,7 +99,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		}
 		pendingKey := contextChannel + ":" + pendingKeyTs
 		if raw, ok := s.pendingReplies.Load(pendingKey); ok {
-			chunks := raw.([]string)
+			pr := raw.(pendingReply)
 			if isLongReplyCancellation(question) {
 				s.pendingReplies.Delete(pendingKey)
 				_ = s.Slack.PostMessage(channel, threadTs, "Ok, resposta cancelada.")
@@ -99,12 +108,17 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			}
 			if isLongReplyConfirmation(question) {
 				s.pendingReplies.Delete(pendingKey)
-				for i, chunk := range chunks {
-					if postErr := s.Slack.PostMessage(channel, threadTs, chunk); postErr != nil {
-						log.Printf("[ERR] long reply chunk %d/%d: %v", i+1, len(chunks), postErr)
+				for i, chunk := range pr.chunks {
+					chunkTs, postErr := s.Slack.PostMessageAndGetTS(channel, threadTs, chunk)
+					if postErr != nil {
+						log.Printf("[ERR] long reply chunk %d/%d: %v", i+1, len(pr.chunks), postErr)
+					} else if chunkTs != "" {
+						// Track each chunk against the original question so deleting it
+						// removes all reply chunks from the thread.
+						s.Slack.Tracker.Track(channel, pr.originalOriginTs, chunkTs)
 					}
 				}
-				log.Printf("[JARVIS] long reply confirmed, posted %d chunks dur=%s", len(chunks), time.Since(start))
+				log.Printf("[JARVIS] long reply confirmed, posted %d chunks dur=%s", len(pr.chunks), time.Since(start))
 				return nil
 			}
 			// Not a clear yes/no — discard pending and process as a new question.
@@ -131,17 +145,53 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		return s.handleIntroRequest(channel, threadTs, originTs)
 	}
 
-	// 4) High-priority: Jira creation flows (always use the original thread).
-	handled, err := s.maybeHandleJiraCreateFlows(channel, threadTs, originTs, originalText, question, threadHist)
-	if handled {
-		log.Printf("[JARVIS] jiraCreateFlow handled dur=%s", time.Since(start))
-		return err
-	}
+	// 4) Jira action flows: detect all required actions in a single LLM call so
+	// a message like "crie um card e adicione para X" runs both flows in sequence.
+	{
+		// Detect all Jira actions needed (create, edit, or both).
+		// The pending-issue state machine inside the create flow may activate
+		// independently of intent detection, so we also check the store.
+		hasPending := s.Cfg.JiraEnabled() && s.Store.Load(channel, threadTs) != nil
+		jiraActions := s.LLM.DetectJiraActions(
+			s.Slack.ResolveUserMentions(parse.StripSlackPermalinks(question)),
+			threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel,
+		)
+		log.Printf("[JARVIS] jiraActions=%v hasPending=%t", jiraActions, hasPending)
 
-	// 4b) Jira edit flows: transition, assign, update, set parent.
-	if handled, err := s.maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist); handled {
-		log.Printf("[JARVIS] jiraEditFlow handled dur=%s", time.Since(start))
-		return err
+		wantsCreate := containsStr(jiraActions, "jira_create")
+		wantsEdit := containsStr(jiraActions, "jira_edit")
+
+		var createdKey string
+		var anyHandled bool
+
+		if wantsCreate || hasPending {
+			res, createErr := s.maybeHandleJiraCreateFlows(channel, threadTs, originTs, originalText, question, threadHist, wantsCreate)
+			if res.Handled {
+				anyHandled = true
+				createdKey = res.CreatedKey
+				if createErr != nil {
+					log.Printf("[JARVIS] jiraCreateFlow handled dur=%s", time.Since(start))
+					return createErr
+				}
+			}
+		}
+
+		if wantsEdit {
+			// Pass the newly created key (if any) so the edit applies to it.
+			handled, editErr := s.maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist, createdKey, true)
+			if handled {
+				anyHandled = true
+				if editErr != nil {
+					log.Printf("[JARVIS] jiraEditFlow handled dur=%s", time.Since(start))
+					return editErr
+				}
+			}
+		}
+
+		if anyHandled {
+			log.Printf("[JARVIS] jiraFlows handled dur=%s", time.Since(start))
+			return nil
+		}
 	}
 
 	// 5) Post a "searching…" placeholder so the user knows Jarvis is working.
@@ -500,7 +550,10 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		if pendingKeyTs == "" {
 			pendingKeyTs = originTs
 		}
-		s.pendingReplies.Store(contextChannel+":"+pendingKeyTs, chunks)
+		s.pendingReplies.Store(contextChannel+":"+pendingKeyTs, pendingReply{
+			chunks:           chunks,
+			originalOriginTs: originTs,
+		})
 		var confirmMsg string
 		if len(chunks) == 1 {
 			confirmMsg = "Essa resposta é longa. Posso postar na thread? _(responda *sim* ou *não*)_"
@@ -527,4 +580,14 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	}
 	log.Printf("[JARVIS] done dur=%s answer_len=%d", time.Since(start), len(answer))
 	return nil
+}
+
+// containsStr reports whether s is present in the slice.
+func containsStr(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
