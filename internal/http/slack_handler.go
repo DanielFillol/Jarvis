@@ -104,11 +104,13 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		deletedTs = msg.Message.Ts
 	}
 	if deletedTs != "" {
-		if botTs := h.Service.Slack.Tracker.Get(msg.Channel, deletedTs); botTs != "" {
-			log.Printf("[SLACK] user deleted origin=%q — deleting bot reply ts=%q", deletedTs, botTs)
+		if botTimestamps := h.Service.Slack.Tracker.GetAll(msg.Channel, deletedTs); len(botTimestamps) > 0 {
+			log.Printf("[SLACK] user deleted origin=%q — deleting %d bot message(s)", deletedTs, len(botTimestamps))
 			go func() {
-				if err := h.Slack.DeleteMessage(msg.Channel, botTs); err != nil {
-					log.Printf("[WARN] delete bot reply failed: %v", err)
+				for _, botTs := range botTimestamps {
+					if err := h.Slack.DeleteMessage(msg.Channel, botTs); err != nil {
+						log.Printf("[WARN] delete bot reply ts=%q failed: %v", botTs, err)
+					}
 				}
 				h.Service.Slack.Tracker.Delete(msg.Channel, deletedTs)
 			}()
