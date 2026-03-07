@@ -49,31 +49,36 @@ func StripSummon(text, botUserID string) string {
 	return strings.TrimSpace(t)
 }
 
-// ExtractSlackThreadPermalink extracts (channelID, messageTs) from a Slack
+// SlackThreadPermalink holds the components extracted from a Slack archives permalink.
+type SlackThreadPermalink struct {
+	ChannelID string
+	MessageTs string
+}
+
+// ExtractSlackThreadPermalink extracts a SlackThreadPermalink from a Slack
 // archives permalink. It returns found=false when no permalink is present. It supports the classic archives format:
 //
 //	https://<workspace>.slack.com/archives/<CHANNEL_ID>/p<16digits>
 //
 // Where p<16digits> encodes the Slack message ts as 10 digits of seconds and
 // 6 digits of fractional seconds.
-func ExtractSlackThreadPermalink(text string) (channelID, messageTs string, found bool) {
+func ExtractSlackThreadPermalink(text string) (SlackThreadPermalink, bool) {
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return "", "", false
+		return SlackThreadPermalink{}, false
 	}
 	m := reSlackArchivesPermalink.FindStringSubmatch(text)
 	if len(m) != 3 {
-		return "", "", false
+		return SlackThreadPermalink{}, false
 	}
-	channelID = m[1]
+	channelID := m[1]
 	p := m[2]
 	if len(p) != 16 {
-		return "", "", false
+		return SlackThreadPermalink{}, false
 	}
 	sec := p[:10]
 	frac := p[10:]
-	messageTs = sec + "." + frac
-	return channelID, messageTs, true
+	return SlackThreadPermalink{ChannelID: channelID, MessageTs: sec + "." + frac}, true
 }
 
 // StripSlackPermalinks removes Slack archives permalinks from text to avoid
