@@ -100,15 +100,23 @@ func filterSchemaForDatabase(fullSchema string, dbID int) string {
 	return strings.TrimSpace(sb.String())
 }
 
+// metabaseQueryResult holds the outcome of runMetabaseQuery.
+type metabaseQueryResult struct {
+	DBCtx       string
+	QueryResult *metabase.QueryResult
+	ExecutedSQL string
+}
+
 // runMetabaseQuery generates a SQL query via the LLM, executes it against the
-// specified Metabase database, and returns a formatted context string, the raw
-// QueryResult, and the executed SQL.  It retries up to three times on failure.
+// specified Metabase database, and returns a metabaseQueryResult containing the
+// formatted context string, the raw QueryResult, and the executed SQL.
+// It retries up to three times on failure.
 //
-// When the LLM requests clarification before generating SQL, dbCtx is prefixed
-// with llm.ClarificationPrefix and result/sql are nil/"".
-func (s *Service) runMetabaseQuery(question, threadHist string, dbID int, baseSQL string) (dbCtx string, result *metabase.QueryResult, executedSQL string) {
+// When the LLM requests clarification before generating SQL, DBCtx is prefixed
+// with llm.ClarificationPrefix and QueryResult/ExecutedSQL are nil/"".
+func (s *Service) runMetabaseQuery(question, threadHist string, dbID int, baseSQL string) metabaseQueryResult {
 	if s.Metabase == nil {
-		return "", nil, ""
+		return metabaseQueryResult{}
 	}
 	fullSchema := s.loadMetabaseSchema()
 	schema := filterSchemaForDatabase(fullSchema, dbID)
@@ -133,7 +141,7 @@ func (s *Service) runMetabaseQuery(question, threadHist string, dbID int, baseSQ
 		}
 		if strings.HasPrefix(sql, llm.ClarificationPrefix) {
 			log.Printf("[METABASE] LLM requested clarification (attempt %d)", attempt)
-			return sql, nil, ""
+			return metabaseQueryResult{DBCtx: sql}
 		}
 		log.Printf("[METABASE] attempt %d sql: %s", attempt, clip(sql, 400))
 		qr, err := s.Metabase.ExecuteNativeQuery(dbID, sql)
@@ -152,8 +160,8 @@ func (s *Service) runMetabaseQuery(question, threadHist string, dbID int, baseSQ
 		log.Printf("[METABASE] query succeeded attempt %d rows=%d", attempt, len(qr.Data.Rows))
 		ctx := fmt.Sprintf("Query executada (db=%d):\n```sql\n%s\n```\n\nResultado:\n%s",
 			dbID, sql, metabase.FormatQueryResult(*qr, 100))
-		return ctx, qr, sql
+		return metabaseQueryResult{DBCtx: ctx, QueryResult: qr, ExecutedSQL: sql}
 	}
 	log.Printf("[METABASE] all %d attempts failed for db=%d", maxAttempts, dbID)
-	return "", nil, ""
+	return metabaseQueryResult{}
 }
