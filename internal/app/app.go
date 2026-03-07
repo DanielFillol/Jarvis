@@ -85,9 +85,9 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	contextChannel := channel
 	contextThreadTs := threadTs
 	hasThreadPermalink := false
-	if chFromLink, tsFromLink, ok := parse.ExtractSlackThreadPermalink(originalText); ok {
-		contextChannel = chFromLink
-		contextThreadTs = tsFromLink
+	if link, ok := parse.ExtractSlackThreadPermalink(originalText); ok {
+		contextChannel = link.ChannelID
+		contextThreadTs = link.MessageTs
 		hasThreadPermalink = true
 	}
 
@@ -176,15 +176,22 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	handlerActions, contextActions := splitActions(actions)
 
 	// Pass 1 — handler actions run before the busy placeholder and may consume the message.
+	// When context actions follow, quiet=true suppresses direct posts so handler confirmation
+	// text is collected and prepended to the single combined answer instead.
+	quiet := len(contextActions) > 0
 	var createdKey string
 	var anyHandled bool
+	var handlerReplyParts []string
 
 	if containsKind(handlerActions, llm.ActionJiraCreate) || hasPending {
 		res, createErr := s.maybeHandleJiraCreateFlows(channel, threadTs, originTs, originalText, question, threadHist,
-			containsKind(handlerActions, llm.ActionJiraCreate))
+			containsKind(handlerActions, llm.ActionJiraCreate), quiet)
 		if res.Handled {
 			anyHandled = true
 			createdKey = res.CreatedKey
+			if res.Reply != "" {
+				handlerReplyParts = append(handlerReplyParts, res.Reply)
+			}
 			if createErr != nil {
 				log.Printf("[JARVIS] jiraCreateFlow handled dur=%s", time.Since(start))
 				return createErr
@@ -193,9 +200,12 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	}
 
 	if containsKind(handlerActions, llm.ActionJiraEdit) {
-		handled, editErr := s.maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist, createdKey, true)
-		if handled {
+		editRes, editErr := s.maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist, createdKey, true, quiet)
+		if editRes.Handled {
 			anyHandled = true
+			if editRes.Reply != "" {
+				handlerReplyParts = append(handlerReplyParts, editRes.Reply)
+			}
 			if editErr != nil {
 				log.Printf("[JARVIS] jiraEditFlow handled dur=%s", time.Since(start))
 				return editErr
@@ -325,7 +335,8 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 					baseSQL = sql
 				}
 			}
-			thisDBCtx, thisQR, thisSql := s.runMetabaseQuery(questionForLLM, threadHist, action.MetabaseDatabaseID, baseSQL)
+			mRes := s.runMetabaseQuery(questionForLLM, threadHist, action.MetabaseDatabaseID, baseSQL)
+			thisDBCtx, thisQR, thisSql := mRes.DBCtx, mRes.QueryResult, mRes.ExecutedSQL
 			if strings.HasPrefix(thisDBCtx, llm.ClarificationPrefix) {
 				clarificationQ := strings.TrimPrefix(thisDBCtx, llm.ClarificationPrefix)
 				if replyErr := replyFn(clarificationQ); replyErr != nil {
@@ -411,7 +422,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 				}
 			}
 			dbID := action.MetabaseDatabaseID
-			_, _, executedSQL := s.runMetabaseQuery(questionForLLM, threadHist, dbID, baseSQL)
+			executedSQL := s.runMetabaseQuery(questionForLLM, threadHist, dbID, baseSQL).ExecutedSQL
 			var showSQLReply string
 			if executedSQL != "" {
 				showSQLReply = fmt.Sprintf(
@@ -555,6 +566,13 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	answer = strings.TrimSpace(answer)
 	if answer == "" {
 		answer = buildInformativeFallback(executedSlackSearch, slackMatches, executedJiraSearch, jiraIssuesFound, "")
+	}
+
+	// Prepend handler action confirmations (e.g. "Card criado ✅") when they were
+	// suppressed in quiet mode so both the handler result and the answer appear in
+	// a single Slack message.
+	if len(handlerReplyParts) > 0 {
+		answer = strings.Join(handlerReplyParts, "\n\n") + "\n\n" + answer
 	}
 
 	// Append Outline source links when documentation was used.
