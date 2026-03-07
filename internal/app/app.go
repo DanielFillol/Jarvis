@@ -477,24 +477,6 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		}
 	}
 
-	// Outline: always run when configured, even without an outline_search action.
-	if s.Outline != nil && outlineCtx == "" {
-		outlineQuery := s.LLM.GenerateOutlineQuery(questionForLLM, s.Cfg.OpenAILesserModel)
-		if outlineQuery == "" {
-			log.Printf("[JARVIS] outlineSearch skipped: could not generate query")
-		} else {
-			log.Printf("[JARVIS] outlineSearch query=%q (fallback)", outlineQuery)
-			results, oErr := s.Outline.SearchDocuments(outlineQuery, 5)
-			if oErr != nil {
-				log.Printf("[WARN] outline search failed: %v", oErr)
-			} else {
-				outlineCtx = outline.FormatContext(results, 8000)
-				outlineSources = outline.FormatSources(results)
-				log.Printf("[JARVIS] outlineContext docs=%d chars=%d", len(results), len(outlineCtx))
-			}
-		}
-	}
-
 	// Merge multi-source contexts.
 	slackCtx := strings.Join(slackCtxParts, "\n\n")
 	jiraCtx := strings.Join(jiraCtxParts, "\n\n")
