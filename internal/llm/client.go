@@ -260,7 +260,7 @@ Exemplo de array (inclua apenas as ações necessárias):
 
 Fontes disponíveis:
 %s%s- Slack: discussões, decisões, links de threads, contexto operacional.
-- Metabase (banco de dados): dados estruturados do banco operacional. Se a pergunta filtra, lista ou consulta entidades (coletas, MTRs, geradores, transportadores, rotas, pedidos, clientes), use metabase_query. NÃO use slack_search para dados que vivem no banco.
+- Metabase (banco de dados): dados estruturados do banco operacional. Se a pergunta filtra, lista ou consulta entidades (registros, entidades operacionais, transações, pedidos), use metabase_query. NÃO use slack_search para dados que vivem no banco.
 
 Regras para jira_create e jira_edit:
 - "jira_create": verbo de criação EXPLÍCITO (criar/cria/abre/abrir/gera/gerar) + tipo de issue, pedido AGORA
@@ -268,7 +268,8 @@ Regras para jira_create e jira_edit:
 - Hipóteses ("estou pensando em criar") → sem jira_create
 - Negações ("não quero criar") → sem jira_create
 - Criação + atribuição na mesma mensagem → jira_create ANTES de jira_edit no array
-- Criar um card → sem jira_search, sem slack_search
+- Criar um card SEM pedido explícito de dados externos → sem jira_search, sem slack_search
+- jira_create/jira_edit PODEM coexistir com metabase_query, slack_search ou jira_search quando o usuário pede EXPLICITAMENTE dados externos para incluir no card ou na resposta (ex: "escreva nesse card o total de X", "adicione as threads onde X foi mencionada", "busque o total de registros")
 %s
 Regras de roteamento de contexto:
 %s
@@ -373,7 +374,7 @@ Regras:
   "como funciona o processo de deploy em produção?" → "deploy produção processo"
   "quais são as políticas de férias da empresa?" → "férias políticas empresa"
   "quanto eu ganho de flash por mes?" → "benefícios flash"
-  "cria uma tarefa no transportador com base nessa thread" → "transportador tarefa fluxo"
+  "cria uma tarefa com base nessa thread" → "tarefa fluxo processo"
   "me explica o onboarding de novos engenheiros" → "onboarding engenheiros"
 
 Pergunta: %s`, question)
