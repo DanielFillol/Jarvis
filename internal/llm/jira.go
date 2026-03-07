@@ -27,7 +27,7 @@ Responda APENAS "sim" ou "não".
 
 Responda "sim" somente quando a mensagem for um pedido direto e imediato de criação:
 - "crie um card", "abre um bug", "cria uma história", "criar um ticket no Jira"
-- "cria uma tarefa no transportador com base nessa thread"
+- "cria uma tarefa com base nessa thread"
 - "abre um card baseado nessa conversa", "crie uma história com base no que foi discutido"
 - "com base nessa thread, crie um bug", "cria um card a partir dessa conversa"
 - Qualquer combinação de verbo de criação (criar/cria/abre/abrir/gera/gerar) + tipo de issue + "com base em"/"baseado em"/"a partir de"
@@ -232,7 +232,7 @@ Retorne JSON exatamente neste formato (deixe campos vazios/null quando não menc
 }
 
 Regras:
-- issue_key: chave do PRIMEIRO card mencionado (ex: TPTDR-522). Obrigatório. Use o contexto da conversa para inferir a chave completa quando o usuário mencionar apenas o número (ex: "card 521" → "TPTDR-521").
+- issue_key: chave do PRIMEIRO card mencionado (ex: PROJ-522). Obrigatório. Use o contexto da conversa para inferir a chave completa quando o usuário mencionar apenas o número (ex: "card 521" → "PROJ-521").
 - additional_issue_keys: array com os demais cards quando o usuário mencionar múltiplos (ex: "faça o mesmo para o 509", "e também o 512"). Mesmas regras de inferência de chave do issue_key. Array vazio quando houver apenas um card.
 - target_sprint: preencha quando o usuário quiser mover para uma sprint.
   Use exatamente um destes valores:
@@ -248,7 +248,7 @@ Regras:
   Para outros verbos de ação de status, use o termo mais próximo em inglês.
   Vazio SOMENTE se nenhuma mudança de status for pedida.
 - assignee_name: nome do assignee. Use "@me" quando o usuário disser "para mim", "a mim", "me atribuir". Vazio se não mencionado.
-- parent_key: chave do card pai (ex: TPTDR-100). Vazio se não mencionado.
+- parent_key: chave do card pai (ex: PROJ-100). Vazio se não mencionado.
 - summary/description/priority/labels: só preencha quando o usuário fornecer o texto EXPLICITAMENTE.
 - generate_description: true em DOIS casos:
   1. O usuário pede que o bot ESCREVA, GERE, CRIE ou DOCUMENTE a descrição/história/story sem fornecer o texto final (ex: "escreva a história", "documente esse card", "crie a descrição", "escreva o que é necessário").
