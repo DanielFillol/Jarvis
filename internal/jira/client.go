@@ -27,7 +27,7 @@ type Client struct {
 	Store    time.Duration
 	Projects []string
 	// CatalogCompact is a one-line summary of all configured projects
-	// (e.g. "INV=Faturamento [Bug, Task] | TPTDR=Transporte [Bug, Epic]").
+	// (e.g. "INV=Faturamento [Bug, Task] | PROJ=Project [Bug, Epic]").
 	// Pre-populated with raw keys at construction; overwritten by GenerateCatalog.
 	CatalogCompact string
 	// WorkflowStatuses maps project key → deduplicated list of all statuses
