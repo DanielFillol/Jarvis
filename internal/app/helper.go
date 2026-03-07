@@ -507,7 +507,7 @@ func buildInformativeFallback(triedSlack bool, slackMatches int, triedJira bool,
 		sug = append(sug, "Tenta incluir uma issue key específica (ex: PROJ-123) ou o nome do épico.")
 	}
 	if triedSlack && slackMatches == 0 {
-		sug = append(sug, "Tenta especificar o canal ou termos exatos (ex: 'tratamento em branco' ou '#coletas').")
+		sug = append(sug, "Tenta especificar o canal ou termos exatos (ex: 'reunião de equipe' ou '#geral').")
 	}
 	if len(sug) > 0 {
 		base += "\n\nSugestões:\n• " + strings.Join(sug, "\n• ")
