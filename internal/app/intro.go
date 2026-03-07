@@ -51,7 +51,7 @@ func isIntroRequest(question string) bool {
 // (docs/jira_projects.md, docs/metabase_schema_compact.md, etc.).
 // Falls back to a static message if the LLM call fails.
 func (s *Service) handleIntroRequest(channel, threadTs, originTs string) error {
-	// Invert JiraProjectNameMap ("transportador" → "TPTDR") to ("TPTDR" → "Transportador").
+	// Invert JiraProjectNameMap ("project-name" → "PROJ") to ("PROJ" → "Project-Name").
 	keyToName := make(map[string]string)
 	for name, key := range s.Cfg.JiraProjectNameMap {
 		display := strings.Title(strings.ToLower(name)) //nolint:staticcheck
