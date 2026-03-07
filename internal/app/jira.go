@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -14,26 +15,39 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/state"
 )
 
+var reJiraKey = regexp.MustCompile(`^[A-Z][A-Z0-9]+-\d+$`)
+
+// jiraEditResult holds the outcome of maybeHandleJiraEditFlows.
+type jiraEditResult struct {
+	// Handled is true when the edit flow consumed the message.
+	Handled bool
+	// Reply is the success message text when quiet=true; callers are responsible
+	// for posting it (typically prepended to the combined final answer).
+	Reply string
+}
+
 // maybeHandleJiraEditFlows handles requests to edit existing Jira issues:
 // transition status, assign, update fields, and set parent.
 // overrideIssueKey, when non-empty, is used as the target issue key instead of
 // extracting it from the message (used when a card was just created in the same turn).
 // intentConfirmed skips the ConfirmJiraEditIntent LLM call when the caller has
-// already verified the intent via DetectJiraActions.
-func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist, overrideIssueKey string, intentConfirmed bool) (bool, error) {
+// already verified the intent via DecideActions.
+// quiet suppresses the direct Slack success post; the confirmation text is instead
+// returned in jiraEditResult.Reply so callers can prepend it to a combined answer.
+func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist, overrideIssueKey string, intentConfirmed, quiet bool) (jiraEditResult, error) {
 	// Strip Slack markup (permalinks, mentions) so the LLM sees clean text.
 	cleanQ := s.Slack.ResolveUserMentions(parse.StripSlackPermalinks(question))
 
 	if !s.Cfg.JiraCreateEnabled {
 		if intentConfirmed || s.LLM.ConfirmJiraEditIntent(cleanQ, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
 			_ = s.Slack.PostMessage(channel, threadTs, "Edição de issues no Jira está desabilitada.")
-			return true, nil
+			return jiraEditResult{Handled: true}, nil
 		}
-		return false, nil
+		return jiraEditResult{}, nil
 	}
 
 	if !intentConfirmed && !s.LLM.ConfirmJiraEditIntent(cleanQ, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
-		return false, nil
+		return jiraEditResult{}, nil
 	}
 
 	senderName, _ := s.Slack.GetUsernameByID(senderUserID)
@@ -41,7 +55,7 @@ func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, ques
 	req, err := s.LLM.ExtractJiraEditRequest(cleanQ, threadHist, senderName, s.Cfg.OpenAIModel)
 	if err != nil {
 		_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Não consegui interpretar o pedido de edição: %v", err))
-		return true, nil
+		return jiraEditResult{Handled: true}, nil
 	}
 
 	// When a card was just created in the same turn, use that key directly.
@@ -51,8 +65,8 @@ func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, ques
 	}
 
 	if req.IssueKey == "" {
-		_ = s.Slack.PostMessage(channel, threadTs, "Não consegui identificar o número do card. Informe a chave (ex: TPTDR-522).")
-		return true, nil
+		_ = s.Slack.PostMessage(channel, threadTs, "Não consegui identificar o número do card. Informe a chave (ex: PROJ-123).")
+		return jiraEditResult{Handled: true}, nil
 	}
 
 	allKeys := append([]string{req.IssueKey}, req.AdditionalIssueKeys...)
@@ -88,8 +102,12 @@ func (s *Service) maybeHandleJiraEditFlows(channel, threadTs, senderUserID, ques
 			parts = append(parts, fmt.Sprintf("*%s* atualizado:\n%s\n%s", r.key, strings.Join(r.lines, "\n"), link))
 		}
 	}
-	_ = s.Slack.PostMessage(channel, threadTs, strings.Join(parts, "\n\n"))
-	return true, nil
+	replyText := strings.Join(parts, "\n\n")
+	if !quiet {
+		_ = s.Slack.PostMessage(channel, threadTs, replyText)
+		return jiraEditResult{Handled: true}, nil
+	}
+	return jiraEditResult{Handled: true, Reply: replyText}, nil
 }
 
 // applyJiraEditToIssue applies all edits from req to a single issueKey and
@@ -128,16 +146,16 @@ func (s *Service) applyJiraEditToIssue(issueKey string, req jira.EditRequest, se
 
 	// Transition (multi-step: chains through intermediates if needed)
 	if req.TargetStatus != "" {
-		finalStatus, steps, err := s.transitionToStatus(issueKey, req.TargetStatus)
+		tr, err := s.transitionToStatus(issueKey, req.TargetStatus)
 		if err != nil {
 			log.Printf("[JARVIS] transitionToStatus %s → %q: %v", issueKey, req.TargetStatus, err)
 			results = append(results, fmt.Sprintf("⚠️ Não consegui transicionar: %v", err))
-		} else if len(steps) > 1 {
-			results = append(results, fmt.Sprintf("✅ Status alterado para *%s* (via: %s)", finalStatus, strings.Join(steps, " → ")))
-		} else if len(steps) == 1 {
-			results = append(results, fmt.Sprintf("✅ Status alterado para *%s*", finalStatus))
+		} else if len(tr.Steps) > 1 {
+			results = append(results, fmt.Sprintf("✅ Status alterado para *%s* (via: %s)", tr.FinalStatus, strings.Join(tr.Steps, " → ")))
+		} else if len(tr.Steps) == 1 {
+			results = append(results, fmt.Sprintf("✅ Status alterado para *%s*", tr.FinalStatus))
 		} else {
-			results = append(results, fmt.Sprintf("ℹ️ Card já estava com status *%s*", finalStatus))
+			results = append(results, fmt.Sprintf("ℹ️ Card já estava com status *%s*", tr.FinalStatus))
 		}
 	}
 
@@ -164,14 +182,20 @@ func (s *Service) applyJiraEditToIssue(issueKey string, req jira.EditRequest, se
 		}
 	}
 
-	// Set parent
+	// Set parent — resolve name/text to a valid key first when necessary.
 	if req.ParentKey != "" {
-		fields := map[string]any{"parent": map[string]any{"key": req.ParentKey}}
-		if err := s.Jira.UpdateIssue(issueKey, fields); err != nil {
-			log.Printf("[JARVIS] SetParent %s → %s: %v", issueKey, req.ParentKey, err)
-			results = append(results, fmt.Sprintf("⚠️ Não consegui definir o pai como *%s*: %v", req.ParentKey, err))
+		parentKey, resolveErr := s.resolveParentKey(issueKey, req.ParentKey)
+		if resolveErr != nil {
+			log.Printf("[JARVIS] resolveParentKey %s ref=%q: %v", issueKey, req.ParentKey, resolveErr)
+			results = append(results, fmt.Sprintf("⚠️ Não encontrei o card pai %q: %v", req.ParentKey, resolveErr))
 		} else {
-			results = append(results, fmt.Sprintf("✅ Pai definido como *%s*", req.ParentKey))
+			fields := map[string]any{"parent": map[string]any{"key": parentKey}}
+			if err := s.Jira.UpdateIssue(issueKey, fields); err != nil {
+				log.Printf("[JARVIS] SetParent %s → %s: %v", issueKey, parentKey, err)
+				results = append(results, fmt.Sprintf("⚠️ Não consegui definir o pai como *%s*: %v", parentKey, err))
+			} else {
+				results = append(results, fmt.Sprintf("✅ Pai definido como *%s*", parentKey))
+			}
 		}
 	}
 
@@ -229,13 +253,19 @@ func (s *Service) applyJiraEditToIssue(issueKey string, req jira.EditRequest, se
 	return results
 }
 
+// transitionResult holds the outcome of transitionToStatus.
+type transitionResult struct {
+	FinalStatus string
+	Steps       []string
+}
+
 // transitionToStatus moves issueKey toward desiredStatus, chaining through
 // intermediate transitions if the workflow doesn't allow direct jumps.
 // The maximum number of steps is derived from the project's workflow size
 // (number of statuses in jira_projects.md catalog), falling back to 10.
 // Returns the final status name and the names of all transitions executed.
-func (s *Service) transitionToStatus(issueKey, desiredStatus string) (finalStatus string, steps []string, err error) {
-	// Extract project key from issue key (e.g. "TPTDR-522" → "TPTDR").
+func (s *Service) transitionToStatus(issueKey, desiredStatus string) (transitionResult, error) {
+	// Extract project key from issue key (e.g. "PROJ-522" → "PROJ").
 	maxSteps := 10
 	if idx := strings.Index(issueKey, "-"); idx > 0 {
 		projectKey := issueKey[:idx]
@@ -247,18 +277,19 @@ func (s *Service) transitionToStatus(issueKey, desiredStatus string) (finalStatu
 		}
 	}
 	log.Printf("[JARVIS] transitionToStatus %s → %q maxSteps=%d", issueKey, desiredStatus, maxSteps)
+	var steps []string
 	for i := 0; i < maxSteps; i++ {
 		issue, err := s.Jira.GetIssue(issueKey)
 		if err != nil {
-			return "", steps, fmt.Errorf("GetIssue: %w", err)
+			return transitionResult{Steps: steps}, fmt.Errorf("GetIssue: %w", err)
 		}
 		currentStatus := issue.Fields.Status.Name
 		if strings.EqualFold(currentStatus, desiredStatus) {
-			return currentStatus, steps, nil
+			return transitionResult{FinalStatus: currentStatus, Steps: steps}, nil
 		}
 		transitions, err := s.Jira.GetTransitions(issueKey)
 		if err != nil {
-			return "", steps, fmt.Errorf("GetTransitions: %w", err)
+			return transitionResult{Steps: steps}, fmt.Errorf("GetTransitions: %w", err)
 		}
 		transID := s.LLM.PickBestTransition(transitions, desiredStatus, s.Cfg.OpenAIModel)
 		if transID == "" {
@@ -266,7 +297,7 @@ func (s *Service) transitionToStatus(issueKey, desiredStatus string) (finalStatu
 			for _, t := range transitions {
 				tNames = append(tNames, t.Name)
 			}
-			return currentStatus, steps, fmt.Errorf("sem caminho de *%s* até *%s*; disponíveis: %s",
+			return transitionResult{FinalStatus: currentStatus, Steps: steps}, fmt.Errorf("sem caminho de *%s* até *%s*; disponíveis: %s",
 				currentStatus, desiredStatus, strings.Join(tNames, ", "))
 		}
 		transName := transID
@@ -277,18 +308,18 @@ func (s *Service) transitionToStatus(issueKey, desiredStatus string) (finalStatu
 			}
 		}
 		if err := s.Jira.TransitionIssue(issueKey, transID); err != nil {
-			return "", steps, fmt.Errorf("TransitionIssue(%s): %w", transName, err)
+			return transitionResult{Steps: steps}, fmt.Errorf("TransitionIssue(%s): %w", transName, err)
 		}
 		steps = append(steps, transName)
 		log.Printf("[JARVIS] transitionToStatus %s step=%d via=%q toward=%q", issueKey, i+1, transName, desiredStatus)
 	}
-	return "", steps, fmt.Errorf("não atingiu %q em %d passos", desiredStatus, maxSteps)
+	return transitionResult{Steps: steps}, fmt.Errorf("não atingiu %q em %d passos", desiredStatus, maxSteps)
 }
 
 // resolveTargetSprint finds the right sprint for the issue's project board
 // based on the LLM's extracted target ("current", "next", or a sprint name/number).
 func (s *Service) resolveTargetSprint(issueKey, target string) (*jira.Sprint, error) {
-	// Derive project key from issue key (e.g. "TPTDR-522" → "TPTDR").
+	// Derive project key from issue key (e.g. "PROJ-522" → "PROJ").
 	idx := strings.Index(issueKey, "-")
 	if idx <= 0 {
 		return nil, fmt.Errorf("invalid issue key: %q", issueKey)
@@ -355,6 +386,36 @@ func (s *Service) resolveTargetSprint(issueKey, target string) (*jira.Sprint, er
 	}
 }
 
+// resolveParentKey resolves a parent issue reference to a valid Jira issue key.
+// If parentRef already looks like a Jira key (e.g. "PROJ-164"), it is returned as-is.
+// Otherwise it searches Jira by text within the child issue's project and returns
+// the key of the first match.
+func (s *Service) resolveParentKey(issueKey, parentRef string) (string, error) {
+	parentRef = strings.TrimSpace(parentRef)
+	if reJiraKey.MatchString(parentRef) {
+		return parentRef, nil
+	}
+	// Derive project key from the child issue (e.g. "PROJ-531" → "PROJ").
+	projKey := ""
+	if idx := strings.Index(issueKey, "-"); idx > 0 {
+		projKey = issueKey[:idx]
+	}
+	jql := fmt.Sprintf(`text ~ %q ORDER BY updated DESC`, parentRef)
+	if projKey != "" {
+		jql = fmt.Sprintf(`project = %s AND text ~ %q ORDER BY updated DESC`, projKey, parentRef)
+	}
+	log.Printf("[JARVIS] resolveParentKey %s ref=%q jql=%q", issueKey, parentRef, jql)
+	issues, err := s.Jira.FetchAll(jql, 5)
+	if err != nil {
+		return "", fmt.Errorf("busca por %q falhou: %w", parentRef, err)
+	}
+	if len(issues) == 0 {
+		return "", fmt.Errorf("nenhum card encontrado para %q", parentRef)
+	}
+	log.Printf("[JARVIS] resolveParentKey %s ref=%q → %s (%s)", issueKey, parentRef, issues[0].Key, issues[0].Summary)
+	return issues[0].Key, nil
+}
+
 // pickBestUser selects the most relevant user from assignable search results.
 // Prefers active users whose display name contains the query, then any active user.
 func pickBestUser(users []jira.JiraUser, query string) *jira.JiraUser {
@@ -407,15 +468,20 @@ type jiraCreateResult struct {
 	// Handled is true when the create flow consumed the message (even if creation
 	// was skipped due to missing fields or disabled config).
 	Handled bool
-	// CreatedKey is the Jira issue key of the newly created card (e.g. "TPTDR-526").
+	// CreatedKey is the Jira issue key of the newly created card (e.g. "PROJ-526").
 	// Empty when the card was not created in this turn (pending state, disabled, etc.).
 	CreatedKey string
+	// Reply is the success message text when quiet=true; callers are responsible
+	// for posting it (typically prepended to the combined final answer).
+	Reply string
 }
 
 // maybeHandleJiraCreateFlows orchestrates the state machine for Jira creation commands.
 // intentConfirmed skips the ConfirmJiraCreateIntent LLM call when the caller has
-// already verified the intent via DetectJiraActions.
-func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, originalText, question, threadHist string, intentConfirmed bool) (jiraCreateResult, error) {
+// already verified the intent via DecideActions.
+// quiet suppresses the direct Slack success post; the confirmation text is instead
+// returned in jiraCreateResult.Reply so callers can prepend it to a combined answer.
+func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, originalText, question, threadHist string, intentConfirmed, quiet bool) (jiraCreateResult, error) {
 	if !s.Cfg.JiraCreateEnabled {
 		if intentConfirmed || s.LLM.ConfirmJiraCreateIntent(question, threadHist, s.Cfg.OpenAILesserModel, s.Cfg.OpenAIModel) {
 			_ = s.Slack.PostMessage(channel, threadTs, "Criação de issues no Jira está desabilitada.")
@@ -446,8 +512,13 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 		}
 		s.Store.Delete(channel, threadTs)
 		s.appendSlackOrigin(&draft, channel, threadTs, pending.OriginTs, pending.OriginalText)
-		key, createErr := s.createIssueAndReply(channel, threadTs, draft)
-		return jiraCreateResult{Handled: true, CreatedKey: key}, createErr
+		key, createErr := s.createIssueAndReply(channel, threadTs, draft, quiet)
+		var replyText string
+		if quiet && key != "" {
+			base := strings.TrimRight(s.Cfg.JiraBaseURL, "/")
+			replyText = fmt.Sprintf("Card criado ✅ *%s*\n%s/browse/%s", key, base, key)
+		}
+		return jiraCreateResult{Handled: true, CreatedKey: key, Reply: replyText}, createErr
 	}
 
 	// 2. Detect new Jira create intent.
@@ -476,8 +547,13 @@ func (s *Service) maybeHandleJiraCreateFlows(channel, threadTs, originTs, origin
 
 	// 5. All fields present — create the card.
 	s.appendSlackOrigin(&draft, channel, threadTs, originTs, originalText)
-	key, createErr := s.createIssueAndReply(channel, threadTs, draft)
-	return jiraCreateResult{Handled: true, CreatedKey: key}, createErr
+	key, createErr := s.createIssueAndReply(channel, threadTs, draft, quiet)
+	var replyText string
+	if quiet && key != "" {
+		base := strings.TrimRight(s.Cfg.JiraBaseURL, "/")
+		replyText = fmt.Sprintf("Card criado ✅ *%s*\n%s/browse/%s", key, base, key)
+	}
+	return jiraCreateResult{Handled: true, CreatedKey: key, Reply: replyText}, createErr
 }
 
 // fetchExampleIssues is a helper that fetches real Jira cards from the same project/type
@@ -525,11 +601,12 @@ func (s *Service) appendSlackOrigin(d *jira.IssueDraft, channel, threadTs, origi
 	d.Description = b.String()
 }
 
-// createIssueAndReply creates a Jira issue via the Jira client, posts a
-// confirmation message to Slack, and attaches any images or videos found in
-// the thread to the newly created issue.  Returns the key of the created issue
-// (e.g. "TPTDR-526") so callers can chain further operations on the same card.
-func (s *Service) createIssueAndReply(channel, threadTs string, d jira.IssueDraft) (string, error) {
+// createIssueAndReply creates a Jira issue via the Jira client and, unless
+// quiet is true, posts a confirmation message to Slack.  It also attaches any
+// images or videos found in the thread to the newly created issue.
+// Returns (issueKey, error).  When quiet=true the caller is responsible for
+// building and posting the confirmation text (typically prepended to a combined answer).
+func (s *Service) createIssueAndReply(channel, threadTs string, d jira.IssueDraft, quiet bool) (string, error) {
 	d.Project = strings.TrimSpace(d.Project)
 	d.IssueType = strings.TrimSpace(d.IssueType)
 	d.Summary = strings.TrimSpace(d.Summary)
@@ -545,7 +622,10 @@ func (s *Service) createIssueAndReply(channel, threadTs string, d jira.IssueDraf
 	}
 	base := strings.TrimRight(s.Cfg.JiraBaseURL, "/")
 	link := base + "/browse/" + created.Key
-	_ = s.Slack.PostMessage(channel, threadTs, fmt.Sprintf("Card criado ✅ *%s*\n%s", created.Key, link))
+	replyText := fmt.Sprintf("Card criado ✅ *%s*\n%s", created.Key, link)
+	if !quiet {
+		_ = s.Slack.PostMessage(channel, threadTs, replyText)
+	}
 	s.attachThreadMediaToIssue(created.Key, channel, threadTs)
 	return created.Key, nil
 }
