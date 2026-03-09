@@ -24,7 +24,7 @@ func (a ImageAttachment) DataURL() string {
 // answerWithModel assembles the prompt and calls the Chat API with the
 // specified model.  It converts Markdown into Slack Markdown before
 // returning the result.
-func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string, images []ImageAttachment, model string) (string, error) {
+func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string, images []ImageAttachment, model string) (string, error) {
 	botName := c.BotName
 	if strings.TrimSpace(botName) == "" {
 		botName = "Jarvis"
@@ -36,8 +36,15 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 		contextHint = "Se os dados não forem suficientes para responder, informe o usuário e sugira como refinar a pergunta. Nunca mencione JQL — este contexto é exclusivamente de banco de dados SQL."
 	}
 
-	systemParts := []string{
-		"Você é o " + botName + ", assistente do Slack.",
+	systemParts := []string{}
+	if strings.TrimSpace(companyCtx) != "" {
+		systemParts = append(systemParts,
+			"## Contexto da empresa (domínio e vocabulário):\n"+strings.TrimSpace(companyCtx),
+			"",
+		)
+	}
+	systemParts = append(systemParts,
+		"Você é o "+botName+", assistente do Slack.",
 		"Responda em português brasileiro, direto, sem enrolação, usando o contexto quando existir.",
 		contextHint,
 		"Não invente fatos.",
@@ -66,7 +73,7 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 		"*Princípio geral:* varie os estilos conforme o conteúdo. Respostas longas com múltiplas seções ficam melhor com títulos em negrito. Código e JQL sempre em bloco. Notas críticas em blockquote. Não use sempre o mesmo padrão — leia o que foi perguntado e escolha o formato que torna a resposta mais fácil de ler.",
 		"",
 		"LIMITAÇÃO IMPORTANTE: Você não consegue enviar arquivos, anexos ou downloads no Slack. Quando o usuário pedir dados em CSV, Excel ou qualquer outro formato de arquivo para download, informe claramente que essa funcionalidade não está disponível no momento e ofereça apresentar os dados diretamente na mensagem (tabela em bloco de código, lista, etc.).",
-	}
+	)
 	if strings.TrimSpace(c.JiraBaseURL) != "" {
 		baseURL := strings.TrimRight(strings.TrimSpace(c.JiraBaseURL), "/")
 		systemParts = append(systemParts, "",
@@ -163,6 +170,7 @@ func (c *Client) answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbC
 // failures, then falls back to lesserModel when configured and different.
 // This makes answer generation resilient to flaky networking, 429s, and 5xxs.
 func (c *Client) AnswerWithRetry(
+	companyCtx,
 	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string,
 	images []ImageAttachment,
 	primaryModel, lesserModel string,
@@ -177,14 +185,14 @@ func (c *Client) AnswerWithRetry(
 	}
 
 	// Try primary first.
-	out, err := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, primaryModel, maxAttempts, baseDelay)
+	out, err := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, primaryModel, maxAttempts, baseDelay)
 	if err == nil && strings.TrimSpace(out) != "" {
 		return out, nil
 	}
 
 	// Fall back to the lesser model if configured and different from the primary.
 	if lesserModel != "" && lesserModel != primaryModel {
-		out2, err2 := c.answerWithRetrySingleModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, lesserModel, maxAttempts, baseDelay)
+		out2, err2 := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, lesserModel, maxAttempts, baseDelay)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
 			return out2, nil
 		}
@@ -201,6 +209,7 @@ func (c *Client) AnswerWithRetry(
 }
 
 func (c *Client) answerWithRetrySingleModel(
+	companyCtx,
 	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string,
 	images []ImageAttachment,
 	model string,
@@ -209,7 +218,7 @@ func (c *Client) answerWithRetrySingleModel(
 ) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		out, err := c.answerWithModel(question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, model)
+		out, err := c.answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, model)
 		if err == nil && strings.TrimSpace(out) != "" {
 			return out, nil
 		}
