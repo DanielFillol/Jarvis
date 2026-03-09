@@ -114,7 +114,7 @@ type metabaseQueryResult struct {
 //
 // When the LLM requests clarification before generating SQL, DBCtx is prefixed
 // with llm.ClarificationPrefix and QueryResult/ExecutedSQL are nil/"".
-func (s *Service) runMetabaseQuery(question, threadHist string, dbID int, baseSQL string) metabaseQueryResult {
+func (s *Service) runMetabaseQuery(question, threadHist string, dbID int, baseSQL string, wantsAllRows bool) metabaseQueryResult {
 	if s.Metabase == nil {
 		return metabaseQueryResult{}
 	}
@@ -134,7 +134,7 @@ func (s *Service) runMetabaseQuery(question, threadHist string, dbID int, baseSQ
 	lastSQL := strings.TrimSpace(baseSQL)
 	lastErr := ""
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		sql, err := s.LLM.GenerateSQL(question, threadHist, schema, lastSQL, lastErr, dbEngine, s.Cfg.OpenAIModel)
+		sql, err := s.LLM.GenerateSQL(question, threadHist, schema, lastSQL, lastErr, dbEngine, wantsAllRows, s.Cfg.OpenAIModel)
 		if err != nil {
 			log.Printf("[METABASE] GenerateSQL attempt %d failed: %v", attempt, err)
 			continue

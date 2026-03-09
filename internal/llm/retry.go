@@ -24,7 +24,7 @@ func (a ImageAttachment) DataURL() string {
 // answerWithModel assembles the prompt and calls the Chat API with the
 // specified model.  It converts Markdown into Slack Markdown before
 // returning the result.
-func (c *Client) answerWithModel(companyCtx, hintsCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string, images []ImageAttachment, model string) (string, error) {
+func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string, images []ImageAttachment, model string) (string, error) {
 	botName := c.BotName
 	if strings.TrimSpace(botName) == "" {
 		botName = "Jarvis"
@@ -40,12 +40,6 @@ func (c *Client) answerWithModel(companyCtx, hintsCtx, question, threadHistory, 
 	if strings.TrimSpace(companyCtx) != "" {
 		systemParts = append(systemParts,
 			"## Contexto da empresa (domínio e vocabulário):\n"+strings.TrimSpace(companyCtx),
-			"",
-		)
-	}
-	if strings.TrimSpace(hintsCtx) != "" {
-		systemParts = append(systemParts,
-			"## Dicas e instruções adicionais:\n"+strings.TrimSpace(hintsCtx),
 			"",
 		)
 	}
@@ -176,7 +170,7 @@ func (c *Client) answerWithModel(companyCtx, hintsCtx, question, threadHistory, 
 // failures, then falls back to lesserModel when configured and different.
 // This makes answer generation resilient to flaky networking, 429s, and 5xxs.
 func (c *Client) AnswerWithRetry(
-	companyCtx, hintsCtx,
+	companyCtx,
 	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string,
 	images []ImageAttachment,
 	primaryModel, lesserModel string,
@@ -191,14 +185,14 @@ func (c *Client) AnswerWithRetry(
 	}
 
 	// Try primary first.
-	out, err := c.answerWithRetrySingleModel(companyCtx, hintsCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, primaryModel, maxAttempts, baseDelay)
+	out, err := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, primaryModel, maxAttempts, baseDelay)
 	if err == nil && strings.TrimSpace(out) != "" {
 		return out, nil
 	}
 
 	// Fall back to the lesser model if configured and different from the primary.
 	if lesserModel != "" && lesserModel != primaryModel {
-		out2, err2 := c.answerWithRetrySingleModel(companyCtx, hintsCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, lesserModel, maxAttempts, baseDelay)
+		out2, err2 := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, lesserModel, maxAttempts, baseDelay)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
 			return out2, nil
 		}
@@ -215,7 +209,7 @@ func (c *Client) AnswerWithRetry(
 }
 
 func (c *Client) answerWithRetrySingleModel(
-	companyCtx, hintsCtx,
+	companyCtx,
 	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string,
 	images []ImageAttachment,
 	model string,
@@ -224,7 +218,7 @@ func (c *Client) answerWithRetrySingleModel(
 ) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		out, err := c.answerWithModel(companyCtx, hintsCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, model)
+		out, err := c.answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, model)
 		if err == nil && strings.TrimSpace(out) != "" {
 			return out, nil
 		}

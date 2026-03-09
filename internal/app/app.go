@@ -58,9 +58,6 @@ type Service struct {
 
 	// companyCtx holds the generated domain glossary injected into every answer call.
 	companyCtx atomic.Value
-
-	// hintsCtx holds the user-maintained hints file content (loaded once at startup).
-	hintsCtx string
 }
 
 // NewService constructs a new Jarvis service from its dependencies.
@@ -77,7 +74,6 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 		FileServer: fs,
 		Store:      *state.NewStore(2 * time.Hour),
 		Outline:    outlineClient,
-		hintsCtx:   readDocFile(cfg.HintsPath, 10000),
 	}
 }
 
@@ -263,6 +259,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	var outlineCtx, outlineSources string
 	var executedSlackSearch, executedJiraSearch bool
 	var slackMatches, jiraIssuesFound int
+	var csvDownloadLine string // set when a CSV file is generated; appended to answer unconditionally
 
 	for _, action := range contextActions {
 		switch action.Kind {
@@ -353,7 +350,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 					baseSQL = sql
 				}
 			}
-			mRes := s.runMetabaseQuery(questionForLLM, threadHist, action.MetabaseDatabaseID, baseSQL)
+			mRes := s.runMetabaseQuery(questionForLLM, threadHist, action.MetabaseDatabaseID, baseSQL, action.WantsAllRows)
 			thisDBCtx, thisQR, thisSql := mRes.DBCtx, mRes.QueryResult, mRes.ExecutedSQL
 			if strings.HasPrefix(thisDBCtx, llm.ClarificationPrefix) {
 				clarificationQ := strings.TrimPrefix(thisDBCtx, llm.ClarificationPrefix)
@@ -393,13 +390,16 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 				if len(csvBytes) > 0 {
 					fileID := s.FileServer.Store("resultado.csv", csvBytes, time.Hour)
 					csvURL := s.Cfg.PublicBaseURL + "/files/" + fileID
+					// Store the download line separately so it is always appended to the
+					// final answer — never rely on the LLM to include it.
+					csvDownloadLine = fmt.Sprintf(":page_facing_up: *Download CSV:* <%s|resultado.csv> _(expira em 1 hora)_", csvURL)
 					dbCtxParts = append(dbCtxParts, fmt.Sprintf(
 						"Query SQL retornou %d registros com os campos: %s.\n\n"+
 							"INSTRUÇÃO INTERNA: Escreva APENAS 1 frase curta de introdução descrevendo o resultado "+
-							"(ex: \"Encontrei %d registros...\"). Não exiba a tabela de dados. Finalize a resposta aí.\n\n"+
-							"Amostra (3 de %d registros):\n%s\n\n:page_facing_up: *Download CSV:* <%s|resultado.csv> _(expira em 1 hora)_",
+							"(ex: \"Encontrei %d registros...\"). Não exiba a tabela de dados.\n\n"+
+							"Amostra (3 de %d registros):\n%s",
 						nRows, strings.Join(cols, ", "), nRows, nRows,
-						metabase.FormatQueryResult(*thisQR, 3), csvURL,
+						metabase.FormatQueryResult(*thisQR, 3),
 					))
 					log.Printf("[JARVIS] CSV generated rows=%d id=%s", nRows, fileID)
 				}
@@ -445,7 +445,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 				}
 			}
 			dbID := action.MetabaseDatabaseID
-			executedSQL := s.runMetabaseQuery(questionForLLM, threadHist, dbID, baseSQL).ExecutedSQL
+			executedSQL := s.runMetabaseQuery(questionForLLM, threadHist, dbID, baseSQL, false).ExecutedSQL
 			var showSQLReply string
 			if executedSQL != "" {
 				showSQLReply = fmt.Sprintf(
@@ -566,7 +566,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 
 	// 11) Generate the answer with the primary LLM (with retry and fallback).
 	answer, err := s.LLM.AnswerWithRetry(
-		s.getCompanyCtx(), s.hintsCtx,
+		s.getCompanyCtx(),
 		questionForLLM, threadHist, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images,
 		s.Cfg.OpenAIModel, s.Cfg.OpenAILesserModel, 2, 0,
 	)
@@ -584,6 +584,12 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// a single Slack message.
 	if len(handlerReplyParts) > 0 {
 		answer = strings.Join(handlerReplyParts, "\n\n") + "\n\n" + answer
+	}
+
+	// Append CSV download link unconditionally when a file was generated.
+	// We never rely on the LLM to copy the link from the context.
+	if csvDownloadLine != "" {
+		answer += "\n\n" + csvDownloadLine
 	}
 
 	// Append Outline source links when documentation was used.

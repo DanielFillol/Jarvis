@@ -396,7 +396,7 @@ Pergunta: %s`, question)
 // will use it to correct the query rather than regenerating from scratch.
 // Returns the SQL string, or a string prefixed with ClarificationPrefix when the
 // LLM needs more information from the user before it can generate a valid query.
-func (c *Client) GenerateSQL(question, threadHist, schemaCtx, baseSQL, lastErr, dbEngine, model string) (string, error) {
+func (c *Client) GenerateSQL(question, threadHist, schemaCtx, baseSQL, lastErr, dbEngine string, wantsAllRows bool, model string) (string, error) {
 	if strings.TrimSpace(model) == "" {
 		model = "gpt-4o-mini"
 	}
@@ -438,6 +438,17 @@ func (c *Client) GenerateSQL(question, threadHist, schemaCtx, baseSQL, lastErr, 
 	if engineCtx == "" {
 		engineCtx = "desconhecido"
 	}
+
+	limitSection := "Limite a 200 linhas por padrão, a menos que o usuário tenha pedido explicitamente todos os dados ou uma lista completa."
+	queryTypeSection := `TIPO DE QUERY — escolha o formato certo para a pergunta:
+- Perguntas analíticas ("analise", "estude", "como está", "quais problemas", "o que melhorar", "tendências", "padrões", "uso", "falhas", "feedbacks", "insights"): use SEMPRE queries com agregações (COUNT, SUM, AVG, GROUP BY, percentuais). Nunca retorne registros individuais brutos para perguntas desse tipo — um resumo agregado é muito mais útil que 1000 linhas de dados.
+- Perguntas de listagem ("lista", "mostre os registros", "quais são os X mais..."): retorne no máximo 50 registros com os campos mais relevantes.
+- Perguntas de exportação ("exportar", "csv", "todos os dados"): aí sim retorne registros individuais com LIMIT 1000.`
+	if wantsAllRows {
+		limitSection = "LIMITE: O usuário solicitou TODOS os dados explicitamente. NÃO use LIMIT ou use LIMIT 50000."
+		queryTypeSection = "TIPO DE QUERY: O usuário pediu todos os dados — retorne registros individuais SEM LIMIT (ou LIMIT 50000)."
+	}
+
 	prompt := fmt.Sprintf(`Você é um especialista em SQL que gera queries nativas para o Metabase.
 Engine do banco de dados: %s
 %s
@@ -454,12 +465,9 @@ INSTRUÇÕES:
 - Se a pergunta for ambígua ou carecer de informação essencial que não pode ser inferida do histórico (ex: período de tempo obrigatório não especificado), responda APENAS com: %s<pergunta de esclarecimento em português>
 - Use somente tabelas e colunas que existem no schema acima.
 - Inclua ORDER BY quando relevante para a pergunta.
-- Limite a 200 linhas por padrão, a menos que o usuário tenha pedido explicitamente todos os dados ou uma lista completa.
+- %s
 
-TIPO DE QUERY — escolha o formato certo para a pergunta:
-- Perguntas analíticas ("analise", "estude", "como está", "quais problemas", "o que melhorar", "tendências", "padrões", "uso", "falhas", "feedbacks", "insights"): use SEMPRE queries com agregações (COUNT, SUM, AVG, GROUP BY, percentuais). Nunca retorne registros individuais brutos para perguntas desse tipo — um resumo agregado é muito mais útil que 1000 linhas de dados.
-- Perguntas de listagem ("lista", "mostre os registros", "quais são os X mais..."): retorne no máximo 50 registros com os campos mais relevantes.
-- Perguntas de exportação ("exportar", "csv", "todos os dados"): aí sim retorne registros individuais com LIMIT 1000.
+%s
 
 REGRAS DE SQL:
 - Buscas textuais: use ILIKE '%%termo%%'. Redshift ILIKE é insensível a maiúsculas mas NÃO a acentos — use substrings curtas e sem caracteres acentuados para maior abrangência.
@@ -467,7 +475,7 @@ REGRAS DE SQL:
 - Prefira tabelas base/normalizadas em vez de views ou tabelas de staging.
 - Datas: use os tipos corretos da coluna (Date vs DateTime) e filtre com >= / < ou BETWEEN conforme a sintaxe do engine acima.
 - Use as referências de data acima para expressões relativas como "semana passada", "hoje", "mês passado".`,
-		engineCtx, dateCtx, clip(schemaCtx, 120000), baseCtx, clip(threadHist, 800), question, ClarificationPrefix)
+		engineCtx, dateCtx, clip(schemaCtx, 120000), baseCtx, clip(threadHist, 800), question, ClarificationPrefix, limitSection, queryTypeSection)
 
 	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}
 	out, err := c.Chat(msgs, model, 0.1, 2000)
