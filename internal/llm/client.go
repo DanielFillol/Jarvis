@@ -263,7 +263,9 @@ Fontes disponíveis:
 - Metabase (banco de dados): dados estruturados do banco operacional. Se a pergunta filtra, lista ou consulta entidades (registros, entidades operacionais, transações, pedidos), use metabase_query. NÃO use slack_search para dados que vivem no banco.
 
 Regras para jira_create e jira_edit:
-- "jira_create": verbo de criação EXPLÍCITO (criar/cria/abre/abrir/gera/gerar) + tipo de issue, pedido AGORA
+- "jira_create": verbo de criação EXPLÍCITO (criar/cria/abre/abrir/gera/gerar) + tipo de issue Jira (tarefa, bug, história, épico, spike), pedido AGORA
+- "jira_create" NÃO se aplica quando o usuário pede criação de conteúdo textual (checklists, documentos, planos, textos, relatórios, listas) para ser exibido na conversa — nesses casos retorne [].
+- "jira_create" NÃO se aplica quando o usuário diz explicitamente que quer o resultado na thread/chat ("em texto aqui", "quero aqui na thread", "responde aqui", "me manda aqui", "só me diz", "me mostra aqui").
 - "jira_edit": mudar status, atribuir, alterar campos, mover para sprint, "adicione para", "atribuir", "assign"
 - Hipóteses ("estou pensando em criar") → sem jira_create
 - Negações ("não quero criar") → sem jira_create
@@ -276,7 +278,7 @@ Regras de roteamento de contexto:
 7. Se o histórico contém SQL ou resultados de banco E o usuário faz follow-up → metabase_query. Use database_id da linha "Query executada (db=N):" do histórico.
 8. show_sql SOMENTE quando usuário pede EXPLICITAMENTE o SQL/query/código usado ("SQL", "query", "consulta que você rodou", "me mostra o código"). Pedidos de dados → metabase_query, não show_sql. Inclua database_id do "Query executada (db=N):" do histórico (ou 0).
 9. Follow-ups com pronomes ("dessas", "desses") referindo entidades já consultadas → metabase_query com mesmo database_id do turno anterior.
-10. wants_all_rows=true: usuário quer todos os dados ("todos", "tudo", "sem limite", "lista completa", "traz tudo").
+10. wants_all_rows=true: usuário quer explicitamente TODOS OS REGISTROS de dados ("todos os registros", "sem limite", "lista completa", "traz tudo", "quero todos"). NÃO use true quando "todos" se refere a tópicos/aspectos de análise (ex: "analise todos os aspectos", "todas as categorias") — nesses casos o usuário quer uma análise, não um dump de dados.
 11. wants_csv_export=true: exportação explícita ("exportar", "csv", "planilha", "download", "baixar", "excel") OU pedido de todos os dados. Quando true, também wants_all_rows=true.
 %s
 Regras para query em slack_search (IMPORTANTE):
@@ -452,7 +454,12 @@ INSTRUÇÕES:
 - Se a pergunta for ambígua ou carecer de informação essencial que não pode ser inferida do histórico (ex: período de tempo obrigatório não especificado), responda APENAS com: %s<pergunta de esclarecimento em português>
 - Use somente tabelas e colunas que existem no schema acima.
 - Inclua ORDER BY quando relevante para a pergunta.
-- Limite a 1000 linhas por padrão, a menos que o usuário tenha pedido todos os dados.
+- Limite a 200 linhas por padrão, a menos que o usuário tenha pedido explicitamente todos os dados ou uma lista completa.
+
+TIPO DE QUERY — escolha o formato certo para a pergunta:
+- Perguntas analíticas ("analise", "estude", "como está", "quais problemas", "o que melhorar", "tendências", "padrões", "uso", "falhas", "feedbacks", "insights"): use SEMPRE queries com agregações (COUNT, SUM, AVG, GROUP BY, percentuais). Nunca retorne registros individuais brutos para perguntas desse tipo — um resumo agregado é muito mais útil que 1000 linhas de dados.
+- Perguntas de listagem ("lista", "mostre os registros", "quais são os X mais..."): retorne no máximo 50 registros com os campos mais relevantes.
+- Perguntas de exportação ("exportar", "csv", "todos os dados"): aí sim retorne registros individuais com LIMIT 1000.
 
 REGRAS DE SQL:
 - Buscas textuais: use ILIKE '%%termo%%'. Redshift ILIKE é insensível a maiúsculas mas NÃO a acentos — use substrings curtas e sem caracteres acentuados para maior abrangência.
