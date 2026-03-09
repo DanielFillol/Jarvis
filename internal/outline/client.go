@@ -51,6 +51,64 @@ type Document struct {
 	URL   string
 }
 
+type listRequest struct {
+	Limit     int    `json:"limit"`
+	Sort      string `json:"sort"`
+	Direction string `json:"direction"`
+}
+
+type listResponse struct {
+	Data []searchDocResult `json:"data"`
+}
+
+// ListDocuments returns up to limit recently-updated published documents.
+// Results are wrapped as SearchResult so FormatContext can be reused.
+func (c *Client) ListDocuments(limit int) ([]SearchResult, error) {
+	if limit <= 0 {
+		limit = 15
+	}
+	body, _ := json.Marshal(listRequest{
+		Limit:     limit,
+		Sort:      "updatedAt",
+		Direction: "DESC",
+	})
+	req, err := http.NewRequest("POST", c.BaseURL+"/documents.list", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("outline: list status=%d body=%s", resp.StatusCode, previewStr(string(rb), 200))
+	}
+	var lr listResponse
+	if err := json.Unmarshal(rb, &lr); err != nil {
+		return nil, fmt.Errorf("outline: list decode: %w", err)
+	}
+	results := make([]SearchResult, 0, len(lr.Data))
+	for _, d := range lr.Data {
+		docURL := d.URL
+		if docURL != "" && !strings.HasPrefix(docURL, "http") {
+			docURL = c.Origin + docURL
+		}
+		results = append(results, SearchResult{
+			Document: Document{
+				ID:    d.ID,
+				Title: d.Title,
+				Text:  d.Text,
+				URL:   docURL,
+			},
+		})
+	}
+	return results, nil
+}
+
 type searchRequest struct {
 	Query        string   `json:"query"`
 	Limit        int      `json:"limit"`
