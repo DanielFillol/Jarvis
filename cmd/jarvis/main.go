@@ -45,6 +45,14 @@ func main() {
 	// Construct core service
 	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs, outlineClient)
 
+	// Generate company context asynchronously from Jira + Metabase docs + Outline.
+	go func() {
+		ctx := app.GenerateCompanyContext(cfg, outlineClient, llmClient)
+		if ctx != "" {
+			service.SetCompanyCtx(ctx)
+		}
+	}()
+
 	// Slack events endpoint
 	slackHandler := httpinternal.NewSlackHandler(slackClient, service)
 
