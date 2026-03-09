@@ -84,6 +84,11 @@ type Config struct {
 	// CompanyContextPath is the output path for the generated company context
 	// Markdown file.  Defaults to "./docs/company_context.md".
 	CompanyContextPath string
+
+	// HintsPath is the path to an optional user-maintained hints/tips file
+	// (Markdown) loaded at startup and injected into every LLM answer call.
+	// Defaults to "./docs/hints.md".  If the file is absent nothing breaks.
+	HintsPath string
 }
 
 // Load reads configuration from environment variables.  A .env file in the
@@ -126,6 +131,7 @@ func Load() Config {
 	cfg.OutlineBaseURL = strings.TrimRight(getEnv("OUTLINE_BASE_URL", ""), "/")
 	cfg.OutlineAPIKey = os.Getenv("OUTLINE_API_KEY")
 	cfg.CompanyContextPath = getEnv("COMPANY_CONTEXT_PATH", "./docs/company_context.md")
+	cfg.HintsPath = getEnv("HINTS_PATH", "./docs/hints.md")
 
 	pages := getEnv("SLACK_SEARCH_MAX_PAGES", "10")
 	if n, err := strconv.Atoi(pages); err == nil {

@@ -58,6 +58,9 @@ type Service struct {
 
 	// companyCtx holds the generated domain glossary injected into every answer call.
 	companyCtx atomic.Value
+
+	// hintsCtx holds the user-maintained hints file content (loaded once at startup).
+	hintsCtx string
 }
 
 // NewService constructs a new Jarvis service from its dependencies.
@@ -74,6 +77,7 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 		FileServer: fs,
 		Store:      *state.NewStore(2 * time.Hour),
 		Outline:    outlineClient,
+		hintsCtx:   readDocFile(cfg.HintsPath, 10000),
 	}
 }
 
@@ -562,7 +566,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 
 	// 11) Generate the answer with the primary LLM (with retry and fallback).
 	answer, err := s.LLM.AnswerWithRetry(
-		s.getCompanyCtx(),
+		s.getCompanyCtx(), s.hintsCtx,
 		questionForLLM, threadHist, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images,
 		s.Cfg.OpenAIModel, s.Cfg.OpenAILesserModel, 2, 0,
 	)
