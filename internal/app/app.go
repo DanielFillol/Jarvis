@@ -5,6 +5,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/DanielFillol/Jarvis/internal/config"
@@ -54,6 +55,9 @@ type Service struct {
 	Store      state.Store
 	FileServer *fileserver.FileServer
 	Outline    *outline.Client
+
+	// companyCtx holds the generated domain glossary injected into every answer call.
+	companyCtx atomic.Value
 }
 
 // NewService constructs a new Jarvis service from its dependencies.
@@ -71,6 +75,16 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 		Store:      *state.NewStore(2 * time.Hour),
 		Outline:    outlineClient,
 	}
+}
+
+// SetCompanyCtx stores the generated domain glossary for injection into answer calls.
+func (s *Service) SetCompanyCtx(ctx string) { s.companyCtx.Store(ctx) }
+
+func (s *Service) getCompanyCtx() string {
+	if v := s.companyCtx.Load(); v != nil {
+		return v.(string)
+	}
+	return ""
 }
 
 // HandleMessage processes an incoming message directed at the bot.  It
@@ -356,7 +370,12 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 
 			// CSV export or large result handling.
 			const largeResultThreshold = 30
-			if thisQR != nil && action.WantsCSVExport && s.FileServer != nil && strings.TrimSpace(s.Cfg.PublicBaseURL) != "" {
+			// Auto-trigger CSV when the result is large enough that an inline table
+			// would be unreadably long (> 100 rows), even if the user didn't explicitly
+			// request a CSV export.
+			const csvAutoThreshold = 100
+			wantsCSV := action.WantsCSVExport || (thisQR != nil && len(thisQR.Data.Rows) > csvAutoThreshold && action.WantsAllRows)
+			if thisQR != nil && wantsCSV && s.FileServer != nil && strings.TrimSpace(s.Cfg.PublicBaseURL) != "" {
 				nRows := len(thisQR.Data.Rows)
 				cols := make([]string, len(thisQR.Data.Cols))
 				for i, c := range thisQR.Data.Cols {
@@ -489,7 +508,12 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			continue
 		}
 		if i < len(dbQueryActions) && dbQueryActions[i].WantsAllRows && len(qr.Data.Rows) > 30 {
-			appendDataTable += metabase.FormatQueryResult(*qr, len(qr.Data.Rows))
+			// Cap inline table to 100 rows; larger results should have gone through CSV.
+			showRows := len(qr.Data.Rows)
+			if showRows > 100 {
+				showRows = 100
+			}
+			appendDataTable += metabase.FormatQueryResult(*qr, showRows)
 		}
 	}
 	_ = dbQueryActions // suppress unused warning if no large results
@@ -538,6 +562,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 
 	// 11) Generate the answer with the primary LLM (with retry and fallback).
 	answer, err := s.LLM.AnswerWithRetry(
+		s.getCompanyCtx(),
 		questionForLLM, threadHist, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images,
 		s.Cfg.OpenAIModel, s.Cfg.OpenAILesserModel, 2, 0,
 	)
