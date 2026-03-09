@@ -2,6 +2,7 @@
 metabase_schema.md
 metabase_schema_compact.md
 jira_projects.md
+company_context.md
 .env
 go.mod
 go.sum
