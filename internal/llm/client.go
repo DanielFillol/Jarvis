@@ -278,7 +278,7 @@ Regras de roteamento de contexto:
 7. Se o histórico contém SQL ou resultados de banco E o usuário faz follow-up → metabase_query. Use database_id da linha "Query executada (db=N):" do histórico.
 8. show_sql SOMENTE quando usuário pede EXPLICITAMENTE o SQL/query/código usado ("SQL", "query", "consulta que você rodou", "me mostra o código"). Pedidos de dados → metabase_query, não show_sql. Inclua database_id do "Query executada (db=N):" do histórico (ou 0).
 9. Follow-ups com pronomes ("dessas", "desses") referindo entidades já consultadas → metabase_query com mesmo database_id do turno anterior.
-10. wants_all_rows=true: usuário quer explicitamente TODOS OS REGISTROS de dados ("todos os registros", "sem limite", "lista completa", "traz tudo", "quero todos"). NÃO use true quando "todos" se refere a tópicos/aspectos de análise (ex: "analise todos os aspectos", "todas as categorias") — nesses casos o usuário quer uma análise, não um dump de dados.
+10. wants_all_rows=true: usuário quer TODOS OS REGISTROS de uma entidade de dados — mesmo que filtrado por data ou outro critério. Sinais: "todas as coletas", "todos os pedidos", "todos os registros", "sem limite", "lista completa", "traz tudo", "quero todos", "detalhamento de todas", "me traz todas". NÃO use true quando "todos" se refere a tópicos/aspectos de análise (ex: "analise todos os aspectos", "todas as categorias") — nesses casos o usuário quer uma análise agregada, não um dump de registros individuais.
 11. wants_csv_export=true: exportação explícita ("exportar", "csv", "planilha", "download", "baixar", "excel") OU pedido de todos os dados. Quando true, também wants_all_rows=true.
 %s
 Regras para query em slack_search (IMPORTANTE):
@@ -396,7 +396,7 @@ Pergunta: %s`, question)
 // will use it to correct the query rather than regenerating from scratch.
 // Returns the SQL string, or a string prefixed with ClarificationPrefix when the
 // LLM needs more information from the user before it can generate a valid query.
-func (c *Client) GenerateSQL(question, threadHist, schemaCtx, baseSQL, lastErr, dbEngine string, wantsAllRows bool, model string) (string, error) {
+func (c *Client) GenerateSQL(question, threadHist, schemaCtx, baseSQL, lastErr, dbEngine, hintsCtx string, wantsAllRows bool, model string) (string, error) {
 	if strings.TrimSpace(model) == "" {
 		model = "gpt-4o-mini"
 	}
@@ -439,6 +439,11 @@ func (c *Client) GenerateSQL(question, threadHist, schemaCtx, baseSQL, lastErr, 
 		engineCtx = "desconhecido"
 	}
 
+	hintsSection := ""
+	if strings.TrimSpace(hintsCtx) != "" {
+		hintsSection = "\n\nQUERY DE REFERÊNCIA PARA ESTE BANCO (use como guia de tabelas, JOINs e aliases — adapte os filtros conforme a pergunta):\n```sql\n" + strings.TrimSpace(hintsCtx) + "\n```\n"
+	}
+
 	limitSection := "Limite a 200 linhas por padrão, a menos que o usuário tenha pedido explicitamente todos os dados ou uma lista completa."
 	queryTypeSection := `TIPO DE QUERY — escolha o formato certo para a pergunta:
 - Perguntas analíticas ("analise", "estude", "como está", "quais problemas", "o que melhorar", "tendências", "padrões", "uso", "falhas", "feedbacks", "insights"): use SEMPRE queries com agregações (COUNT, SUM, AVG, GROUP BY, percentuais). Nunca retorne registros individuais brutos para perguntas desse tipo — um resumo agregado é muito mais útil que 1000 linhas de dados.
@@ -454,7 +459,7 @@ Engine do banco de dados: %s
 %s
 Schema do banco de dados:
 %s
-%s
+%s%s
 Histórico da conversa (para contexto):
 %s
 
@@ -475,7 +480,7 @@ REGRAS DE SQL:
 - Prefira tabelas base/normalizadas em vez de views ou tabelas de staging.
 - Datas: use os tipos corretos da coluna (Date vs DateTime) e filtre com >= / < ou BETWEEN conforme a sintaxe do engine acima.
 - Use as referências de data acima para expressões relativas como "semana passada", "hoje", "mês passado".`,
-		engineCtx, dateCtx, clip(schemaCtx, 120000), baseCtx, clip(threadHist, 800), question, ClarificationPrefix, limitSection, queryTypeSection)
+		engineCtx, dateCtx, clip(schemaCtx, 120000), baseCtx, hintsSection, clip(threadHist, 800), question, ClarificationPrefix, limitSection, queryTypeSection)
 
 	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}
 	out, err := c.Chat(msgs, model, 0.1, 2000)

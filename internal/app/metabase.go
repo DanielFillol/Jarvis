@@ -130,11 +130,13 @@ func (s *Service) runMetabaseQuery(question, threadHist string, dbID int, baseSQ
 		}
 	}
 
+	hintsCtx := loadDBHints(s.Cfg.SQLHintsDir, dbID)
+
 	const maxAttempts = 3
 	lastSQL := strings.TrimSpace(baseSQL)
 	lastErr := ""
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		sql, err := s.LLM.GenerateSQL(question, threadHist, schema, lastSQL, lastErr, dbEngine, wantsAllRows, s.Cfg.OpenAIModel)
+		sql, err := s.LLM.GenerateSQL(question, threadHist, schema, lastSQL, lastErr, dbEngine, hintsCtx, wantsAllRows, s.Cfg.OpenAIModel)
 		if err != nil {
 			log.Printf("[METABASE] GenerateSQL attempt %d failed: %v", attempt, err)
 			continue
@@ -164,4 +166,18 @@ func (s *Service) runMetabaseQuery(question, threadHist string, dbID int, baseSQ
 	}
 	log.Printf("[METABASE] all %d attempts failed for db=%d", maxAttempts, dbID)
 	return metabaseQueryResult{}
+}
+
+// loadDBHints reads the hint file for the given database ID from dir.
+// Returns "" when the file is absent or empty — callers treat that as "no hints".
+func loadDBHints(dir string, dbID int) string {
+	if strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	path := filepath.Join(dir, fmt.Sprintf("db_%d.md", dbID))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "" // file absent is normal — not an error
+	}
+	return strings.TrimSpace(string(data))
 }
