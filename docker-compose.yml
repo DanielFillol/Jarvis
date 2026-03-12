@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: jarvis_telemetry
+      POSTGRES_USER: jarvis
+      POSTGRES_PASSWORD: jarvis
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jarvis -d jarvis_telemetry"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  jarvis:
+    build: .
+    env_file: .env
+    environment:
+      TELEMETRY_DB_URL: postgres://jarvis:jarvis@postgres:5432/jarvis_telemetry?sslmode=disable
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
