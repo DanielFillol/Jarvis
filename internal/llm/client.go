@@ -221,7 +221,8 @@ func (c *Client) DecideActions(
 3. Resumo/retrospectiva de processo (sprint, fechamento, entrega) → jira_search E slack_search.
 4. Se jira_search para pergunta substantiva (não apenas listagem de tickets), considere slack_search também.
 5. Perguntas curtas (≤ 2 palavras) ou com resposta no histórico → sem jira_search, sem slack_search.
-6. Criar card no Jira → sem slack_search, sem jira_search.`
+6. Criar card no Jira → sem slack_search, sem jira_search.
+7. jira_create e jira_edit NUNCA devem aparecer juntos no mesmo array, a menos que o edit use o card recém-criado (override). Se a intent for criar um card novo, use apenas jira_create.`
 		jiraIntentBlock = `
 Valores de jira_intent (campo de jira_search):
 - "listar_bugs_abertos": perguntas sobre bugs em aberto, falhas, erros.
