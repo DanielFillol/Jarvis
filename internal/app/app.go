@@ -17,6 +17,7 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/parse"
 	"github.com/DanielFillol/Jarvis/internal/slack"
 	"github.com/DanielFillol/Jarvis/internal/state"
+	"github.com/DanielFillol/Jarvis/internal/telemetry"
 )
 
 // pendingReply holds the message chunks for a long answer awaiting confirmation
@@ -55,6 +56,7 @@ type Service struct {
 	Store      state.Store
 	FileServer *fileserver.FileServer
 	Outline    *outline.Client
+	Telemetry  *telemetry.Client
 
 	// companyCtx holds the generated domain glossary injected into every answer call.
 	companyCtx atomic.Value
@@ -64,7 +66,8 @@ type Service struct {
 // metabaseClient may be nil when Metabase integration is not configured.
 // fs may be nil when CSV export is not needed.
 // outlineClient may be nil when Outline integration is not configured.
-func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, metabaseClient *metabase.Client, fs *fileserver.FileServer, outlineClient *outline.Client) *Service {
+// telemetryClient may be nil when telemetry is not configured.
+func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, metabaseClient *metabase.Client, fs *fileserver.FileServer, outlineClient *outline.Client, telemetryClient *telemetry.Client) *Service {
 	return &Service{
 		Slack:      slackClient,
 		Jira:       jiraClient,
@@ -74,6 +77,7 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 		FileServer: fs,
 		Store:      *state.NewStore(2 * time.Hour),
 		Outline:    outlineClient,
+		Telemetry:  telemetryClient,
 	}
 }
 
@@ -94,6 +98,24 @@ func (s *Service) getCompanyCtx() string {
 func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, question, senderUserID string, files []slack.File) error {
 	start := time.Now()
 	log.Printf("[JARVIS] start question=%q originTs=%q senderUserID=%q", preview(question, 180), originTs, senderUserID)
+
+	// Telemetry: populate base fields now; remaining fields are filled in-line
+	// and the event is recorded (fire-and-forget) when HandleMessage returns.
+	telEvent := telemetry.Event{
+		Channel:      channel,
+		ChannelType:  channelType(channel),
+		ThreadTs:     threadTs,
+		OriginTs:     originTs,
+		SenderUserID: senderUserID,
+		QuestionLen:  len(question),
+		FileCount:    len(files),
+		LLMModel:     s.Cfg.OpenAIModel,
+		Success:      true,
+	}
+	defer func() {
+		telEvent.DurationMs = int(time.Since(start).Milliseconds())
+		s.Telemetry.Record(telEvent)
+	}()
 
 	// 1) Resolve thread context: current thread vs. explicit Slack permalink.
 	contextChannel := channel
@@ -175,6 +197,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		log.Printf("[WARN] decideActions failed: %v", actErr)
 		actions = fallbackActions(hasThreadPermalink)
 	}
+	telEvent.Actions = actionKinds(actions)
 	// Explicit permalink → thread is already the authoritative context; drop Slack searches.
 	if hasThreadPermalink {
 		filtered := actions[:0]
@@ -213,7 +236,11 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		}
 	}
 
-	if containsKind(handlerActions, llm.ActionJiraEdit) {
+	// Do not run jira_edit when create was handled without a card being produced
+	// (e.g. bot is asking for missing fields). Once a card is actually created
+	// (createdKey != ""), edit may run to apply extra fields from the same request.
+	pendingCreateHandled := anyHandled && createdKey == ""
+	if containsKind(handlerActions, llm.ActionJiraEdit) && !pendingCreateHandled {
 		editRes, editErr := s.maybeHandleJiraEditFlows(channel, threadTs, senderUserID, question, threadHist, createdKey, true, quiet)
 		if editRes.Handled {
 			anyHandled = true
@@ -230,6 +257,12 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	if anyHandled && len(contextActions) == 0 {
 		log.Printf("[JARVIS] handlerFlows handled dur=%s", time.Since(start))
 		return nil
+	}
+
+	// 4b) Smoke-test command: run the prompt library test cycle.
+	if isTestCommand(question) {
+		log.Printf("[JARVIS] testFlow triggered dur=%s", time.Since(start))
+		return s.handleTestFlow(channel, threadTs)
 	}
 
 	// 5) Post a "searching…" placeholder so the user knows Jarvis is working.
@@ -269,6 +302,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 				continue
 			}
 			executedSlackSearch = true
+			telEvent.SlackSearched = true
 			unresolvedUserIDs := extractFromUserIDs(action.Query)
 			resolvedQuery := s.Slack.ResolveUserIDsInQuery(action.Query)
 			log.Printf("[JARVIS] slackSearch query=%q", resolvedQuery)
@@ -292,6 +326,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			}
 			if len(matches) > 0 {
 				slackMatches += len(matches)
+				telEvent.SlackMatches += len(matches)
 				ctx := buildSlackContext(matches, 25)
 				log.Printf("[JARVIS] slackContext matches=%d chars=%d", len(matches), len(ctx))
 				slackCtxParts = append(slackCtxParts, ctx)
@@ -301,6 +336,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 
 		case llm.ActionJiraSearch:
 			executedJiraSearch = true
+			telEvent.JiraSearched = true
 			jql := strings.TrimSpace(action.JQL)
 			if jql == "" {
 				jql = defaultJQLForIntent(action.JiraIntent, question, s.Cfg.JiraProjectKeys)
@@ -310,14 +346,34 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			issues, jErr := s.Jira.FetchAll(jql, 200)
 			if jErr != nil {
 				log.Printf("[WARN] jira search failed: %v", jErr)
+				// Attempt JQL correction using real workflow statuses from catalog.
+				if corrected := correctJQLStatus(jql, s.Jira.WorkflowStatuses); corrected != jql {
+					log.Printf("[JARVIS] jiraJQL corrected=%q", corrected)
+					issues, jErr = s.Jira.FetchAll(corrected, 200)
+				}
+			}
+			if jErr != nil {
+				telEvent.JiraError = true
+				jiraCtxParts = append(jiraCtxParts,
+					"[JIRA_ERROR: A busca falhou. NÃO invente issues, títulos, assignees ou chaves. "+
+						"Informe o usuário que houve um erro ao consultar o Jira e peça para refinar a busca.]")
+				break
+			}
+			if len(issues) == 0 {
+				jiraCtxParts = append(jiraCtxParts,
+					fmt.Sprintf("[JIRA_EMPTY: JQL '%s' retornou 0 issues. "+
+						"Informe o usuário que não foram encontradas issues com esses critérios. "+
+						"NÃO invente issues.]", jql))
 				break
 			}
 			jiraIssuesFound += len(issues)
+			telEvent.JiraIssues += len(issues)
 			ctx := buildJiraContext(issues, 40)
 			log.Printf("[JARVIS] jiraContext issues=%d chars=%d", len(issues), len(ctx))
 			jiraCtxParts = append(jiraCtxParts, ctx)
 
 		case llm.ActionOutlineSearch:
+			telEvent.OutlineSearched = true
 			outlineQuery := strings.TrimSpace(action.Query)
 			if outlineQuery == "" {
 				outlineQuery = s.LLM.GenerateOutlineQuery(questionForLLM, s.Cfg.OpenAILesserModel)
@@ -341,6 +397,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			}
 
 		case llm.ActionMetabaseQuery:
+			telEvent.MetabaseQueried = true
 			if s.Metabase == nil {
 				break
 			}
@@ -351,7 +408,33 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 				}
 			}
 			mRes := s.runMetabaseQuery(questionForLLM, threadHist, action.MetabaseDatabaseID, baseSQL, action.WantsAllRows)
+
+			// Cross-database fallback: when primary DB returned no data or failed entirely,
+			// try remaining databases before giving up.
+			if !strings.HasPrefix(mRes.DBCtx, llm.ClarificationPrefix) {
+				primaryEmpty := mRes.DBCtx == "" || (mRes.QueryResult != nil && len(mRes.QueryResult.Data.Rows) == 0)
+				if primaryEmpty {
+					for _, db := range s.Metabase.Databases {
+						if db.ID == action.MetabaseDatabaseID {
+							continue
+						}
+						log.Printf("[METABASE] primary db=%d returned no data, trying fallback db=%d (%s)",
+							action.MetabaseDatabaseID, db.ID, db.Name)
+						fbRes := s.runMetabaseQuery(questionForLLM, threadHist, db.ID, "", action.WantsAllRows)
+						if fbRes.QueryResult != nil && len(fbRes.QueryResult.Data.Rows) > 0 {
+							mRes = fbRes
+							action.MetabaseDatabaseID = db.ID
+							log.Printf("[METABASE] fallback db=%d succeeded rows=%d", db.ID, len(fbRes.QueryResult.Data.Rows))
+							break
+						}
+					}
+				}
+			}
+
 			thisDBCtx, thisQR, thisSql := mRes.DBCtx, mRes.QueryResult, mRes.ExecutedSQL
+			if thisQR != nil {
+				telEvent.MetabaseRows += len(thisQR.Data.Rows)
+			}
 			if strings.HasPrefix(thisDBCtx, llm.ClarificationPrefix) {
 				clarificationQ := strings.TrimPrefix(thisDBCtx, llm.ClarificationPrefix)
 				if replyErr := replyFn(clarificationQ); replyErr != nil {
@@ -393,6 +476,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 					// Store the download line separately so it is always appended to the
 					// final answer — never rely on the LLM to include it.
 					csvDownloadLine = fmt.Sprintf(":page_facing_up: *Download CSV:* <%s|resultado.csv> _(expira em 1 hora)_", csvURL)
+					telEvent.CSVGenerated = true
 					dbCtxParts = append(dbCtxParts, fmt.Sprintf(
 						"Query SQL retornou %d registros com os campos: %s.\n\n"+
 							"INSTRUÇÃO INTERNA: Escreva APENAS 1 frase curta de introdução descrevendo o resultado "+
@@ -636,8 +720,13 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		return nil
 	}
 
+	telEvent.AnswerLen = len(answer)
+	telEvent.Question = question
+	telEvent.Answer = answer
 	if err := replyFn(answer); err != nil {
 		log.Printf("[ERR] postSlackMessage failed: %v", err)
+		telEvent.Success = false
+		telEvent.ErrorStage = "post_message"
 		return err
 	}
 	if busyTs != "" {
@@ -686,4 +775,13 @@ func fallbackActions(hasThreadPermalink bool) []llm.ActionDescriptor {
 		return nil // thread content is already the context
 	}
 	return []llm.ActionDescriptor{{Kind: llm.ActionJiraSearch, JiraIntent: "default"}}
+}
+
+// channelType returns "dm" for direct-message channels (IDs starting with "D")
+// and "channel" for everything else.
+func channelType(channel string) string {
+	if strings.HasPrefix(channel, "D") {
+		return "dm"
+	}
+	return "channel"
 }
