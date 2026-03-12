@@ -13,6 +13,7 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/metabase"
 	"github.com/DanielFillol/Jarvis/internal/outline"
 	"github.com/DanielFillol/Jarvis/internal/slack"
+	"github.com/DanielFillol/Jarvis/internal/telemetry"
 )
 
 func main() {
@@ -34,6 +35,12 @@ func main() {
 		log.Printf("[BOOT] Outline enabled base_url=%q", cfg.OutlineBaseURL)
 	}
 
+	// Initialize optional telemetry client (nil when TELEMETRY_DB_URL is empty).
+	telemetryClient := telemetry.NewClient(cfg.TelemetryDBURL)
+	if telemetryClient != nil {
+		defer telemetryClient.Close()
+	}
+
 	// Generate Jira project catalog asynchronously (enriches CatalogCompact from raw keys).
 	if cfg.JiraEnabled() {
 		go func() {
@@ -43,7 +50,7 @@ func main() {
 	}
 
 	// Construct core service
-	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs, outlineClient)
+	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs, outlineClient, telemetryClient)
 
 	// Generate company context asynchronously from Jira + Metabase docs + Outline.
 	go func() {
