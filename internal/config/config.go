@@ -89,6 +89,12 @@ type Config struct {
 	// (e.g. db_3.md for database ID 3). Defaults to "./docs/sql_hints".
 	// If the directory is absent nothing breaks — hints are simply skipped.
 	SQLHintsDir string
+
+	// ── Optional: Telemetry ──────────────────────────────────────────────────
+	// Set TELEMETRY_DB_URL to a PostgreSQL DSN (e.g.
+	// postgres://user:pass@host:5432/dbname?sslmode=disable) to enable
+	// usage telemetry.  When empty, telemetry is silently disabled.
+	TelemetryDBURL string
 }
 
 // Load reads configuration from environment variables.  A .env file in the
@@ -132,6 +138,7 @@ func Load() Config {
 	cfg.OutlineAPIKey = os.Getenv("OUTLINE_API_KEY")
 	cfg.CompanyContextPath = getEnv("COMPANY_CONTEXT_PATH", "./docs/company_context.md")
 	cfg.SQLHintsDir = getEnv("SQL_HINTS_DIR", "./docs/sql_hints")
+	cfg.TelemetryDBURL = os.Getenv("TELEMETRY_DB_URL")
 
 	pages := getEnv("SLACK_SEARCH_MAX_PAGES", "10")
 	if n, err := strconv.Atoi(pages); err == nil {
