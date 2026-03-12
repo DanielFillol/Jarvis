@@ -18,6 +18,66 @@ import (
 var reSplitOR = regexp.MustCompile(`(?i)\s+OR\s+`)
 var reLastAND = regexp.MustCompile(`(?i)^(.*)\s+AND\s+(.+)$`)
 
+// reJQLProject matches "project = KEY" or "project in (KEY)" in JQL.
+var reJQLProject = regexp.MustCompile(`(?i)\bproject\s*=\s*([A-Z][A-Z0-9]+)`)
+
+// reJQLStatusValue matches status = "VALUE" in JQL (double-quoted values).
+var reJQLStatusValue = regexp.MustCompile(`(?i)\bstatus\s*=\s*"([^"]+)"`)
+
+// correctJQLStatus tries to fix a JQL that failed due to an invalid status name.
+// It finds status = "VALUE" clauses, looks up the real status name in workflowStatuses
+// using a case-insensitive comparison, and returns the corrected JQL.
+// Returns the original JQL unchanged if no correction is possible.
+func correctJQLStatus(jql string, workflowStatuses map[string][]string) string {
+	if len(workflowStatuses) == 0 {
+		return jql
+	}
+
+	// Determine which project the JQL targets to narrow the candidate list.
+	projectKey := ""
+	if m := reJQLProject.FindStringSubmatch(jql); m != nil {
+		projectKey = strings.ToUpper(m[1])
+	}
+
+	// Collect candidate status names from this project or all projects.
+	var candidates []string
+	if projectKey != "" {
+		if ss, ok := workflowStatuses[projectKey]; ok {
+			candidates = ss
+		}
+	}
+	if len(candidates) == 0 {
+		seen := make(map[string]bool)
+		for _, ss := range workflowStatuses {
+			for _, s := range ss {
+				if !seen[s] {
+					seen[s] = true
+					candidates = append(candidates, s)
+				}
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return jql
+	}
+
+	// Replace each status value with the correctly-cased real name.
+	result := reJQLStatusValue.ReplaceAllStringFunc(jql, func(match string) string {
+		sub := reJQLStatusValue.FindStringSubmatch(match)
+		if sub == nil {
+			return match
+		}
+		val := sub[1]
+		for _, c := range candidates {
+			if strings.EqualFold(c, val) && c != val {
+				return strings.Replace(match, `"`+val+`"`, `"`+c+`"`, 1)
+			}
+		}
+		return match
+	})
+	return result
+}
+
 // missingFieldsMsg builds the Slack mrkdwn message used when a Jira issue draft
 // is missing required fields (project and/or issue type).
 // It instructs the user how to provide the missing values using the
