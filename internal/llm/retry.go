@@ -89,6 +89,15 @@ func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, 
 			"- NÃO oriente o usuário a usar o Jira ou a fazer buscas no Jira.",
 			"- Se os dados forem insuficientes, pergunte ao usuário como refinar a consulta.")
 	}
+	// When the Jira context contains a sentinel (error or empty result), reinforce
+	// the anti-hallucination instruction so the LLM never invents issue data.
+	if strings.Contains(jiraCtx, "[JIRA_ERROR:") || strings.Contains(jiraCtx, "[JIRA_EMPTY:") {
+		systemParts = append(systemParts, "",
+			"DADOS JIRA AUSENTES: A busca no Jira falhou ou não retornou resultados.",
+			"- NÃO invente issues, títulos, assignees, chaves (PROJ-NNN) ou links.",
+			"- Use apenas o que está no CONTEXTO DO JIRA acima.",
+			"- Se não houver dados, informe o usuário claramente e sugira refinar a busca.")
+	}
 	// Inform the LLM which optional integrations are active so it responds
 	// honestly when users ask about capabilities that are not configured.
 	if !c.JiraEnabled {
