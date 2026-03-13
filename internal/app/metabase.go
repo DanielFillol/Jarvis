@@ -100,6 +100,38 @@ func filterSchemaForDatabase(fullSchema string, dbID int) string {
 	return strings.TrimSpace(sb.String())
 }
 
+// isAllZeroResult reports whether a successful QueryResult contains only
+// numeric-zero values across all rows. Returns false for empty result sets
+// or for result sets that contain no numeric columns at all (text-only).
+func isAllZeroResult(qr *metabase.QueryResult) bool {
+	if qr == nil || len(qr.Data.Rows) == 0 {
+		return false
+	}
+	foundNumeric := false
+	for _, row := range qr.Data.Rows {
+		for _, cell := range row {
+			switch v := cell.(type) {
+			case float64:
+				foundNumeric = true
+				if v != 0 {
+					return false
+				}
+			case int:
+				foundNumeric = true
+				if v != 0 {
+					return false
+				}
+			case int64:
+				foundNumeric = true
+				if v != 0 {
+					return false
+				}
+			}
+		}
+	}
+	return foundNumeric
+}
+
 // metabaseQueryResult holds the outcome of runMetabaseQuery.
 type metabaseQueryResult struct {
 	DBCtx       string
@@ -135,6 +167,8 @@ func (s *Service) runMetabaseQuery(question, threadHist string, dbID int, baseSQ
 	const maxAttempts = 3
 	lastSQL := strings.TrimSpace(baseSQL)
 	lastErr := ""
+	var zeroResult *metabase.QueryResult // non-nil when phase 1 produced an all-zero result
+	var zeroSQL string                   // the SQL that produced the zero result
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		sql, err := s.LLM.GenerateSQL(question, threadHist, schema, lastSQL, lastErr, dbEngine, hintsCtx, wantsAllRows, s.Cfg.OpenAIModel)
 		if err != nil {
@@ -160,10 +194,68 @@ func (s *Service) runMetabaseQuery(question, threadHist string, dbID int, baseSQ
 			continue
 		}
 		log.Printf("[METABASE] query succeeded attempt %d rows=%d", attempt, len(qr.Data.Rows))
-		ctx := fmt.Sprintf("Query executada (db=%d):\n```sql\n%s\n```\n\nResultado:\n%s",
-			dbID, sql, metabase.FormatQueryResult(*qr, 100))
-		return metabaseQueryResult{DBCtx: ctx, QueryResult: qr, ExecutedSQL: sql}
+		if !isAllZeroResult(qr) {
+			ctx := fmt.Sprintf("Query executada (db=%d):\n```sql\n%s\n```\n\nResultado:\n%s",
+				dbID, sql, metabase.FormatQueryResult(*qr, 100))
+			return metabaseQueryResult{DBCtx: ctx, QueryResult: qr, ExecutedSQL: sql}
+		}
+		// All-zero — save and break; Phase 2 will verify.
+		log.Printf("[METABASE] zero result detected at attempt %d — entering zero-result retry phase", attempt)
+		zeroResult = qr
+		zeroSQL = sql
+		lastSQL = sql
+		break
 	}
+
+	if zeroResult != nil {
+		const maxZeroRetries = 3
+		const zeroHint = "A query anterior retornou apenas zeros em todas as colunas numéricas. " +
+			"Verifique se os filtros, JOINs e nomes de tabelas/colunas estão corretos. " +
+			"Tente uma abordagem alternativa para confirmar se o resultado é realmente zero ou se há um erro na query."
+
+		for zeroAttempt := 1; zeroAttempt <= maxZeroRetries; zeroAttempt++ {
+			log.Printf("[METABASE] zero-result retry %d/%d for db=%d", zeroAttempt, maxZeroRetries, dbID)
+			sql, err := s.LLM.GenerateSQL(question, threadHist, schema, lastSQL, zeroHint, dbEngine, hintsCtx, wantsAllRows, s.Cfg.OpenAIModel)
+			if err != nil {
+				log.Printf("[METABASE] zero-retry GenerateSQL attempt %d failed: %v", zeroAttempt, err)
+				continue
+			}
+			if strings.HasPrefix(sql, llm.ClarificationPrefix) {
+				log.Printf("[METABASE] LLM requested clarification during zero-retry (attempt %d)", zeroAttempt)
+				return metabaseQueryResult{DBCtx: sql}
+			}
+			log.Printf("[METABASE] zero-retry %d sql: %s", zeroAttempt, clip(sql, 400))
+			qr, err := s.Metabase.ExecuteNativeQuery(dbID, sql)
+			if err != nil {
+				log.Printf("[METABASE] zero-retry ExecuteNativeQuery attempt %d failed: %v", zeroAttempt, err)
+				lastSQL = sql
+				continue
+			}
+			if qr.Error != "" {
+				log.Printf("[METABASE] zero-retry query error attempt %d: %s", zeroAttempt, clip(qr.Error, 200))
+				lastSQL = sql
+				continue
+			}
+			log.Printf("[METABASE] zero-retry %d succeeded rows=%d", zeroAttempt, len(qr.Data.Rows))
+			if !isAllZeroResult(qr) {
+				log.Printf("[METABASE] zero-result overridden by non-zero result on retry %d", zeroAttempt)
+				ctx := fmt.Sprintf("Query executada (db=%d):\n```sql\n%s\n```\n\nResultado:\n%s",
+					dbID, sql, metabase.FormatQueryResult(*qr, 100))
+				return metabaseQueryResult{DBCtx: ctx, QueryResult: qr, ExecutedSQL: sql}
+			}
+			log.Printf("[METABASE] zero-retry %d also returned all-zeros", zeroAttempt)
+			lastSQL = sql
+		}
+
+		// All retries confirmed zero — return original zero result.
+		log.Printf("[METABASE] zero result confirmed after %d retries for db=%d", maxZeroRetries, dbID)
+		zeroCtx := fmt.Sprintf(
+			"Query executada (db=%d):\n```sql\n%s\n```\n\nResultado (resultado confirmado: 0):\n%s",
+			dbID, zeroSQL, metabase.FormatQueryResult(*zeroResult, 100),
+		)
+		return metabaseQueryResult{DBCtx: zeroCtx, QueryResult: zeroResult, ExecutedSQL: zeroSQL}
+	}
+
 	log.Printf("[METABASE] all %d attempts failed for db=%d", maxAttempts, dbID)
 	return metabaseQueryResult{}
 }
