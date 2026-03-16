@@ -411,8 +411,8 @@ func isPdfMimetype(mimetype string) bool {
 	return strings.Contains(mimetype, "pdf")
 }
 
-// pdfBytesToText extracts plain text from a PDF file using the ledongthuc/pdf library.
-func pdfBytesToText(data []byte) (string, error) {
+// PdfBytesToText extracts plain text from a PDF file using the ledongthuc/pdf library.
+func PdfBytesToText(data []byte) (string, error) {
 	r, err := pdflib.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return "", fmt.Errorf("open pdf: %w", err)
@@ -436,10 +436,10 @@ func isDocxMimetype(mimetype string) bool {
 		strings.HasSuffix(mimetype, ".docx")
 }
 
-// xlsxBytesToText converts raw XLSX bytes into a plain-text table representation
+// XlsxBytesToText converts raw XLSX bytes into a plain-text table representation
 // suitable for inclusion in an LLM prompt.  Each sheet is rendered as a
 // tab-separated grid with its name as a header.
-func xlsxBytesToText(data []byte) (string, error) {
+func XlsxBytesToText(data []byte) (string, error) {
 	f, err := excelize.OpenReader(bytes.NewReader(data))
 	if err != nil {
 		return "", fmt.Errorf("parse xlsx: %w", err)
@@ -462,10 +462,10 @@ func xlsxBytesToText(data []byte) (string, error) {
 	return strings.TrimSpace(b.String()), nil
 }
 
-// docxBytesToText extracts plain text from a DOCX file (which is a ZIP
+// DocxBytesToText extracts plain text from a DOCX file (which is a ZIP
 // containing word/document.xml). It preserves paragraph breaks.
 // Uses only the standard library — no external dependency is required.
-func docxBytesToText(data []byte) (string, error) {
+func DocxBytesToText(data []byte) (string, error) {
 	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return "", fmt.Errorf("open docx zip: %w", err)
