@@ -23,22 +23,25 @@ type Client struct {
 	APIKey      string
 	JiraBaseURL string
 	BotName     string
-	// JiraEnabled, MetabaseEnabled, and OutlineEnabled tell the answer LLM which
-	// integrations are active so it can respond accurately when asked.
-	JiraEnabled     bool
-	MetabaseEnabled bool
-	OutlineEnabled  bool
+	// JiraEnabled, MetabaseEnabled, OutlineEnabled, and GoogleDriveEnabled tell
+	// the answer LLM which integrations are active so it can respond accurately
+	// when asked.
+	JiraEnabled        bool
+	MetabaseEnabled    bool
+	OutlineEnabled     bool
+	GoogleDriveEnabled bool
 }
 
 // NewClient constructs a new LLM client from the provided configuration.
 func NewClient(cfg config.Config) *Client {
 	return &Client{
-		APIKey:          cfg.OpenAIAPIKey,
-		JiraBaseURL:     cfg.JiraBaseURL,
-		BotName:         cfg.BotName,
-		JiraEnabled:     cfg.JiraEnabled(),
-		MetabaseEnabled: cfg.MetabaseEnabled(),
-		OutlineEnabled:  cfg.OutlineEnabled(),
+		APIKey:             cfg.OpenAIAPIKey,
+		JiraBaseURL:        cfg.JiraBaseURL,
+		BotName:            cfg.BotName,
+		JiraEnabled:        cfg.JiraEnabled(),
+		MetabaseEnabled:    cfg.MetabaseEnabled(),
+		OutlineEnabled:     cfg.OutlineEnabled(),
+		GoogleDriveEnabled: cfg.GoogleDriveEnabled(),
 	}
 }
 
@@ -131,13 +134,14 @@ type ActionDescriptor struct {
 }
 
 const (
-	ActionJiraCreate    = "jira_create"
-	ActionJiraEdit      = "jira_edit"
-	ActionJiraSearch    = "jira_search"
-	ActionSlackSearch   = "slack_search"
-	ActionMetabaseQuery = "metabase_query"
-	ActionShowSQL       = "show_sql"
-	ActionOutlineSearch = "outline_search"
+	ActionJiraCreate        = "jira_create"
+	ActionJiraEdit          = "jira_edit"
+	ActionJiraSearch        = "jira_search"
+	ActionSlackSearch       = "slack_search"
+	ActionMetabaseQuery     = "metabase_query"
+	ActionShowSQL           = "show_sql"
+	ActionOutlineSearch     = "outline_search"
+	ActionGoogleDriveSearch = "googledrive_search"
 )
 
 // DecideActions performs a single LLM call to determine all actions the bot must
@@ -155,6 +159,7 @@ func (c *Client) DecideActions(
 	metabaseDatabases []string,
 	storedDBID int,
 	outlineEnabled bool,
+	googleDriveEnabled bool,
 ) ([]ActionDescriptor, error) {
 	projectsCtx := ""
 	if jiraEnabled && strings.TrimSpace(jiraCatalog) != "" {
@@ -184,6 +189,10 @@ func (c *Client) DecideActions(
 	if outlineEnabled {
 		outlineCtxStr = "\nOutline Wiki está configurado e disponível para busca de documentação.\n"
 	}
+	googleDriveCtxStr := ""
+	if googleDriveEnabled {
+		googleDriveCtxStr = "\nGoogle Drive está configurado e disponível para busca de documentos e arquivos internos.\n"
+	}
 	metabaseFollowUpCtx := ""
 	if storedDBID > 0 {
 		metabaseFollowUpCtx = fmt.Sprintf(
@@ -208,6 +217,9 @@ func (c *Client) DecideActions(
 	}
 	if outlineEnabled {
 		exampleItems = append(exampleItems, `  {"kind": "outline_search", "query": "processo deploy produção"}`)
+	}
+	if googleDriveEnabled {
+		exampleItems = append(exampleItems, `  {"kind": "googledrive_search", "query": "relatório vendas 2024"}`)
 	}
 
 	// Jira-specific routing rules.
@@ -248,10 +260,16 @@ Regras para jql (campo de jira_search):
 		outlineSourceLine = "- Outline Wiki: documentação interna, processos, guias, runbooks, especificações de produto, onboarding, políticas.\n"
 		outlineRule = "12. Quando Outline está configurado: inclua outline_search quando a resposta depende principalmente de documentação interna (processos, guias, runbooks, políticas, onboarding, RH, benefícios). Preencha query com 2–4 termos-chave do assunto, sem artigos ou preposições.\n"
 	}
+	googleDriveSourceLine := ""
+	googleDriveRule := ""
+	if googleDriveEnabled {
+		googleDriveSourceLine = "- Google Drive: arquivos internos, planilhas, apresentações, documentos compartilhados, relatórios, contratos, propostas.\n"
+		googleDriveRule = "13. Quando Google Drive está configurado: inclua googledrive_search quando a resposta provavelmente está em um arquivo compartilhado no Drive (planilha, apresentação, PDF, relatório, contrato). Preencha query com 2–4 termos-chave descritivos do arquivo ou conteúdo buscado.\n"
+	}
 
 	prompt := fmt.Sprintf(`Você é um roteador de ações de um assistente de Slack.
 Analise a mensagem e retorne um JSON array com TODAS as ações necessárias, na ordem certa.
-%s%s%s%s%s%s
+%s%s%s%s%s%s%s
 Retorne APENAS um JSON array válido, sem markdown fences. Retorne [] quando nenhuma ação for necessária.
 
 Exemplo de array (inclua apenas as ações necessárias):
@@ -260,7 +278,7 @@ Exemplo de array (inclua apenas as ações necessárias):
 ]
 
 Fontes disponíveis:
-%s%s- Slack: discussões, decisões, links de threads, contexto operacional.
+%s%s%s- Slack: discussões, decisões, links de threads, contexto operacional.
 - Metabase (banco de dados): dados estruturados do banco operacional. Se a pergunta filtra, lista ou consulta entidades (registros, entidades operacionais, transações, pedidos), use metabase_query. NÃO use slack_search para dados que vivem no banco.
 
 Regras para jira_create e jira_edit:
@@ -281,7 +299,7 @@ Regras de roteamento de contexto:
 9. Follow-ups com pronomes ("dessas", "desses") referindo entidades já consultadas → metabase_query com mesmo database_id do turno anterior.
 10. wants_all_rows=true: usuário quer TODOS OS REGISTROS de uma entidade de dados — mesmo que filtrado por data ou outro critério. Sinais: "todas as coletas", "todos os pedidos", "todos os registros", "sem limite", "lista completa", "traz tudo", "quero todos", "detalhamento de todas", "me traz todas". NÃO use true quando "todos" se refere a tópicos/aspectos de análise (ex: "analise todos os aspectos", "todas as categorias") — nesses casos o usuário quer uma análise agregada, não um dump de registros individuais.
 11. wants_csv_export=true: exportação explícita ("exportar", "csv", "planilha", "download", "baixar", "excel") OU pedido de todos os dados. Quando true, também wants_all_rows=true.
-%s
+%s%s
 Regras para query em slack_search (IMPORTANTE):
 - query NUNCA vazio quando kind="slack_search" — sempre gere uma query útil.
 - Se mencionar canais (#nome), inclua in:#nome-do-canal.
@@ -302,12 +320,12 @@ Thread (contexto recente):
 
 Pergunta:
 %s
-`, dateCtx, senderCtx, projectsCtx, metabaseCtx, metabaseFollowUpCtx, outlineCtxStr,
+`, dateCtx, senderCtx, projectsCtx, metabaseCtx, metabaseFollowUpCtx, outlineCtxStr, googleDriveCtxStr,
 		strings.Join(exampleItems, ",\n"),
-		jiraSourceLine, outlineSourceLine,
+		jiraSourceLine, outlineSourceLine, googleDriveSourceLine,
 		jiraIntentBlock,
 		jiraRules,
-		outlineRule,
+		outlineRule, googleDriveRule,
 		clip(threadHistory, 1200), question)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
@@ -336,6 +354,11 @@ Pergunta:
 			a.Query = normalizeSlackQuery(strings.TrimSpace(a.Query))
 		case ActionOutlineSearch:
 			if !outlineEnabled {
+				continue
+			}
+			a.Query = strings.TrimSpace(a.Query)
+		case ActionGoogleDriveSearch:
+			if !googleDriveEnabled {
 				continue
 			}
 			a.Query = strings.TrimSpace(a.Query)

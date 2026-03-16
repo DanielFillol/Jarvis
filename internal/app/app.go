@@ -10,6 +10,7 @@ import (
 
 	"github.com/DanielFillol/Jarvis/internal/config"
 	"github.com/DanielFillol/Jarvis/internal/fileserver"
+	"github.com/DanielFillol/Jarvis/internal/googledrive"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
 	"github.com/DanielFillol/Jarvis/internal/metabase"
@@ -53,10 +54,11 @@ type Service struct {
 	// awaiting user confirmation before being posted to the thread.
 	pendingReplies sync.Map
 
-	Store      state.Store
-	FileServer *fileserver.FileServer
-	Outline    *outline.Client
-	Telemetry  *telemetry.Client
+	Store       state.Store
+	FileServer  *fileserver.FileServer
+	Outline     *outline.Client
+	GoogleDrive *googledrive.Client
+	Telemetry   *telemetry.Client
 
 	// companyCtx holds the generated domain glossary injected into every answer call.
 	companyCtx atomic.Value
@@ -66,18 +68,20 @@ type Service struct {
 // metabaseClient may be nil when Metabase integration is not configured.
 // fs may be nil when CSV export is not needed.
 // outlineClient may be nil when Outline integration is not configured.
+// googleDriveClient may be nil when Google Drive integration is not configured.
 // telemetryClient may be nil when telemetry is not configured.
-func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, metabaseClient *metabase.Client, fs *fileserver.FileServer, outlineClient *outline.Client, telemetryClient *telemetry.Client) *Service {
+func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, metabaseClient *metabase.Client, fs *fileserver.FileServer, outlineClient *outline.Client, googleDriveClient *googledrive.Client, telemetryClient *telemetry.Client) *Service {
 	return &Service{
-		Slack:      slackClient,
-		Jira:       jiraClient,
-		LLM:        llmClient,
-		Metabase:   metabaseClient,
-		Cfg:        cfg,
-		FileServer: fs,
-		Store:      *state.NewStore(2 * time.Hour),
-		Outline:    outlineClient,
-		Telemetry:  telemetryClient,
+		Slack:       slackClient,
+		Jira:        jiraClient,
+		LLM:         llmClient,
+		Metabase:    metabaseClient,
+		Cfg:         cfg,
+		FileServer:  fs,
+		Store:       *state.NewStore(2 * time.Hour),
+		Outline:     outlineClient,
+		GoogleDrive: googleDriveClient,
+		Telemetry:   telemetryClient,
 	}
 }
 
@@ -188,10 +192,11 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	storedDBID, _ := s.loadThreadDBID(contextChannel, contextThreadTs)
 
 	actions, actErr := s.LLM.DecideActions(
-		questionForLLM, threadHist, s.Cfg.OpenAILesserModel,
+		questionForLLM, threadHist, s.Cfg.OpenAIModel,
 		s.Cfg.JiraEnabled(), s.Jira.CatalogCompact, senderUserID,
 		s.formattedMetabaseDatabases(), storedDBID,
 		s.Cfg.OutlineEnabled(),
+		s.Cfg.GoogleDriveEnabled(),
 	)
 	if actErr != nil {
 		log.Printf("[WARN] decideActions failed: %v", actErr)
@@ -290,6 +295,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	var dbQueryResults []*metabase.QueryResult
 	var dbQueryActions []llm.ActionDescriptor
 	var outlineCtx, outlineSources string
+	var googleDriveCtx, googleDriveSources string
 	var executedSlackSearch, executedJiraSearch bool
 	var slackMatches, jiraIssuesFound int
 	var csvDownloadLine string // set when a CSV file is generated; appended to answer unconditionally
@@ -392,6 +398,23 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 					log.Printf("[JARVIS] outlineContext docs=%d chars=%d", len(results), len(outlineCtx))
 					if outlineCtx == "" {
 						outlineCtx = "[AVISO: A busca no Outline não retornou documentos. Informe ao usuário que não foram encontrados docs relevantes para a consulta realizada.]"
+					}
+				}
+			}
+
+		case llm.ActionGoogleDriveSearch:
+			driveQuery := strings.TrimSpace(action.Query)
+			if s.GoogleDrive != nil && driveQuery != "" {
+				log.Printf("[JARVIS] googleDriveSearch query=%q", driveQuery)
+				results, dErr := s.GoogleDrive.SearchAndFetch(driveQuery)
+				if dErr != nil {
+					log.Printf("[WARN] google drive search failed: %v", dErr)
+				} else {
+					googleDriveCtx = googledrive.FormatContext(results, 8000)
+					googleDriveSources = googledrive.FormatSources(results)
+					log.Printf("[JARVIS] googleDriveContext files=%d chars=%d", len(results), len(googleDriveCtx))
+					if googleDriveCtx == "" {
+						googleDriveCtx = "[AVISO: A busca no Google Drive não retornou arquivos. Informe ao usuário que não foram encontrados documentos relevantes para a consulta realizada.]"
 					}
 				}
 			}
@@ -651,7 +674,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// 11) Generate the answer with the primary LLM (with retry and fallback).
 	answer, err := s.LLM.AnswerWithRetry(
 		s.getCompanyCtx(),
-		questionForLLM, threadHist, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images,
+		questionForLLM, threadHist, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, images,
 		s.Cfg.OpenAIModel, s.Cfg.OpenAILesserModel, 2, 0,
 	)
 	if err != nil || strings.TrimSpace(answer) == "" {
@@ -679,6 +702,11 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// Append Outline source links when documentation was used.
 	if outlineSources != "" {
 		answer += "\n\n" + outlineSources
+	}
+
+	// Append Google Drive source links when files were used.
+	if googleDriveSources != "" {
+		answer += "\n\n" + googleDriveSources
 	}
 
 	// Append full data table when bypassing LLM for large result formatting.

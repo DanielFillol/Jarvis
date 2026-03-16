@@ -81,6 +81,18 @@ type Config struct {
 	OutlineBaseURL string
 	OutlineAPIKey  string
 
+	// ── Optional: Google Drive ────────────────────────────────────────────────
+	// Configure one of GOOGLE_DRIVE_CREDENTIALS_JSON or GOOGLE_DRIVE_CREDENTIALS_PATH
+	// to enable Google Drive integration (document search and content extraction).
+	// GOOGLE_DRIVE_CREDENTIALS_JSON: raw service account JSON (preferred for Docker).
+	// GOOGLE_DRIVE_CREDENTIALS_PATH: path to the service account JSON file (local dev).
+	GoogleDriveCredentialsJSON string
+	GoogleDriveCredentialsPath string
+	// GoogleDriveFolderID restricts search to a specific folder when set.
+	GoogleDriveFolderID string
+	// GoogleDriveSearchLimit is the max number of files returned per query. Defaults to 5.
+	GoogleDriveSearchLimit int
+
 	// CompanyContextPath is the output path for the generated company context
 	// Markdown file.  Defaults to "./docs/company_context.md".
 	CompanyContextPath string
@@ -136,6 +148,16 @@ func Load() Config {
 
 	cfg.OutlineBaseURL = strings.TrimRight(getEnv("OUTLINE_BASE_URL", ""), "/")
 	cfg.OutlineAPIKey = os.Getenv("OUTLINE_API_KEY")
+
+	cfg.GoogleDriveCredentialsJSON = os.Getenv("GOOGLE_DRIVE_CREDENTIALS_JSON")
+	cfg.GoogleDriveCredentialsPath = os.Getenv("GOOGLE_DRIVE_CREDENTIALS_PATH")
+	cfg.GoogleDriveFolderID = os.Getenv("GOOGLE_DRIVE_FOLDER_ID")
+	if n, err := strconv.Atoi(getEnv("GOOGLE_DRIVE_SEARCH_LIMIT", "5")); err == nil {
+		cfg.GoogleDriveSearchLimit = n
+	} else {
+		cfg.GoogleDriveSearchLimit = 5
+	}
+
 	cfg.CompanyContextPath = getEnv("COMPANY_CONTEXT_PATH", "./docs/company_context.md")
 	cfg.SQLHintsDir = getEnv("SQL_HINTS_DIR", "./docs/sql_hints")
 	cfg.TelemetryDBURL = os.Getenv("TELEMETRY_DB_URL")
@@ -206,4 +228,9 @@ func (c Config) MetabaseEnabled() bool {
 // OutlineEnabled reports whether Outline credentials have been provided.
 func (c Config) OutlineEnabled() bool {
 	return strings.TrimSpace(c.OutlineBaseURL) != "" && strings.TrimSpace(c.OutlineAPIKey) != ""
+}
+
+// GoogleDriveEnabled reports whether Google Drive credentials have been provided.
+func (c Config) GoogleDriveEnabled() bool {
+	return strings.TrimSpace(c.GoogleDriveCredentialsJSON) != "" || strings.TrimSpace(c.GoogleDriveCredentialsPath) != ""
 }

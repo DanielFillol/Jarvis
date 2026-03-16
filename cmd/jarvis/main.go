@@ -3,10 +3,12 @@ package main
 import (
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/DanielFillol/Jarvis/internal/app"
 	"github.com/DanielFillol/Jarvis/internal/config"
 	"github.com/DanielFillol/Jarvis/internal/fileserver"
+	"github.com/DanielFillol/Jarvis/internal/googledrive"
 	httpinternal "github.com/DanielFillol/Jarvis/internal/http"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
@@ -35,6 +37,35 @@ func main() {
 		log.Printf("[BOOT] Outline enabled base_url=%q", cfg.OutlineBaseURL)
 	}
 
+	// Initialize optional Google Drive client (nil when not configured).
+	var googleDriveClient *googledrive.Client
+	if cfg.GoogleDriveEnabled() {
+		credsJSON := []byte(cfg.GoogleDriveCredentialsJSON)
+		if len(credsJSON) == 0 {
+			var readErr error
+			credsJSON, readErr = os.ReadFile(cfg.GoogleDriveCredentialsPath)
+			if readErr != nil {
+				log.Printf("[BOOT] GoogleDrive: failed to read credentials file %q: %v", cfg.GoogleDriveCredentialsPath, readErr)
+			}
+		}
+		if len(credsJSON) > 0 {
+			var driveErr error
+			googleDriveClient, driveErr = googledrive.NewClient(
+				credsJSON,
+				cfg.GoogleDriveFolderID,
+				cfg.GoogleDriveSearchLimit,
+				app.PdfBytesToText,
+				app.DocxBytesToText,
+				app.XlsxBytesToText,
+			)
+			if driveErr != nil {
+				log.Printf("[BOOT] GoogleDrive: init failed: %v", driveErr)
+			} else {
+				log.Printf("[BOOT] GoogleDrive enabled folder_id=%q search_limit=%d", cfg.GoogleDriveFolderID, cfg.GoogleDriveSearchLimit)
+			}
+		}
+	}
+
 	// Initialize optional telemetry client (nil when TELEMETRY_DB_URL is empty).
 	telemetryClient := telemetry.NewClient(cfg.TelemetryDBURL)
 	if telemetryClient != nil {
@@ -50,7 +81,7 @@ func main() {
 	}
 
 	// Construct core service
-	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs, outlineClient, telemetryClient)
+	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs, outlineClient, googleDriveClient, telemetryClient)
 
 	// Generate company context asynchronously from Jira + Metabase docs + Outline.
 	go func() {

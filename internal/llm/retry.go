@@ -24,7 +24,7 @@ func (a ImageAttachment) DataURL() string {
 // answerWithModel assembles the prompt and calls the Chat API with the
 // specified model.  It converts Markdown into Slack Markdown before
 // returning the result.
-func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string, images []ImageAttachment, model string) (string, error) {
+func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx string, images []ImageAttachment, model string) (string, error) {
 	botName := c.BotName
 	if strings.TrimSpace(botName) == "" {
 		botName = "Jarvis"
@@ -108,9 +108,20 @@ func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, 
 		systemParts = append(systemParts, "",
 			"METABASE NÃO CONFIGURADO: A integração com Metabase (banco de dados) não está habilitada nesta instalação. Se o usuário pedir consultas de dados, métricas ou relatórios que requeiram SQL, informe gentilmente que essa integração não está disponível e sugira que o administrador configure as variáveis METABASE_BASE_URL e METABASE_API_KEY.")
 	}
+	if c.MetabaseEnabled && strings.TrimSpace(dbCtx) == "" {
+		systemParts = append(systemParts, "",
+			"DADOS DE BANCO AUSENTES: Nenhum resultado de consulta SQL está disponível para esta resposta.",
+			"- Se a pergunta requer dados do banco de dados, informe o usuário que não foi possível buscar os dados.",
+			"- NÃO invente, estime ou fabrique registros, nomes, status, valores ou qualquer dado operacional.",
+			"- Responda apenas com o que está no contexto da thread ou nos outros contextos fornecidos.")
+	}
 	if !c.OutlineEnabled {
 		systemParts = append(systemParts, "",
 			"OUTLINE NÃO CONFIGURADO: A integração com o Outline Wiki não está habilitada nesta instalação. Se o usuário pedir documentação interna, processos ou guias que provavelmente estão na wiki, informe gentilmente que essa integração não está disponível e sugira que o administrador configure as variáveis OUTLINE_BASE_URL e OUTLINE_API_KEY.")
+	}
+	if !c.GoogleDriveEnabled {
+		systemParts = append(systemParts, "",
+			"GOOGLE DRIVE NÃO CONFIGURADO: A integração com o Google Drive não está habilitada nesta instalação. Se o usuário pedir arquivos, documentos ou planilhas do Drive, informe gentilmente que essa integração não está disponível e sugira que o administrador configure as variáveis GOOGLE_DRIVE_CREDENTIALS_JSON ou GOOGLE_DRIVE_CREDENTIALS_PATH.")
 	}
 	system := strings.Join(systemParts, "\n")
 	var u strings.Builder
@@ -142,6 +153,11 @@ func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, 
 	if outlineCtx != "" {
 		u.WriteString("DOCUMENTAÇÃO INTERNA (Outline Wiki):\n")
 		u.WriteString(outlineCtx)
+		u.WriteString("\n\n")
+	}
+	if googleDriveCtx != "" {
+		u.WriteString("DOCUMENTOS DO GOOGLE DRIVE:\n")
+		u.WriteString(googleDriveCtx)
 		u.WriteString("\n\n")
 	}
 	u.WriteString("PERGUNTA:\n")
@@ -180,7 +196,7 @@ func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, 
 // This makes answer generation resilient to flaky networking, 429s, and 5xxs.
 func (c *Client) AnswerWithRetry(
 	companyCtx,
-	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string,
+	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx string,
 	images []ImageAttachment,
 	primaryModel, lesserModel string,
 	maxAttempts int,
@@ -194,14 +210,14 @@ func (c *Client) AnswerWithRetry(
 	}
 
 	// Try primary first.
-	out, err := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, primaryModel, maxAttempts, baseDelay)
+	out, err := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, images, primaryModel, maxAttempts, baseDelay)
 	if err == nil && strings.TrimSpace(out) != "" {
 		return out, nil
 	}
 
 	// Fall back to the lesser model if configured and different from the primary.
 	if lesserModel != "" && lesserModel != primaryModel {
-		out2, err2 := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, lesserModel, maxAttempts, baseDelay)
+		out2, err2 := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, images, lesserModel, maxAttempts, baseDelay)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
 			return out2, nil
 		}
@@ -219,7 +235,7 @@ func (c *Client) AnswerWithRetry(
 
 func (c *Client) answerWithRetrySingleModel(
 	companyCtx,
-	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx string,
+	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx string,
 	images []ImageAttachment,
 	model string,
 	maxAttempts int,
@@ -227,7 +243,7 @@ func (c *Client) answerWithRetrySingleModel(
 ) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		out, err := c.answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, images, model)
+		out, err := c.answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, images, model)
 		if err == nil && strings.TrimSpace(out) != "" {
 			return out, nil
 		}
