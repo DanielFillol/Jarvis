@@ -21,7 +21,7 @@ type introOptions struct {
 
 // isIntroRequest returns true when the message is asking the bot to introduce
 // itself or list its capabilities.  Uses keyword matching — no LLM call.
-func isIntroRequest(question string) bool {
+func isIntroRequest(question, botName string) bool {
 	q := strings.ToLower(question)
 	q = strings.NewReplacer("?", "", "!", "", ".", "", "-", " ", "_", " ").Replace(q)
 	triggers := []string{
@@ -35,8 +35,11 @@ func isIntroRequest(question string) bool {
 		"me apresente", "me dê uma apresentação", "me de uma apresentacao",
 		"suas funções", "suas funcoes", "suas opções", "suas opcoes",
 		"como pode me ajudar", "como você pode me ajudar", "como voce pode me ajudar",
-		"o que é o jarvis", "o que e o jarvis",
 		"me mostra o que faz", "me mostra o que você faz",
+	}
+	lower := strings.ToLower(strings.TrimSpace(botName))
+	if lower != "" {
+		triggers = append(triggers, "o que é o "+lower, "o que e o "+lower)
 	}
 	for _, t := range triggers {
 		if strings.Contains(q, t) {

@@ -153,7 +153,7 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	question := parse.StripSummon(text, h.Slack.BotUserID)
+	question := parse.StripSummon(text, h.Slack.BotUserID, h.Service.Cfg.BotName)
 	if question == "" && len(msg.Files) == 0 {
 		log.Printf("[BOT] summoned but empty after strip and no files; ignoring")
 		return

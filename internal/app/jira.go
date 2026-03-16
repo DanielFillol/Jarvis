@@ -359,8 +359,8 @@ func (s *Service) resolveTargetSprint(issueKey, target string) (*jira.Sprint, er
 	default:
 		// Search by name/number across active + future sprints.
 		var candidates []jira.Sprint
-		for _, state := range []string{"active", "future"} {
-			ss, err := s.Jira.GetSprints(boardID, state)
+		for _, st := range []string{"active", "future"} {
+			ss, err := s.Jira.GetSprints(boardID, st)
 			if err == nil {
 				candidates = append(candidates, ss...)
 			}
@@ -612,7 +612,7 @@ func (s *Service) createIssueAndReply(channel, threadTs string, d jira.IssueDraf
 	d.Summary = strings.TrimSpace(d.Summary)
 	d.Description = strings.TrimSpace(d.Description)
 	if d.Project == "" || d.IssueType == "" {
-		_ = s.Slack.PostMessage(channel, threadTs, missingFieldsMsg(d, d.Project == "", d.IssueType == ""))
+		_ = s.Slack.PostMessage(channel, threadTs, missingFieldsMsg(d, d.Project == "", d.IssueType == "", s.Cfg.BotName))
 		return "", nil
 	}
 	created, err := s.Jira.CreateIssue(d)

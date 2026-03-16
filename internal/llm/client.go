@@ -426,7 +426,6 @@ Regras:
   "quanto eu ganho de vale alimentação por mês?" → "vale alimentação benefício"
   "como funciona o processo de deploy em produção?" → "deploy produção processo"
   "quais são as políticas de férias da empresa?" → "férias políticas empresa"
-  "quanto eu ganho de flash por mes?" → "benefícios flash"
   "cria uma tarefa com base nessa thread" → "tarefa fluxo processo"
   "me explica o onboarding de novos engenheiros" → "onboarding engenheiros"
 

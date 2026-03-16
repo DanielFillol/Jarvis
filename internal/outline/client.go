@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/DanielFillol/Jarvis/internal/config"
 )
 
 // Client is a minimal Outline API client that supports document search.
@@ -19,19 +22,22 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
-// NewClient constructs an Outline client.  baseURL is the API root, e.g.
-// "https://app.getoutline.com/api" (cloud) or "https://wiki.yourcompany.com/api"
-// (self-hosted).  apiKey is a personal access token from Outline → Settings → API.
-func NewClient(baseURL, apiKey string) *Client {
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+// NewClient constructs an Outline client from config.  Returns nil when Outline
+// is not configured (OUTLINE_BASE_URL or OUTLINE_API_KEY missing).
+func NewClient(cfg config.Config) *Client {
+	if !cfg.OutlineEnabled() {
+		return nil
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(cfg.OutlineBaseURL), "/")
 	origin := baseURL
 	if u, err := url.Parse(baseURL); err == nil {
 		origin = u.Scheme + "://" + u.Host
 	}
+	log.Printf("[BOOT] Outline enabled base_url=%q", baseURL)
 	return &Client{
 		BaseURL:    baseURL,
 		Origin:     origin,
-		APIKey:     apiKey,
+		APIKey:     cfg.OutlineAPIKey,
 		HTTPClient: &http.Client{Timeout: 15 * time.Second},
 	}
 }

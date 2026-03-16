@@ -35,12 +35,17 @@ func LooksLikeDirectMention(text, botUserID string) bool {
 // StripSummon removes bot mentions and prefixes from a message, leaving
 // the remainder to be interpreted as the user's question.  It trims
 // surrounding whitespace.
-func StripSummon(text, botUserID string) string {
+func StripSummon(text, botUserID, botName string) string {
 	t := strings.TrimSpace(text)
 	if botUserID != "" {
 		t = strings.ReplaceAll(t, "<@"+botUserID+">", "")
 	}
-	prefixes := []string{"Jarvis:", "jarvis:", "!jarvis", "@Jarvis", "@jarvis"}
+	lower := strings.ToLower(strings.TrimSpace(botName))
+	var prefixes []string
+	if lower != "" {
+		title := strings.ToUpper(lower[:1]) + lower[1:]
+		prefixes = []string{title + ":", lower + ":", "!" + lower, "@" + title, "@" + lower}
+	}
 	for _, p := range prefixes {
 		if strings.HasPrefix(t, p) {
 			t = strings.TrimPrefix(t, p)

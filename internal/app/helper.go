@@ -83,7 +83,7 @@ func correctJQLStatus(jql string, workflowStatuses map[string][]string) string {
 // It instructs the user how to provide the missing values using the
 // `jarvis: jira definir | projeto=... | tipo=...` command and includes a short
 // summary of the current draft so the user can confirm what will be created.
-func missingFieldsMsg(d jira.IssueDraft, needProject, needType bool) string {
+func missingFieldsMsg(d jira.IssueDraft, needProject, needType bool, botName string) string {
 	var missing []string
 
 	if needProject {
@@ -107,7 +107,7 @@ func missingFieldsMsg(d jira.IssueDraft, needProject, needType bool) string {
 	)
 
 	msg += "Responda com:\n"
-	msg += "`jarvis: jira definir | projeto=ABC | tipo=Bug`"
+	msg += "`" + strings.ToLower(botName) + ": jira definir | projeto=ABC | tipo=Bug`"
 
 	return msg
 }
