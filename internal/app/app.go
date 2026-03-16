@@ -184,7 +184,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	log.Printf("[JARVIS] thread history chars=%d", len(threadHist))
 
 	// 3b) Intro request: user asked the bot to introduce itself.
-	if isIntroRequest(question) {
+	if isIntroRequest(question, s.Cfg.BotName) {
 		log.Printf("[JARVIS] introFlow handled dur=%s", time.Since(start))
 		return s.handleIntroRequest(channel, threadTs, originTs)
 	}
@@ -270,7 +270,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	}
 
 	// 4b) Smoke-test command: run the prompt library test cycle.
-	if isTestCommand(question) {
+	if isTestCommand(question, s.Cfg.BotName) {
 		log.Printf("[JARVIS] testFlow triggered dur=%s", time.Since(start))
 		return s.handleTestFlow(channel, threadTs)
 	}
