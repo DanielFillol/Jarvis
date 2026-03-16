@@ -1,12 +1,5 @@
 .idea/
-metabase_schema.md
-metabase_schema_compact.md
-jira_projects.md
-company_context.md
-hints.md
+.docs/
 .env
 go.mod
 go.sum
-docs/sql_hints/db_3.md
-docs/sql_hints/db_5.md
-docs/prompt_library.md
