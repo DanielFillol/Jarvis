@@ -701,19 +701,19 @@ func (s *Service) buildFileContext(files []slack.File) string {
 		var content string
 		switch {
 		case isXLSX:
-			content, err = xlsxBytesToText(data)
+			content, err = XlsxBytesToText(data)
 			if err != nil {
 				log.Printf("[JARVIS] failed to parse xlsx %q: %v", f.Name, err)
 				continue
 			}
 		case isDocx:
-			content, err = docxBytesToText(data)
+			content, err = DocxBytesToText(data)
 			if err != nil {
 				log.Printf("[JARVIS] failed to parse docx %q: %v", f.Name, err)
 				continue
 			}
 		case isPDF:
-			content, err = pdfBytesToText(data)
+			content, err = PdfBytesToText(data)
 			if err != nil {
 				log.Printf("[JARVIS] failed to parse pdf %q: %v", f.Name, err)
 				continue
