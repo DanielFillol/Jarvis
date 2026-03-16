@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/lib/pq"
+
+	"github.com/DanielFillol/Jarvis/internal/config"
 )
 
 // Client wraps a PostgreSQL connection for fire-and-forget telemetry writes.
@@ -106,8 +108,9 @@ const insertConversationSQL = `
 INSERT INTO conversations (event_id, question, answer) VALUES ($1, $2, $3)`
 
 // NewClient connects to PostgreSQL and runs migrations.
-// Returns nil (silently) when dsn is empty, so telemetry is fully optional.
-func NewClient(dsn string) *Client {
+// Returns nil (silently) when TELEMETRY_DB_URL is empty, so telemetry is fully optional.
+func NewClient(cfg config.Config) *Client {
+	dsn := cfg.TelemetryDBURL
 	if dsn == "" {
 		return nil
 	}
