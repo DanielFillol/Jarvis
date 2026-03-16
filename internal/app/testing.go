@@ -12,9 +12,10 @@ import (
 )
 
 // isTestCommand reports whether the question is a smoke-test trigger.
-func isTestCommand(q string) bool {
+func isTestCommand(q, botName string) bool {
 	q = strings.ToLower(strings.TrimSpace(q))
-	return q == "jarvis teste" || q == "jarvis test" || q == "/teste"
+	lower := strings.ToLower(botName)
+	return q == lower+" teste" || q == lower+" test" || q == "/teste"
 }
 
 // handleTestFlow runs the full prompt library smoke test and posts results in the thread.

@@ -3,7 +3,6 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
 
 	"github.com/DanielFillol/Jarvis/internal/app"
 	"github.com/DanielFillol/Jarvis/internal/config"
@@ -29,64 +28,14 @@ func main() {
 	jiraClient := jira.NewClient(cfg)
 	llmClient := llm.NewClient(cfg)
 	metabaseClient := metabase.NewClient(cfg)
-	fs := fileserver.New()
-
-	// Initialize optional Outline client (nil when not configured).
-	var outlineClient *outline.Client
-	if cfg.OutlineEnabled() {
-		outlineClient = outline.NewClient(cfg.OutlineBaseURL, cfg.OutlineAPIKey)
-		log.Printf("[BOOT] Outline enabled base_url=%q", cfg.OutlineBaseURL)
-	}
-
-	// Initialize optional Google Drive client (nil when not configured).
-	var googleDriveClient *googledrive.Client
-	if cfg.GoogleDriveEnabled() {
-		credsJSON := []byte(cfg.GoogleDriveCredentialsJSON)
-		if len(credsJSON) == 0 {
-			var readErr error
-			credsJSON, readErr = os.ReadFile(cfg.GoogleDriveCredentialsPath)
-			if readErr != nil {
-				log.Printf("[BOOT] GoogleDrive: failed to read credentials file %q: %v", cfg.GoogleDriveCredentialsPath, readErr)
-			}
-		}
-		if len(credsJSON) > 0 {
-			var driveErr error
-			googleDriveClient, driveErr = googledrive.NewClient(
-				credsJSON,
-				cfg.GoogleDriveFolderID,
-				cfg.GoogleDriveSearchLimit,
-				app.PdfBytesToText,
-				app.DocxBytesToText,
-				app.XlsxBytesToText,
-			)
-			if driveErr != nil {
-				log.Printf("[BOOT] GoogleDrive: init failed: %v", driveErr)
-			} else {
-				log.Printf("[BOOT] GoogleDrive enabled folder_id=%q search_limit=%d", cfg.GoogleDriveFolderID, cfg.GoogleDriveSearchLimit)
-			}
-		}
-	}
-
-	// Initialize optional HubSpot client (nil when not configured).
-	var hubspotClient *hubspot.Client
-	if cfg.HubSpotEnabled() {
-		hubspotClient = hubspot.NewClient(cfg.HubSpotBaseURL, cfg.HubSpotAPIKey, cfg.HubSpotSearchLimit)
-		log.Printf("[BOOT] HubSpot enabled base_url=%q search_limit=%d", cfg.HubSpotBaseURL, cfg.HubSpotSearchLimit)
-	}
-
-	// Initialize optional telemetry client (nil when TELEMETRY_DB_URL is empty).
-	telemetryClient := telemetry.NewClient(cfg.TelemetryDBURL)
+	outlineClient := outline.NewClient(cfg)
+	hubspotClient := hubspot.NewClient(cfg)
+	googleDriveClient := googledrive.NewClient(cfg, app.PdfBytesToText, app.DocxBytesToText, app.XlsxBytesToText)
+	telemetryClient := telemetry.NewClient(cfg)
 	if telemetryClient != nil {
 		defer telemetryClient.Close()
 	}
-
-	// Generate Jira project catalog asynchronously (enriches CatalogCompact from raw keys).
-	if cfg.JiraEnabled() {
-		go func() {
-			catalog := jiraClient.GenerateCatalog(cfg.JiraProjectsPath)
-			jiraClient.CatalogCompact = catalog
-		}()
-	}
+	fs := fileserver.New()
 
 	// Construct core service
 	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs, outlineClient, googleDriveClient, hubspotClient, telemetryClient)
