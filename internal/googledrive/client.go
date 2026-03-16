@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"strings"
 
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
+
+	"github.com/DanielFillol/Jarvis/internal/config"
 )
 
 const maxFileSize = 5 * 1024 * 1024 // 5 MB per file
@@ -34,33 +37,47 @@ type Client struct {
 	xlsxParser  func([]byte) (string, error)
 }
 
-// NewClient creates an authenticated Google Drive client using a service account.
-// credsJSON is the raw JSON of the service account credentials file.
-// folderID restricts searches to a specific folder when non-empty.
-// limit is the max results per query (default 5).
+// NewClient creates an authenticated Google Drive client from config.
+// Returns nil when Google Drive is not configured or credentials cannot be loaded.
 // pdfParser, docxParser, xlsxParser are injected from app.PdfBytesToText etc. to
 // avoid a circular import between this package and the app package.
-func NewClient(credsJSON []byte, folderID string, limit int, pdfParser, docxParser, xlsxParser func([]byte) (string, error)) (*Client, error) {
+func NewClient(cfg config.Config, pdfParser, docxParser, xlsxParser func([]byte) (string, error)) *Client {
+	if !cfg.GoogleDriveEnabled() {
+		return nil
+	}
+	credsJSON := []byte(cfg.GoogleDriveCredentialsJSON)
+	if len(credsJSON) == 0 {
+		var readErr error
+		credsJSON, readErr = os.ReadFile(cfg.GoogleDriveCredentialsPath)
+		if readErr != nil {
+			log.Printf("[BOOT] GoogleDrive: failed to read credentials file %q: %v", cfg.GoogleDriveCredentialsPath, readErr)
+			return nil
+		}
+	}
+	limit := cfg.GoogleDriveSearchLimit
 	if limit <= 0 {
 		limit = 5
 	}
 	ctx := context.Background()
 	creds, err := google.CredentialsFromJSONWithType(ctx, credsJSON, drive.DriveReadonlyScope, drive.DriveFileScope)
 	if err != nil {
-		return nil, fmt.Errorf("googledrive: parse credentials: %w", err)
+		log.Printf("[BOOT] GoogleDrive: parse credentials: %v", err)
+		return nil
 	}
 	svc, err := drive.NewService(ctx, option.WithCredentials(creds))
 	if err != nil {
-		return nil, fmt.Errorf("googledrive: create service: %w", err)
+		log.Printf("[BOOT] GoogleDrive: create service: %v", err)
+		return nil
 	}
+	log.Printf("[BOOT] GoogleDrive enabled folder_id=%q search_limit=%d", cfg.GoogleDriveFolderID, limit)
 	return &Client{
 		svc:         svc,
-		folderID:    folderID,
+		folderID:    cfg.GoogleDriveFolderID,
 		searchLimit: limit,
 		pdfParser:   pdfParser,
 		docxParser:  docxParser,
 		xlsxParser:  xlsxParser,
-	}, nil
+	}
 }
 
 // SearchFiles queries Drive for files whose full-text content contains query.
