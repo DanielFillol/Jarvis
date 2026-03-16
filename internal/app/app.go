@@ -11,6 +11,7 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/config"
 	"github.com/DanielFillol/Jarvis/internal/fileserver"
 	"github.com/DanielFillol/Jarvis/internal/googledrive"
+	"github.com/DanielFillol/Jarvis/internal/hubspot"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
 	"github.com/DanielFillol/Jarvis/internal/metabase"
@@ -58,6 +59,7 @@ type Service struct {
 	FileServer  *fileserver.FileServer
 	Outline     *outline.Client
 	GoogleDrive *googledrive.Client
+	HubSpot     *hubspot.Client
 	Telemetry   *telemetry.Client
 
 	// companyCtx holds the generated domain glossary injected into every answer call.
@@ -69,8 +71,9 @@ type Service struct {
 // fs may be nil when CSV export is not needed.
 // outlineClient may be nil when Outline integration is not configured.
 // googleDriveClient may be nil when Google Drive integration is not configured.
+// hubspotClient may be nil when HubSpot integration is not configured.
 // telemetryClient may be nil when telemetry is not configured.
-func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, metabaseClient *metabase.Client, fs *fileserver.FileServer, outlineClient *outline.Client, googleDriveClient *googledrive.Client, telemetryClient *telemetry.Client) *Service {
+func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.Client, llmClient *llm.Client, metabaseClient *metabase.Client, fs *fileserver.FileServer, outlineClient *outline.Client, googleDriveClient *googledrive.Client, hubspotClient *hubspot.Client, telemetryClient *telemetry.Client) *Service {
 	return &Service{
 		Slack:       slackClient,
 		Jira:        jiraClient,
@@ -81,6 +84,7 @@ func NewService(cfg config.Config, slackClient *slack.Client, jiraClient *jira.C
 		Store:       *state.NewStore(2 * time.Hour),
 		Outline:     outlineClient,
 		GoogleDrive: googleDriveClient,
+		HubSpot:     hubspotClient,
 		Telemetry:   telemetryClient,
 	}
 }
@@ -197,6 +201,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		s.formattedMetabaseDatabases(), storedDBID,
 		s.Cfg.OutlineEnabled(),
 		s.Cfg.GoogleDriveEnabled(),
+		s.Cfg.HubSpotEnabled(),
 	)
 	if actErr != nil {
 		log.Printf("[WARN] decideActions failed: %v", actErr)
@@ -296,6 +301,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	var dbQueryActions []llm.ActionDescriptor
 	var outlineCtx, outlineSources string
 	var googleDriveCtx, googleDriveSources string
+	var hubspotCtx, hubspotSources string
 	var executedSlackSearch, executedJiraSearch bool
 	var slackMatches, jiraIssuesFound int
 	var csvDownloadLine string // set when a CSV file is generated; appended to answer unconditionally
@@ -419,6 +425,28 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 				}
 			}
 
+		case llm.ActionHubSpotSearch:
+			if s.HubSpot == nil {
+				break
+			}
+			objectType := strings.TrimSpace(action.HubSpotObjectType)
+			query := strings.TrimSpace(action.HubSpotQuery)
+			if query == "" {
+				query = question
+			}
+			log.Printf("[JARVIS] hubspotSearch object_type=%q query=%q", objectType, query)
+			results, hErr := s.HubSpot.Search(objectType, query)
+			if hErr != nil {
+				log.Printf("[WARN] hubspot search failed: %v", hErr)
+				hubspotCtx = "[HUBSPOT_ERROR: busca falhou. NÃO invente dados de CRM.]"
+			} else if len(results) == 0 {
+				hubspotCtx = "[HUBSPOT_EMPTY: nenhum resultado encontrado no HubSpot.]"
+			} else {
+				hubspotCtx = hubspot.FormatContext(results, 4000)
+				hubspotSources = hubspot.FormatSources(results)
+				log.Printf("[JARVIS] hubspotContext records=%d chars=%d", len(results), len(hubspotCtx))
+			}
+
 		case llm.ActionMetabaseQuery:
 			telEvent.MetabaseQueried = true
 			if s.Metabase == nil {
@@ -432,24 +460,26 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			}
 			mRes := s.runMetabaseQuery(questionForLLM, threadHist, action.MetabaseDatabaseID, baseSQL, action.WantsAllRows)
 
-			// Cross-database fallback: when primary DB returned no data or failed entirely,
-			// try remaining databases before giving up.
-			if !strings.HasPrefix(mRes.DBCtx, llm.ClarificationPrefix) {
-				primaryEmpty := mRes.DBCtx == "" || (mRes.QueryResult != nil && len(mRes.QueryResult.Data.Rows) == 0)
-				if primaryEmpty {
-					for _, db := range s.Metabase.Databases {
-						if db.ID == action.MetabaseDatabaseID {
-							continue
-						}
-						log.Printf("[METABASE] primary db=%d returned no data, trying fallback db=%d (%s)",
-							action.MetabaseDatabaseID, db.ID, db.Name)
-						fbRes := s.runMetabaseQuery(questionForLLM, threadHist, db.ID, "", action.WantsAllRows)
-						if fbRes.QueryResult != nil && len(fbRes.QueryResult.Data.Rows) > 0 {
-							mRes = fbRes
-							action.MetabaseDatabaseID = db.ID
-							log.Printf("[METABASE] fallback db=%d succeeded rows=%d", db.ID, len(fbRes.QueryResult.Data.Rows))
-							break
-						}
+			// Cross-database fallback: when primary DB returned no data, failed entirely,
+			// OR returned a clarification about a missing table/schema — try remaining
+			// databases before asking the user.  A clarification about which DB to use
+			// is a signal that the schema doesn't match; another DB may answer correctly.
+			primaryNeedsRetry := mRes.DBCtx == "" ||
+				strings.HasPrefix(mRes.DBCtx, llm.ClarificationPrefix) ||
+				(mRes.QueryResult != nil && len(mRes.QueryResult.Data.Rows) == 0)
+			if primaryNeedsRetry {
+				for _, db := range s.Metabase.Databases {
+					if db.ID == action.MetabaseDatabaseID {
+						continue
+					}
+					log.Printf("[METABASE] primary db=%d needs retry (clarification/empty), trying fallback db=%d (%s)",
+						action.MetabaseDatabaseID, db.ID, db.Name)
+					fbRes := s.runMetabaseQuery(questionForLLM, threadHist, db.ID, "", action.WantsAllRows)
+					if fbRes.QueryResult != nil && len(fbRes.QueryResult.Data.Rows) > 0 {
+						mRes = fbRes
+						action.MetabaseDatabaseID = db.ID
+						log.Printf("[METABASE] fallback db=%d succeeded rows=%d", db.ID, len(fbRes.QueryResult.Data.Rows))
+						break
 					}
 				}
 			}
@@ -674,7 +704,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// 11) Generate the answer with the primary LLM (with retry and fallback).
 	answer, err := s.LLM.AnswerWithRetry(
 		s.getCompanyCtx(),
-		questionForLLM, threadHist, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, images,
+		questionForLLM, threadHist, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, hubspotCtx, images,
 		s.Cfg.OpenAIModel, s.Cfg.OpenAILesserModel, 2, 0,
 	)
 	if err != nil || strings.TrimSpace(answer) == "" {
@@ -707,6 +737,11 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// Append Google Drive source links when files were used.
 	if googleDriveSources != "" {
 		answer += "\n\n" + googleDriveSources
+	}
+
+	// Append HubSpot source links when CRM data was used.
+	if hubspotSources != "" {
+		answer += "\n\n" + hubspotSources
 	}
 
 	// Append full data table when bypassing LLM for large result formatting.

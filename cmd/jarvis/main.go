@@ -10,6 +10,7 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/fileserver"
 	"github.com/DanielFillol/Jarvis/internal/googledrive"
 	httpinternal "github.com/DanielFillol/Jarvis/internal/http"
+	"github.com/DanielFillol/Jarvis/internal/hubspot"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
 	"github.com/DanielFillol/Jarvis/internal/metabase"
@@ -66,6 +67,13 @@ func main() {
 		}
 	}
 
+	// Initialize optional HubSpot client (nil when not configured).
+	var hubspotClient *hubspot.Client
+	if cfg.HubSpotEnabled() {
+		hubspotClient = hubspot.NewClient(cfg.HubSpotBaseURL, cfg.HubSpotAPIKey, cfg.HubSpotSearchLimit)
+		log.Printf("[BOOT] HubSpot enabled base_url=%q search_limit=%d", cfg.HubSpotBaseURL, cfg.HubSpotSearchLimit)
+	}
+
 	// Initialize optional telemetry client (nil when TELEMETRY_DB_URL is empty).
 	telemetryClient := telemetry.NewClient(cfg.TelemetryDBURL)
 	if telemetryClient != nil {
@@ -81,7 +89,7 @@ func main() {
 	}
 
 	// Construct core service
-	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs, outlineClient, googleDriveClient, telemetryClient)
+	service := app.NewService(cfg, slackClient, jiraClient, llmClient, metabaseClient, fs, outlineClient, googleDriveClient, hubspotClient, telemetryClient)
 
 	// Generate company context asynchronously from Jira + Metabase docs + Outline.
 	go func() {

@@ -51,6 +51,7 @@ func (s *Service) HandleMessageDirect(ctx context.Context, channel, threadTs, or
 		s.Cfg.JiraEnabled(), s.Jira.CatalogCompact, senderUserID,
 		s.formattedMetabaseDatabases(), 0, s.Cfg.OutlineEnabled(),
 		s.Cfg.GoogleDriveEnabled(),
+		s.Cfg.HubSpotEnabled(),
 	)
 	if err != nil {
 		log.Printf("[TEST] decideActions failed: %v", err)
@@ -122,7 +123,7 @@ func (s *Service) HandleMessageDirect(ctx context.Context, channel, threadTs, or
 
 	answer, err := s.LLM.AnswerWithRetry(
 		s.getCompanyCtx(),
-		question, "", slackCtx, jiraCtx, dbCtx, "", outlineCtx, "", nil,
+		question, "", slackCtx, jiraCtx, dbCtx, "", outlineCtx, "", "", nil,
 		s.Cfg.OpenAIModel, s.Cfg.OpenAILesserModel, 2, 0,
 	)
 	if err != nil {

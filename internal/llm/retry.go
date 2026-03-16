@@ -24,7 +24,7 @@ func (a ImageAttachment) DataURL() string {
 // answerWithModel assembles the prompt and calls the Chat API with the
 // specified model.  It converts Markdown into Slack Markdown before
 // returning the result.
-func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx string, images []ImageAttachment, model string) (string, error) {
+func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, hubspotCtx string, images []ImageAttachment, model string) (string, error) {
 	botName := c.BotName
 	if strings.TrimSpace(botName) == "" {
 		botName = "Jarvis"
@@ -123,6 +123,10 @@ func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, 
 		systemParts = append(systemParts, "",
 			"GOOGLE DRIVE NÃO CONFIGURADO: A integração com o Google Drive não está habilitada nesta instalação. Se o usuário pedir arquivos, documentos ou planilhas do Drive, informe gentilmente que essa integração não está disponível e sugira que o administrador configure as variáveis GOOGLE_DRIVE_CREDENTIALS_JSON ou GOOGLE_DRIVE_CREDENTIALS_PATH.")
 	}
+	if !c.HubSpotEnabled {
+		systemParts = append(systemParts, "",
+			"HUBSPOT NÃO CONFIGURADO: A integração com o HubSpot CRM não está habilitada nesta instalação. Se o usuário pedir dados de CRM (contatos, empresas, deals, tickets, clientes), informe gentilmente que essa integração não está disponível e sugira que o administrador configure a variável HUBSPOT_API_KEY.")
+	}
 	system := strings.Join(systemParts, "\n")
 	var u strings.Builder
 	if threadHistory != "" {
@@ -158,6 +162,11 @@ func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, 
 	if googleDriveCtx != "" {
 		u.WriteString("DOCUMENTOS DO GOOGLE DRIVE:\n")
 		u.WriteString(googleDriveCtx)
+		u.WriteString("\n\n")
+	}
+	if hubspotCtx != "" {
+		u.WriteString("CONTEXTO DO HUBSPOT CRM:\n")
+		u.WriteString(hubspotCtx)
 		u.WriteString("\n\n")
 	}
 	u.WriteString("PERGUNTA:\n")
@@ -196,7 +205,7 @@ func (c *Client) answerWithModel(companyCtx, question, threadHistory, slackCtx, 
 // This makes answer generation resilient to flaky networking, 429s, and 5xxs.
 func (c *Client) AnswerWithRetry(
 	companyCtx,
-	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx string,
+	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, hubspotCtx string,
 	images []ImageAttachment,
 	primaryModel, lesserModel string,
 	maxAttempts int,
@@ -210,14 +219,14 @@ func (c *Client) AnswerWithRetry(
 	}
 
 	// Try primary first.
-	out, err := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, images, primaryModel, maxAttempts, baseDelay)
+	out, err := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, hubspotCtx, images, primaryModel, maxAttempts, baseDelay)
 	if err == nil && strings.TrimSpace(out) != "" {
 		return out, nil
 	}
 
 	// Fall back to the lesser model if configured and different from the primary.
 	if lesserModel != "" && lesserModel != primaryModel {
-		out2, err2 := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, images, lesserModel, maxAttempts, baseDelay)
+		out2, err2 := c.answerWithRetrySingleModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, hubspotCtx, images, lesserModel, maxAttempts, baseDelay)
 		if err2 == nil && strings.TrimSpace(out2) != "" {
 			return out2, nil
 		}
@@ -235,7 +244,7 @@ func (c *Client) AnswerWithRetry(
 
 func (c *Client) answerWithRetrySingleModel(
 	companyCtx,
-	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx string,
+	question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, hubspotCtx string,
 	images []ImageAttachment,
 	model string,
 	maxAttempts int,
@@ -243,7 +252,7 @@ func (c *Client) answerWithRetrySingleModel(
 ) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		out, err := c.answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, images, model)
+		out, err := c.answerWithModel(companyCtx, question, threadHistory, slackCtx, jiraCtx, dbCtx, fileCtx, outlineCtx, googleDriveCtx, hubspotCtx, images, model)
 		if err == nil && strings.TrimSpace(out) != "" {
 			return out, nil
 		}

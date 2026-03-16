@@ -93,6 +93,14 @@ type Config struct {
 	// GoogleDriveSearchLimit is the max number of files returned per query. Defaults to 5.
 	GoogleDriveSearchLimit int
 
+	// ── Optional: HubSpot ────────────────────────────────────────────────────
+	// Configure HUBSPOT_API_KEY to enable HubSpot CRM integration (contact,
+	// company, deal and ticket search).  Authentication uses a private app
+	// access token (Bearer).  HUBSPOT_BASE_URL defaults to https://api.hubapi.com.
+	HubSpotAPIKey      string
+	HubSpotBaseURL     string
+	HubSpotSearchLimit int
+
 	// CompanyContextPath is the output path for the generated company context
 	// Markdown file.  Defaults to "./docs/company_context.md".
 	CompanyContextPath string
@@ -156,6 +164,14 @@ func Load() Config {
 		cfg.GoogleDriveSearchLimit = n
 	} else {
 		cfg.GoogleDriveSearchLimit = 5
+	}
+
+	cfg.HubSpotAPIKey = os.Getenv("HUBSPOT_API_KEY")
+	cfg.HubSpotBaseURL = getEnv("HUBSPOT_BASE_URL", "https://api.hubapi.com")
+	if n, err := strconv.Atoi(getEnv("HUBSPOT_SEARCH_LIMIT", "10")); err == nil {
+		cfg.HubSpotSearchLimit = n
+	} else {
+		cfg.HubSpotSearchLimit = 10
 	}
 
 	cfg.CompanyContextPath = getEnv("COMPANY_CONTEXT_PATH", "./docs/company_context.md")
@@ -233,4 +249,9 @@ func (c Config) OutlineEnabled() bool {
 // GoogleDriveEnabled reports whether Google Drive credentials have been provided.
 func (c Config) GoogleDriveEnabled() bool {
 	return strings.TrimSpace(c.GoogleDriveCredentialsJSON) != "" || strings.TrimSpace(c.GoogleDriveCredentialsPath) != ""
+}
+
+// HubSpotEnabled reports whether a HubSpot API key has been provided.
+func (c Config) HubSpotEnabled() bool {
+	return strings.TrimSpace(c.HubSpotAPIKey) != ""
 }

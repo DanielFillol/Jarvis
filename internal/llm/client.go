@@ -23,13 +23,14 @@ type Client struct {
 	APIKey      string
 	JiraBaseURL string
 	BotName     string
-	// JiraEnabled, MetabaseEnabled, OutlineEnabled, and GoogleDriveEnabled tell
-	// the answer LLM which integrations are active so it can respond accurately
-	// when asked.
+	// JiraEnabled, MetabaseEnabled, OutlineEnabled, GoogleDriveEnabled, and
+	// HubSpotEnabled tell the answer LLM which integrations are active so it
+	// can respond accurately when asked.
 	JiraEnabled        bool
 	MetabaseEnabled    bool
 	OutlineEnabled     bool
 	GoogleDriveEnabled bool
+	HubSpotEnabled     bool
 }
 
 // NewClient constructs a new LLM client from the provided configuration.
@@ -42,6 +43,7 @@ func NewClient(cfg config.Config) *Client {
 		MetabaseEnabled:    cfg.MetabaseEnabled(),
 		OutlineEnabled:     cfg.OutlineEnabled(),
 		GoogleDriveEnabled: cfg.GoogleDriveEnabled(),
+		HubSpotEnabled:     cfg.HubSpotEnabled(),
 	}
 }
 
@@ -120,7 +122,7 @@ func (c *Client) chatWithTemperature(messages []OpenAIMessage, model string, tem
 type ActionDescriptor struct {
 	Kind string `json:"kind"` // one of the Action* constants below
 
-	// slack_search, outline_search
+	// slack_search, outline_search, googledrive_search
 	Query string `json:"query,omitempty"`
 
 	// jira_search
@@ -131,6 +133,10 @@ type ActionDescriptor struct {
 	MetabaseDatabaseID int  `json:"database_id,omitempty"`
 	WantsAllRows       bool `json:"wants_all_rows,omitempty"`
 	WantsCSVExport     bool `json:"wants_csv_export,omitempty"`
+
+	// hubspot_search
+	HubSpotObjectType string `json:"hubspot_object_type,omitempty"`
+	HubSpotQuery      string `json:"hubspot_query,omitempty"`
 }
 
 const (
@@ -142,6 +148,7 @@ const (
 	ActionShowSQL           = "show_sql"
 	ActionOutlineSearch     = "outline_search"
 	ActionGoogleDriveSearch = "googledrive_search"
+	ActionHubSpotSearch     = "hubspot_search"
 )
 
 // DecideActions performs a single LLM call to determine all actions the bot must
@@ -160,6 +167,7 @@ func (c *Client) DecideActions(
 	storedDBID int,
 	outlineEnabled bool,
 	googleDriveEnabled bool,
+	hubspotEnabled bool,
 ) ([]ActionDescriptor, error) {
 	projectsCtx := ""
 	if jiraEnabled && strings.TrimSpace(jiraCatalog) != "" {
@@ -193,6 +201,10 @@ func (c *Client) DecideActions(
 	if googleDriveEnabled {
 		googleDriveCtxStr = "\nGoogle Drive está configurado e disponível para busca de documentos e arquivos internos.\n"
 	}
+	hubspotCtxStr := ""
+	if hubspotEnabled {
+		hubspotCtxStr = "\nHubSpot CRM está configurado e disponível para busca de contatos, empresas, negociações e tickets.\n"
+	}
 	metabaseFollowUpCtx := ""
 	if storedDBID > 0 {
 		metabaseFollowUpCtx = fmt.Sprintf(
@@ -220,6 +232,9 @@ func (c *Client) DecideActions(
 	}
 	if googleDriveEnabled {
 		exampleItems = append(exampleItems, `  {"kind": "googledrive_search", "query": "relatório vendas 2024"}`)
+	}
+	if hubspotEnabled {
+		exampleItems = append(exampleItems, `  {"kind": "hubspot_search", "hubspot_object_type": "contacts", "hubspot_query": "João Silva"}`)
 	}
 
 	// Jira-specific routing rules.
@@ -266,10 +281,16 @@ Regras para jql (campo de jira_search):
 		googleDriveSourceLine = "- Google Drive: arquivos internos, planilhas, apresentações, documentos compartilhados, relatórios, contratos, propostas.\n"
 		googleDriveRule = "13. Quando Google Drive está configurado: inclua googledrive_search quando a resposta provavelmente está em um arquivo compartilhado no Drive (planilha, apresentação, PDF, relatório, contrato). Preencha query com 2–4 termos-chave descritivos do arquivo ou conteúdo buscado.\n"
 	}
+	hubspotSourceLine := ""
+	hubspotRule := ""
+	if hubspotEnabled {
+		hubspotSourceLine = "- HubSpot CRM: contatos, empresas, negociações (deals), tickets de suporte, dados de clientes e pipeline comercial.\n"
+		hubspotRule = "14. Quando HubSpot está configurado: inclua hubspot_search quando a pergunta envolve dados de CRM (busca de contato, empresa, deal, ticket, cliente, lead, pipeline). Preencha hubspot_object_type com um de: contacts, companies, deals, tickets (ou deixe vazio para buscar em todos). Preencha hubspot_query com o termo de busca mais relevante.\n"
+	}
 
 	prompt := fmt.Sprintf(`Você é um roteador de ações de um assistente de Slack.
 Analise a mensagem e retorne um JSON array com TODAS as ações necessárias, na ordem certa.
-%s%s%s%s%s%s%s
+%s%s%s%s%s%s%s%s
 Retorne APENAS um JSON array válido, sem markdown fences. Retorne [] quando nenhuma ação for necessária.
 
 Exemplo de array (inclua apenas as ações necessárias):
@@ -278,7 +299,7 @@ Exemplo de array (inclua apenas as ações necessárias):
 ]
 
 Fontes disponíveis:
-%s%s%s- Slack: discussões, decisões, links de threads, contexto operacional.
+%s%s%s%s- Slack: discussões, decisões, links de threads, contexto operacional.
 - Metabase (banco de dados): dados estruturados do banco operacional. Se a pergunta filtra, lista ou consulta entidades (registros, entidades operacionais, transações, pedidos), use metabase_query. NÃO use slack_search para dados que vivem no banco.
 
 Regras para jira_create e jira_edit:
@@ -299,7 +320,7 @@ Regras de roteamento de contexto:
 9. Follow-ups com pronomes ("dessas", "desses") referindo entidades já consultadas → metabase_query com mesmo database_id do turno anterior.
 10. wants_all_rows=true: usuário quer TODOS OS REGISTROS de uma entidade de dados — mesmo que filtrado por data ou outro critério. Sinais: "todas as coletas", "todos os pedidos", "todos os registros", "sem limite", "lista completa", "traz tudo", "quero todos", "detalhamento de todas", "me traz todas". NÃO use true quando "todos" se refere a tópicos/aspectos de análise (ex: "analise todos os aspectos", "todas as categorias") — nesses casos o usuário quer uma análise agregada, não um dump de registros individuais.
 11. wants_csv_export=true: exportação explícita ("exportar", "csv", "planilha", "download", "baixar", "excel") OU pedido de todos os dados. Quando true, também wants_all_rows=true.
-%s%s
+%s%s%s
 Regras para query em slack_search (IMPORTANTE):
 - query NUNCA vazio quando kind="slack_search" — sempre gere uma query útil.
 - Se mencionar canais (#nome), inclua in:#nome-do-canal.
@@ -320,12 +341,12 @@ Thread (contexto recente):
 
 Pergunta:
 %s
-`, dateCtx, senderCtx, projectsCtx, metabaseCtx, metabaseFollowUpCtx, outlineCtxStr, googleDriveCtxStr,
+`, dateCtx, senderCtx, projectsCtx, metabaseCtx, metabaseFollowUpCtx, outlineCtxStr, googleDriveCtxStr, hubspotCtxStr,
 		strings.Join(exampleItems, ",\n"),
-		jiraSourceLine, outlineSourceLine, googleDriveSourceLine,
+		jiraSourceLine, outlineSourceLine, googleDriveSourceLine, hubspotSourceLine,
 		jiraIntentBlock,
 		jiraRules,
-		outlineRule, googleDriveRule,
+		outlineRule, googleDriveRule, hubspotRule,
 		clip(threadHistory, 1200), question)
 
 	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
@@ -362,6 +383,12 @@ Pergunta:
 				continue
 			}
 			a.Query = strings.TrimSpace(a.Query)
+		case ActionHubSpotSearch:
+			if !hubspotEnabled {
+				continue
+			}
+			a.HubSpotObjectType = strings.TrimSpace(a.HubSpotObjectType)
+			a.HubSpotQuery = strings.TrimSpace(a.HubSpotQuery)
 		case ActionMetabaseQuery, ActionShowSQL:
 			if len(metabaseDatabases) == 0 {
 				continue
