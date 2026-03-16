@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/DanielFillol/Jarvis/internal/config"
 )
 
 const defaultBaseURL = "https://api.hubapi.com"
@@ -29,20 +32,24 @@ type Client struct {
 	http        *http.Client
 }
 
-// NewClient creates a new HubSpot client.
-// baseURL defaults to https://api.hubapi.com when empty.
-// limit defaults to 10 when <= 0.
-func NewClient(baseURL, apiKey string, limit int) *Client {
-	if strings.TrimSpace(baseURL) == "" {
+// NewClient creates a new HubSpot client from config.
+// Returns nil when HubSpot is not configured (HUBSPOT_API_KEY missing).
+func NewClient(cfg config.Config) *Client {
+	if !cfg.HubSpotEnabled() {
+		return nil
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(cfg.HubSpotBaseURL), "/")
+	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
-	baseURL = strings.TrimRight(baseURL, "/")
+	limit := cfg.HubSpotSearchLimit
 	if limit <= 0 {
 		limit = 10
 	}
+	log.Printf("[BOOT] HubSpot enabled base_url=%q search_limit=%d", baseURL, limit)
 	return &Client{
 		baseURL:     baseURL,
-		apiKey:      apiKey,
+		apiKey:      cfg.HubSpotAPIKey,
 		searchLimit: limit,
 		http:        &http.Client{Timeout: 30 * time.Second},
 	}
