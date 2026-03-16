@@ -38,6 +38,8 @@ type Client struct {
 
 // NewClient constructs a Jira client from the supplied configuration.  If
 // JiraBaseURL is empty, then API methods will return errors.
+// When Jira is enabled, the project catalog is generated asynchronously in the
+// background so CatalogCompact is enriched without blocking startup.
 func NewClient(cfg config.Config) *Client {
 	// Create a pending Store with 2-hour TTL
 	store := NewStore(2 * time.Hour)
@@ -45,7 +47,7 @@ func NewClient(cfg config.Config) *Client {
 	// Register project name→key mapping for natural language parsing
 	parse.SetProjectNameMap(cfg.JiraProjectNameMap)
 
-	return &Client{
+	c := &Client{
 		BaseURL:        strings.TrimRight(cfg.JiraBaseURL, "/"),
 		Email:          cfg.JiraEmail,
 		Token:          cfg.JiraAPIToken,
@@ -53,6 +55,15 @@ func NewClient(cfg config.Config) *Client {
 		Projects:       cfg.JiraProjectKeys,
 		CatalogCompact: strings.Join(cfg.JiraProjectKeys, ", "),
 	}
+
+	if cfg.JiraEnabled() {
+		go func() {
+			catalog := c.GenerateCatalog(cfg.JiraProjectsPath)
+			c.CatalogCompact = catalog
+		}()
+	}
+
+	return c
 }
 
 // IssueDraft represents a draft of a Jira issue used when the user
