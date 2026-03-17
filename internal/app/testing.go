@@ -47,12 +47,17 @@ func (s *Service) handleTestFlow(channel, threadTs string) error {
 // returns the response as a string instead of posting it to Slack.
 // Used by smoke tests in the prompt library runner.
 func (s *Service) HandleMessageDirect(ctx context.Context, channel, threadTs, originTs, question, senderUserID string) (string, error) {
+	hubspotCatalog := ""
+	if s.HubSpot != nil {
+		hubspotCatalog = s.HubSpot.CatalogCompact
+	}
 	actions, err := s.LLM.DecideActions(
 		question, "", s.Cfg.OpenAILesserModel,
 		s.Cfg.JiraEnabled(), s.Jira.CatalogCompact, senderUserID,
 		s.formattedMetabaseDatabases(), 0, s.Cfg.OutlineEnabled(),
 		s.Cfg.GoogleDriveEnabled(),
 		s.Cfg.HubSpotEnabled(),
+		hubspotCatalog,
 	)
 	if err != nil {
 		log.Printf("[TEST] decideActions failed: %v", err)

@@ -30,6 +30,9 @@ type Client struct {
 	apiKey      string
 	searchLimit int
 	http        *http.Client
+	// CatalogCompact is a compact one-liner of all deal/ticket pipelines and
+	// their stages.  Populated asynchronously at startup by GenerateCatalog.
+	CatalogCompact string
 }
 
 // NewClient creates a new HubSpot client from config.
@@ -47,12 +50,19 @@ func NewClient(cfg config.Config) *Client {
 		limit = 10
 	}
 	log.Printf("[BOOT] HubSpot enabled base_url=%q search_limit=%d", baseURL, limit)
-	return &Client{
+	c := &Client{
 		baseURL:     baseURL,
 		apiKey:      cfg.HubSpotAPIKey,
 		searchLimit: limit,
 		http:        &http.Client{Timeout: 30 * time.Second},
 	}
+	catalogPath := cfg.HubSpotCatalogPath
+	go func() {
+		catalog := c.GenerateCatalog(catalogPath)
+		c.CatalogCompact = catalog
+		log.Printf("[HUBSPOT] catalog: %s", catalog)
+	}()
+	return c
 }
 
 // objectProperties maps each CRM object type to the properties to fetch.

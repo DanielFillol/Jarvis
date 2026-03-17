@@ -30,12 +30,14 @@ func GenerateCompanyContext(cfg config.Config, outlineClient *outline.Client, ll
 		}
 	}
 
-	if strings.TrimSpace(jiraDoc) == "" && strings.TrimSpace(metabaseDoc) == "" && strings.TrimSpace(outlineDocs) == "" {
+	hubspotDoc := readDocFile(cfg.HubSpotCatalogPath, 4000)
+
+	if strings.TrimSpace(jiraDoc) == "" && strings.TrimSpace(metabaseDoc) == "" && strings.TrimSpace(outlineDocs) == "" && strings.TrimSpace(hubspotDoc) == "" {
 		log.Printf("[BOOT] company_context: no source material available, skipping")
 		return ""
 	}
 
-	ctx := llmClient.GenerateCompanyContext(jiraDoc, metabaseDoc, outlineDocs, cfg.OpenAILesserModel)
+	ctx := llmClient.GenerateCompanyContext(jiraDoc, metabaseDoc, outlineDocs, hubspotDoc, cfg.OpenAILesserModel)
 	if strings.TrimSpace(ctx) == "" {
 		return ""
 	}

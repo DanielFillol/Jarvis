@@ -10,7 +10,7 @@ import (
 // from the provided Jira, Metabase, and Outline documentation.
 // The output is a short (~1200 chars) Markdown reference in Portuguese that
 // will be injected into every answer call.  Returns "" on error.
-func (c *Client) GenerateCompanyContext(jiraDoc, metabaseDoc, outlineDocs, model string) string {
+func (c *Client) GenerateCompanyContext(jiraDoc, metabaseDoc, outlineDocs, hubspotDoc, model string) string {
 	if strings.TrimSpace(model) == "" {
 		model = "gpt-4o-mini"
 	}
@@ -24,6 +24,9 @@ func (c *Client) GenerateCompanyContext(jiraDoc, metabaseDoc, outlineDocs, model
 	}
 	if strings.TrimSpace(outlineDocs) != "" {
 		parts = append(parts, "### Documentação Outline\n"+clip(outlineDocs, 6000))
+	}
+	if strings.TrimSpace(hubspotDoc) != "" {
+		parts = append(parts, "### Pipelines HubSpot\n"+clip(hubspotDoc, 4000))
 	}
 	if len(parts) == 0 {
 		return ""

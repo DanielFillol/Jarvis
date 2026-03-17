@@ -100,6 +100,9 @@ type Config struct {
 	HubSpotAPIKey      string
 	HubSpotBaseURL     string
 	HubSpotSearchLimit int
+	// HubSpotCatalogPath is the output path for the generated HubSpot pipeline
+	// catalog Markdown file.  Defaults to "./docs/hubspot_catalog.md".
+	HubSpotCatalogPath string
 
 	// CompanyContextPath is the output path for the generated company context
 	// Markdown file.  Defaults to "./docs/company_context.md".
@@ -173,6 +176,7 @@ func Load() Config {
 	} else {
 		cfg.HubSpotSearchLimit = 10
 	}
+	cfg.HubSpotCatalogPath = getEnv("HUBSPOT_CATALOG_PATH", "./docs/hubspot_catalog.md")
 
 	cfg.CompanyContextPath = getEnv("COMPANY_CONTEXT_PATH", "./docs/company_context.md")
 	cfg.SQLHintsDir = getEnv("SQL_HINTS_DIR", "./docs/sql_hints")

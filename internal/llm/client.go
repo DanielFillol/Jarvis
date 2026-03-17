@@ -170,6 +170,7 @@ func (c *Client) DecideActions(
 	outlineEnabled bool,
 	googleDriveEnabled bool,
 	hubspotEnabled bool,
+	hubspotCatalog string,
 ) ([]ActionDescriptor, error) {
 	projectsCtx := ""
 	if jiraEnabled && strings.TrimSpace(jiraCatalog) != "" {
@@ -206,6 +207,9 @@ func (c *Client) DecideActions(
 	hubspotCtxStr := ""
 	if hubspotEnabled {
 		hubspotCtxStr = "\nHubSpot CRM está configurado e disponível para busca de contatos, empresas, negociações e tickets.\n"
+		if strings.TrimSpace(hubspotCatalog) != "" {
+			hubspotCtxStr += fmt.Sprintf("Pipelines HubSpot disponíveis:\n%s\n", hubspotCatalog)
+		}
 	}
 	metabaseFollowUpCtx := ""
 	if storedDBID > 0 {
@@ -289,7 +293,8 @@ Regras para jql (campo de jira_search):
 		hubspotSourceLine = "- HubSpot CRM: contatos, empresas, negociações (deals), tickets de suporte, dados de clientes e pipeline comercial.\n"
 		hubspotRule = "14. Quando HubSpot está configurado: inclua hubspot_search quando a pergunta envolve dados de CRM (busca de contato, empresa, deal, ticket, cliente, lead, pipeline). Preencha hubspot_object_type com um de: contacts, companies, deals, tickets (ou deixe vazio para buscar em todos). Preencha hubspot_query com o termo de busca mais relevante.\n" +
 			"14a. Se a mesma mensagem pedir explicitamente dados do banco de dados (Metabase) além do CRM, inclua TAMBÉM metabase_query no array — as duas ações devem aparecer juntas.\n" +
-			"14b. Quando o usuário especificar um intervalo de datas, preencha hubspot_after (data inicial inclusiva) e/ou hubspot_before (data final exclusiva) no formato YYYY-MM-DD. Use a data atual fornecida acima para calcular expressões relativas (\"últimos dois meses\", \"mês passado\", \"essa semana\").\n"
+			"14b. Quando o usuário especificar um intervalo de datas, preencha hubspot_after (data inicial inclusiva) e/ou hubspot_before (data final exclusiva) no formato YYYY-MM-DD. Use a data atual fornecida acima para calcular expressões relativas (\"últimos dois meses\", \"mês passado\", \"essa semana\").\n" +
+			"14c. Quando o usuário mencionar um estágio ou pipeline específico (ex: 'enterprise 3.0', 'fechado ganho', 'proposta'), use esse nome como parte do hubspot_query para filtrar negócios naquele estágio. Consulte os Pipelines HubSpot disponíveis listados acima para identificar o nome correto do estágio.\n"
 	}
 
 	// Multi-source rule: encourage combining sources when multiple are configured.

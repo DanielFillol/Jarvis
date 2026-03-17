@@ -195,6 +195,10 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	hasPending := s.Cfg.JiraEnabled() && s.Store.Load(channel, threadTs) != nil
 	storedDBID, _ := s.loadThreadDBID(contextChannel, contextThreadTs)
 
+	hubspotCatalog := ""
+	if s.HubSpot != nil {
+		hubspotCatalog = s.HubSpot.CatalogCompact
+	}
 	actions, actErr := s.LLM.DecideActions(
 		questionForLLM, threadHist, s.Cfg.OpenAIModel,
 		s.Cfg.JiraEnabled(), s.Jira.CatalogCompact, senderUserID,
@@ -202,6 +206,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		s.Cfg.OutlineEnabled(),
 		s.Cfg.GoogleDriveEnabled(),
 		s.Cfg.HubSpotEnabled(),
+		hubspotCatalog,
 	)
 	if actErr != nil {
 		log.Printf("[WARN] decideActions failed: %v", actErr)
@@ -642,6 +647,7 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			s.Cfg.JiraEnabled(), s.Jira.CatalogCompact, senderUserID,
 			s.formattedMetabaseDatabases(), storedDBID,
 			s.Cfg.OutlineEnabled(), s.Cfg.GoogleDriveEnabled(), s.Cfg.HubSpotEnabled(),
+			hubspotCatalog,
 		)
 		triedKinds := make(map[string]bool)
 		for _, a := range contextActions {
