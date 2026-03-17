@@ -118,6 +118,10 @@ type Config struct {
 	// postgres://user:pass@host:5432/dbname?sslmode=disable) to enable
 	// usage telemetry.  When empty, telemetry is silently disabled.
 	TelemetryDBURL string
+
+	// ChatAPIKey gates the /api/chat endpoint.  When empty the endpoint is
+	// open (no authentication required).  Set via CHAT_API_KEY.
+	ChatAPIKey string
 }
 
 // Load reads configuration from environment variables.  A .env file in the
@@ -181,6 +185,7 @@ func Load() Config {
 	cfg.CompanyContextPath = getEnv("COMPANY_CONTEXT_PATH", "./docs/company_context.md")
 	cfg.SQLHintsDir = getEnv("SQL_HINTS_DIR", "./docs/sql_hints")
 	cfg.TelemetryDBURL = os.Getenv("TELEMETRY_DB_URL")
+	cfg.ChatAPIKey = os.Getenv("CHAT_API_KEY")
 
 	pages := getEnv("SLACK_SEARCH_MAX_PAGES", "10")
 	if n, err := strconv.Atoi(pages); err == nil {

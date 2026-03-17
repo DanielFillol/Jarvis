@@ -51,8 +51,12 @@ func main() {
 	// Slack events endpoint
 	slackHandler := httpinternal.NewSlackHandler(slackClient, service)
 
+	// Direct HTTP chat endpoint
+	chatHandler := httpinternal.NewChatHandler(service, cfg.ChatAPIKey)
+
 	mux := http.NewServeMux()
 	mux.Handle("/slack/events", slackHandler)
+	mux.Handle("/api/chat", chatHandler)
 	mux.Handle("/files/", fs)
 
 	// Start HTTP server
