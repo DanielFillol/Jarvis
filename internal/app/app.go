@@ -434,13 +434,36 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			if query == "" {
 				query = question
 			}
-			log.Printf("[JARVIS] hubspotSearch object_type=%q query=%q", objectType, query)
-			results, hErr := s.HubSpot.Search(objectType, query)
+			log.Printf("[JARVIS] hubspotSearch object_type=%q query=%q after=%q before=%q", objectType, query, action.HubSpotAfter, action.HubSpotBefore)
+			results, hErr := s.HubSpot.Search(objectType, query, action.HubSpotAfter, action.HubSpotBefore)
 			if hErr != nil {
 				log.Printf("[WARN] hubspot search failed: %v", hErr)
 				hubspotCtx = "[HUBSPOT_ERROR: busca falhou. NÃO invente dados de CRM.]"
 			} else if len(results) == 0 {
-				hubspotCtx = "[HUBSPOT_EMPTY: nenhum resultado encontrado no HubSpot.]"
+				// Ask LLM to generate alternative query variants and retry.
+				variants := s.LLM.GenerateHubSpotQueryVariants(query, questionForLLM, s.Cfg.OpenAILesserModel)
+				log.Printf("[JARVIS] hubspotSearch empty, LLM variants=%v", variants)
+				for _, v := range variants {
+					if strings.TrimSpace(v) == "" || v == query {
+						continue
+					}
+					log.Printf("[JARVIS] hubspotSearch retry variant=%q", v)
+					results, hErr = s.HubSpot.Search(objectType, v, action.HubSpotAfter, action.HubSpotBefore)
+					if hErr != nil {
+						log.Printf("[WARN] hubspot search failed variant=%q: %v", v, hErr)
+						break
+					}
+					if len(results) > 0 {
+						log.Printf("[JARVIS] hubspotContext records=%d chars=%d (variant=%q)", len(results), len(hubspot.FormatContext(results, 4000)), v)
+						break
+					}
+				}
+				if len(results) == 0 {
+					hubspotCtx = "[HUBSPOT_EMPTY: nenhum resultado encontrado no HubSpot.]"
+				} else {
+					hubspotCtx = hubspot.FormatContext(results, 4000)
+					hubspotSources = hubspot.FormatSources(results)
+				}
 			} else {
 				hubspotCtx = hubspot.FormatContext(results, 4000)
 				hubspotSources = hubspot.FormatSources(results)
@@ -601,6 +624,136 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			}
 			log.Printf("[JARVIS] show SQL handled executedSQL_len=%d dur=%s", len(executedSQL), time.Since(start))
 			return nil
+		}
+	}
+
+	// Pass 3 — fallback: when all context sources returned empty/error, ask the router
+	// again with a note about what was tried, then execute any newly suggested sources.
+	if len(contextActions) > 0 && allContextsNegative(hubspotCtx, jiraCtxParts, slackCtxParts, dbCtxParts, outlineCtx, googleDriveCtx) {
+		var triedSources []string
+		for _, a := range contextActions {
+			triedSources = append(triedSources, a.Kind)
+		}
+		fallbackNote := fmt.Sprintf(
+			"[SISTEMA: fontes consultadas retornaram vazio ou erro: %s. Considere fontes alternativas disponíveis.] ",
+			strings.Join(triedSources, ", "))
+		fallbackActions2, _ := s.LLM.DecideActions(
+			fallbackNote+questionForLLM, threadHist, s.Cfg.OpenAIModel,
+			s.Cfg.JiraEnabled(), s.Jira.CatalogCompact, senderUserID,
+			s.formattedMetabaseDatabases(), storedDBID,
+			s.Cfg.OutlineEnabled(), s.Cfg.GoogleDriveEnabled(), s.Cfg.HubSpotEnabled(),
+		)
+		triedKinds := make(map[string]bool)
+		for _, a := range contextActions {
+			triedKinds[a.Kind] = true
+		}
+		_, fallbackCtxActions := splitActions(fallbackActions2)
+		var newActions []llm.ActionDescriptor
+		for _, a := range fallbackCtxActions {
+			if !triedKinds[a.Kind] {
+				newActions = append(newActions, a)
+			}
+		}
+		log.Printf("[JARVIS] fallbackPass tried=%v new=%v", triedSources, actionKinds(newActions))
+		for _, action := range newActions {
+			switch action.Kind {
+			case llm.ActionSlackSearch:
+				if strings.TrimSpace(action.Query) == "" || s.Cfg.SlackUserToken == "" {
+					continue
+				}
+				executedSlackSearch = true
+				resolvedQuery := s.Slack.ResolveUserIDsInQuery(action.Query)
+				log.Printf("[JARVIS] fallback slackSearch query=%q", resolvedQuery)
+				matches, sErr := s.Slack.SearchMessagesAll(resolvedQuery)
+				if sErr != nil {
+					log.Printf("[WARN] fallback slack search failed: %v", sErr)
+					break
+				}
+				if len(matches) > 0 {
+					slackMatches += len(matches)
+					slackCtxParts = append(slackCtxParts, buildSlackContext(matches, 25))
+					log.Printf("[JARVIS] fallback slackContext matches=%d", len(matches))
+				}
+			case llm.ActionJiraSearch:
+				executedJiraSearch = true
+				jql := strings.TrimSpace(action.JQL)
+				if jql == "" {
+					jql = defaultJQLForIntent(action.JiraIntent, question, s.Cfg.JiraProjectKeys)
+				}
+				jql = sanitizeJQL(jql)
+				log.Printf("[JARVIS] fallback jiraJQL=%q", jql)
+				issues, jErr := s.Jira.FetchAll(jql, 200)
+				if jErr != nil {
+					log.Printf("[WARN] fallback jira search failed: %v", jErr)
+					break
+				}
+				if len(issues) > 0 {
+					jiraIssuesFound += len(issues)
+					jiraCtxParts = append(jiraCtxParts, buildJiraContext(issues, 40))
+					log.Printf("[JARVIS] fallback jiraContext issues=%d", len(issues))
+				}
+			case llm.ActionOutlineSearch:
+				outlineQuery := strings.TrimSpace(action.Query)
+				if s.Outline != nil && outlineQuery != "" {
+					log.Printf("[JARVIS] fallback outlineSearch query=%q", outlineQuery)
+					results, oErr := s.Outline.SearchDocuments(outlineQuery, 5)
+					if oErr != nil {
+						log.Printf("[WARN] fallback outline search failed: %v", oErr)
+					} else {
+						outlineCtx = outline.FormatContext(results, 8000)
+						outlineSources = outline.FormatSources(results)
+						log.Printf("[JARVIS] fallback outlineContext docs=%d", len(results))
+					}
+				}
+			case llm.ActionGoogleDriveSearch:
+				driveQuery := strings.TrimSpace(action.Query)
+				if s.GoogleDrive != nil && driveQuery != "" {
+					log.Printf("[JARVIS] fallback googleDriveSearch query=%q", driveQuery)
+					results, dErr := s.GoogleDrive.SearchAndFetch(driveQuery)
+					if dErr != nil {
+						log.Printf("[WARN] fallback google drive search failed: %v", dErr)
+					} else {
+						googleDriveCtx = googledrive.FormatContext(results, 8000)
+						googleDriveSources = googledrive.FormatSources(results)
+						log.Printf("[JARVIS] fallback googleDriveContext files=%d", len(results))
+					}
+				}
+			case llm.ActionHubSpotSearch:
+				if s.HubSpot == nil {
+					break
+				}
+				objectType := strings.TrimSpace(action.HubSpotObjectType)
+				query := strings.TrimSpace(action.HubSpotQuery)
+				if query == "" {
+					query = question
+				}
+				log.Printf("[JARVIS] fallback hubspotSearch object_type=%q query=%q", objectType, query)
+				results, hErr := s.HubSpot.Search(objectType, query, action.HubSpotAfter, action.HubSpotBefore)
+				if hErr != nil {
+					log.Printf("[WARN] fallback hubspot search failed: %v", hErr)
+				} else if len(results) == 0 {
+					variants := s.LLM.GenerateHubSpotQueryVariants(query, questionForLLM, s.Cfg.OpenAILesserModel)
+					log.Printf("[JARVIS] fallback hubspotSearch empty, LLM variants=%v", variants)
+					for _, v := range variants {
+						if strings.TrimSpace(v) == "" || v == query {
+							continue
+						}
+						results, hErr = s.HubSpot.Search(objectType, v, action.HubSpotAfter, action.HubSpotBefore)
+						if hErr != nil {
+							log.Printf("[WARN] fallback hubspot search failed variant=%q: %v", v, hErr)
+							break
+						}
+						if len(results) > 0 {
+							log.Printf("[JARVIS] fallback hubspotContext records=%d (variant=%q)", len(results), v)
+							break
+						}
+					}
+				}
+				if len(results) > 0 {
+					hubspotCtx = hubspot.FormatContext(results, 4000)
+					hubspotSources = hubspot.FormatSources(results)
+				}
+			}
 		}
 	}
 
@@ -847,4 +1000,30 @@ func channelType(channel string) string {
 		return "dm"
 	}
 	return "channel"
+}
+
+// allContextsNegative returns true when every accumulated context is empty or
+// contains only an error/empty marker — indicating all sources came up blank.
+func allContextsNegative(hubspotCtx string, jiraCtxParts, slackCtxParts, dbCtxParts []string, outlineCtx, googleDriveCtx string) bool {
+	isNeg := func(s string) bool {
+		return s == "" ||
+			strings.HasPrefix(s, "[HUBSPOT_EMPTY") ||
+			strings.HasPrefix(s, "[HUBSPOT_ERROR") ||
+			strings.HasPrefix(s, "[JIRA_EMPTY") ||
+			strings.HasPrefix(s, "[JIRA_ERROR") ||
+			strings.HasPrefix(s, "[ERRO:") ||
+			strings.HasPrefix(s, "[AVISO:")
+	}
+	allNeg := func(parts []string) bool {
+		if len(parts) == 0 {
+			return true
+		}
+		for _, p := range parts {
+			if !isNeg(p) {
+				return false
+			}
+		}
+		return true
+	}
+	return isNeg(hubspotCtx) && allNeg(jiraCtxParts) && len(slackCtxParts) == 0 && allNeg(dbCtxParts) && isNeg(outlineCtx) && isNeg(googleDriveCtx)
 }

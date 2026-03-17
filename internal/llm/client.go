@@ -137,6 +137,8 @@ type ActionDescriptor struct {
 	// hubspot_search
 	HubSpotObjectType string `json:"hubspot_object_type,omitempty"`
 	HubSpotQuery      string `json:"hubspot_query,omitempty"`
+	HubSpotAfter      string `json:"hubspot_after,omitempty"`  // ISO YYYY-MM-DD, inclusive
+	HubSpotBefore     string `json:"hubspot_before,omitempty"` // ISO YYYY-MM-DD, exclusive
 }
 
 const (
@@ -234,7 +236,7 @@ func (c *Client) DecideActions(
 		exampleItems = append(exampleItems, `  {"kind": "googledrive_search", "query": "relatório vendas 2024"}`)
 	}
 	if hubspotEnabled {
-		exampleItems = append(exampleItems, `  {"kind": "hubspot_search", "hubspot_object_type": "contacts", "hubspot_query": "João Silva"}`)
+		exampleItems = append(exampleItems, `  {"kind": "hubspot_search", "hubspot_object_type": "companies", "hubspot_query": "Acme Corp", "hubspot_after": "2026-01-01"}`)
 	}
 
 	// Jira-specific routing rules.
@@ -273,7 +275,7 @@ Regras para jql (campo de jira_search):
 	outlineRule := ""
 	if outlineEnabled {
 		outlineSourceLine = "- Outline Wiki: documentação interna, processos, guias, runbooks, especificações de produto, onboarding, políticas.\n"
-		outlineRule = "12. Quando Outline está configurado: inclua outline_search quando a resposta depende principalmente de documentação interna (processos, guias, runbooks, políticas, onboarding, RH, benefícios). Preencha query com 2–4 termos-chave do assunto, sem artigos ou preposições.\n"
+		outlineRule = "12. Quando Outline está configurado: inclua outline_search quando a resposta depende principalmente de documentação interna (processos, guias, runbooks, políticas, onboarding, RH, benefícios). Preencha query com 2–4 termos-chave do assunto, sem artigos ou preposições. NUNCA inclua o nome da própria empresa/organização na query — o Outline já é o wiki interno da empresa, então o nome dela não filtra nada útil.\n"
 	}
 	googleDriveSourceLine := ""
 	googleDriveRule := ""
@@ -285,7 +287,36 @@ Regras para jql (campo de jira_search):
 	hubspotRule := ""
 	if hubspotEnabled {
 		hubspotSourceLine = "- HubSpot CRM: contatos, empresas, negociações (deals), tickets de suporte, dados de clientes e pipeline comercial.\n"
-		hubspotRule = "14. Quando HubSpot está configurado: inclua hubspot_search quando a pergunta envolve dados de CRM (busca de contato, empresa, deal, ticket, cliente, lead, pipeline). Preencha hubspot_object_type com um de: contacts, companies, deals, tickets (ou deixe vazio para buscar em todos). Preencha hubspot_query com o termo de busca mais relevante.\n"
+		hubspotRule = "14. Quando HubSpot está configurado: inclua hubspot_search quando a pergunta envolve dados de CRM (busca de contato, empresa, deal, ticket, cliente, lead, pipeline). Preencha hubspot_object_type com um de: contacts, companies, deals, tickets (ou deixe vazio para buscar em todos). Preencha hubspot_query com o termo de busca mais relevante.\n" +
+			"14a. Se a mesma mensagem pedir explicitamente dados do banco de dados (Metabase) além do CRM, inclua TAMBÉM metabase_query no array — as duas ações devem aparecer juntas.\n" +
+			"14b. Quando o usuário especificar um intervalo de datas, preencha hubspot_after (data inicial inclusiva) e/ou hubspot_before (data final exclusiva) no formato YYYY-MM-DD. Use a data atual fornecida acima para calcular expressões relativas (\"últimos dois meses\", \"mês passado\", \"essa semana\").\n"
+	}
+
+	// Multi-source rule: encourage combining sources when multiple are configured.
+	activeSources := 1 // slack is always available
+	if jiraEnabled {
+		activeSources++
+	}
+	if len(metabaseDatabases) > 0 {
+		activeSources++
+	}
+	if outlineEnabled {
+		activeSources++
+	}
+	if googleDriveEnabled {
+		activeSources++
+	}
+	if hubspotEnabled {
+		activeSources++
+	}
+	multiSourceRule := ""
+	if activeSources >= 3 {
+		multiSourceRule = `REGRA GERAL DE MULTI-FONTE: Quando múltiplas fontes estão configuradas, prefira incluir VÁRIAS ações
+no array em vez de apenas uma. Uma resposta completa vale mais que uma resposta rápida. Exemplos:
+- Pergunta sobre empresa ou cliente: inclua hubspot_search E metabase_query se ambos disponíveis.
+- Pergunta sobre processo ou entrega: inclua jira_search E slack_search.
+- Nunca descarte uma fonte disponível se ela puder contribuir para a resposta.
+`
 	}
 
 	prompt := fmt.Sprintf(`Você é um roteador de ações de um assistente de Slack.
@@ -313,7 +344,7 @@ Regras para jira_create e jira_edit:
 - Criar um card SEM pedido explícito de dados externos → sem jira_search, sem slack_search
 - jira_create/jira_edit PODEM coexistir com metabase_query, slack_search ou jira_search quando o usuário pede EXPLICITAMENTE dados externos para incluir no card ou na resposta (ex: "escreva nesse card o total de X", "adicione as threads onde X foi mencionada", "busque o total de registros")
 %s
-Regras de roteamento de contexto:
+%sRegras de roteamento de contexto:
 %s
 7. Se o histórico contém SQL ou resultados de banco E o usuário faz follow-up → metabase_query. Use database_id da linha "Query executada (db=N):" do histórico.
 8. show_sql SOMENTE quando usuário pede EXPLICITAMENTE o SQL/query/código usado ("SQL", "query", "consulta que você rodou", "me mostra o código"). Pedidos de dados → metabase_query, não show_sql. Inclua database_id do "Query executada (db=N):" do histórico (ou 0).
@@ -345,6 +376,7 @@ Pergunta:
 		strings.Join(exampleItems, ",\n"),
 		jiraSourceLine, outlineSourceLine, googleDriveSourceLine, hubspotSourceLine,
 		jiraIntentBlock,
+		multiSourceRule,
 		jiraRules,
 		outlineRule, googleDriveRule, hubspotRule,
 		clip(threadHistory, 1200), question)
@@ -389,6 +421,8 @@ Pergunta:
 			}
 			a.HubSpotObjectType = strings.TrimSpace(a.HubSpotObjectType)
 			a.HubSpotQuery = strings.TrimSpace(a.HubSpotQuery)
+			a.HubSpotAfter = strings.TrimSpace(a.HubSpotAfter)
+			a.HubSpotBefore = strings.TrimSpace(a.HubSpotBefore)
 		case ActionMetabaseQuery, ActionShowSQL:
 			if len(metabaseDatabases) == 0 {
 				continue
@@ -407,6 +441,36 @@ Pergunta:
 	return result, nil
 }
 
+// GenerateHubSpotQueryVariants asks the LLM to suggest up to 2 alternative search
+// queries for a HubSpot CRM search that returned no results on the first attempt.
+// Returns an empty slice on error or when no useful variants can be generated.
+func (c *Client) GenerateHubSpotQueryVariants(originalQuery, question, model string) []string {
+	if strings.TrimSpace(model) == "" {
+		model = "gpt-4o-mini"
+	}
+	prompt := fmt.Sprintf(`Uma busca no HubSpot CRM para "%s" não retornou resultados.
+Contexto da pergunta: "%s"
+
+Gere até 2 variações alternativas da query de busca para tentar encontrar o registro no CRM.
+Considere: remover hifens, acentos, sufixos descritivos; usar apenas o nome principal; trocar variantes do nome.
+Exemplos: "liv-up-saude" → ["Liv Up", "Liv Up Saúde"] | "bec-bar-001" → ["Bec Bar"] | "cliente-xyz" → ["Cliente XYZ", "XYZ"]
+
+Retorne APENAS um JSON array de strings com as variações, sem markdown. Ex: ["Liv Up", "Liv Up Saúde"]
+Se não houver variações úteis, retorne: []`, originalQuery, question)
+
+	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}
+	out, err := c.Chat(msgs, model, 0, 100)
+	if err != nil {
+		return nil
+	}
+	out = strings.TrimSpace(stripCodeFences(out))
+	var variants []string
+	if err := json.Unmarshal([]byte(out), &variants); err != nil {
+		return nil
+	}
+	return variants
+}
+
 // GenerateOutlineQuery uses the LLM to produce a concise, effective search
 // query (2–4 keywords) for the Outline wiki from the user's question.
 // It extracts the core subject, stripping greetings, articles, prepositions,
@@ -422,10 +486,11 @@ RETORNE APENAS os termos, sem pontuação, sem aspas, sem explicações.
 Regras:
 - Extraia apenas substantivos e adjetivos centrais do assunto.
 - Omita saudações, artigos, preposições, verbos auxiliares e pronomes.
+- NUNCA inclua o nome da própria empresa/organização — o Outline já é o wiki interno da empresa, então esse nome não filtra nada útil.
 - Exemplos:
   "quanto eu ganho de vale alimentação por mês?" → "vale alimentação benefício"
   "como funciona o processo de deploy em produção?" → "deploy produção processo"
-  "quais são as políticas de férias da empresa?" → "férias políticas empresa"
+  "quais são as políticas de férias da empresa?" → "férias políticas"
   "cria uma tarefa com base nessa thread" → "tarefa fluxo processo"
   "me explica o onboarding de novos engenheiros" → "onboarding engenheiros"
 
@@ -526,10 +591,12 @@ INSTRUÇÕES:
 
 REGRAS DE SQL:
 - Buscas textuais: use ILIKE '%%termo%%'. Redshift ILIKE é insensível a maiúsculas mas NÃO a acentos — use substrings curtas e sem caracteres acentuados para maior abrangência.
+- Normalização de nomes em ILIKE: quando o nome da entidade na pergunta contiver hifens, underscores ou caracteres especiais, remova-os antes de usar no filtro. Ex: "empresa-abc-sp" → ILIKE '%%empresa abc%%'; "fornecedor-01" → ILIKE '%%fornecedor%%'. Nunca copie o nome com hifens diretamente para o ILIKE.
 - Atributos de entidades referenciadas por ID estão em tabelas separadas — sempre use JOIN, nunca assuma que o valor existe como coluna direta.
 - Prefira tabelas base/normalizadas em vez de views ou tabelas de staging.
 - Datas: use os tipos corretos da coluna (Date vs DateTime) e filtre com >= / < ou BETWEEN conforme a sintaxe do engine acima.
-- Use as referências de data acima para expressões relativas como "semana passada", "hoje", "mês passado".`,
+- Use as referências de data acima para expressões relativas como "semana passada", "hoje", "mês passado".
+- CONTEXTO DE ENTIDADE: Se a pergunta não especificar explicitamente um filtro de entidade (gerador, cliente, empresa, transportador) mas o histórico da conversa mostra que o assunto está focado em uma entidade específica (ex: "Liv Up-Saúde", "Empresa X"), APLIQUE esse filtro na query como cláusula WHERE mesmo que não seja mencionado na pergunta atual. Nunca retorne dados gerais de todo o banco quando o contexto indica uma entidade específica.`,
 		engineCtx, dateCtx, clip(schemaCtx, 120000), baseCtx, hintsSection, clip(threadHist, 800), question, ClarificationPrefix, limitSection, queryTypeSection)
 
 	msgs := []OpenAIMessage{{Role: "user", Content: prompt}}

@@ -87,18 +87,47 @@ func deriveName(objectType string, props map[string]string) string {
 	return ""
 }
 
+// isoToMillis converts an ISO date string (YYYY-MM-DD) to Unix milliseconds.
+func isoToMillis(date string) (int64, error) {
+	t, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return 0, err
+	}
+	return t.UnixMilli(), nil
+}
+
 // search performs POST /crm/v3/objects/{objectType}/search and returns parsed results.
-func (c *Client) search(objectType, query string) ([]*SearchResult, error) {
+// after and before are optional ISO YYYY-MM-DD strings to filter by hs_lastmodifieddate.
+func (c *Client) search(objectType, query, after, before string) ([]*SearchResult, error) {
 	props, ok := objectProperties[objectType]
 	if !ok {
 		return nil, fmt.Errorf("unknown hubspot object type: %s", objectType)
 	}
 
-	body, _ := json.Marshal(map[string]interface{}{
+	bodyMap := map[string]interface{}{
 		"query":      query,
 		"properties": props,
 		"limit":      c.searchLimit,
-	})
+	}
+	var filters []map[string]interface{}
+	if after != "" {
+		if ms, err := isoToMillis(after); err == nil {
+			filters = append(filters, map[string]interface{}{
+				"propertyName": "hs_lastmodifieddate", "operator": "GTE", "value": fmt.Sprintf("%d", ms),
+			})
+		}
+	}
+	if before != "" {
+		if ms, err := isoToMillis(before); err == nil {
+			filters = append(filters, map[string]interface{}{
+				"propertyName": "hs_lastmodifieddate", "operator": "LTE", "value": fmt.Sprintf("%d", ms),
+			})
+		}
+	}
+	if len(filters) > 0 {
+		bodyMap["filterGroups"] = []map[string]interface{}{{"filters": filters}}
+	}
+	body, _ := json.Marshal(bodyMap)
 
 	url := fmt.Sprintf("%s/crm/v3/objects/%s/search", c.baseURL, objectType)
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
@@ -146,19 +175,20 @@ func (c *Client) search(objectType, query string) ([]*SearchResult, error) {
 }
 
 // Search searches a specific object type. When objectType is empty, searches all types.
-func (c *Client) Search(objectType, query string) ([]*SearchResult, error) {
+// after and before are optional ISO YYYY-MM-DD date bounds (hs_lastmodifieddate filter).
+func (c *Client) Search(objectType, query, after, before string) ([]*SearchResult, error) {
 	if strings.TrimSpace(objectType) == "" {
-		return c.searchAllTypes(query)
+		return c.searchAllTypes(query, after, before)
 	}
-	return c.search(objectType, query)
+	return c.search(objectType, query, after, before)
 }
 
 // searchAllTypes runs Search across all object types and merges results.
-func (c *Client) searchAllTypes(query string) ([]*SearchResult, error) {
+func (c *Client) searchAllTypes(query, after, before string) ([]*SearchResult, error) {
 	var all []*SearchResult
 	var lastErr error
 	for _, ot := range allObjectTypes {
-		res, err := c.search(ot, query)
+		res, err := c.search(ot, query, after, before)
 		if err != nil {
 			lastErr = err
 			continue
