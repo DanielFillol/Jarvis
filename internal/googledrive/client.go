@@ -59,7 +59,7 @@ func NewClient(cfg config.Config, pdfParser, docxParser, xlsxParser func([]byte)
 		limit = 5
 	}
 	ctx := context.Background()
-	creds, err := google.CredentialsFromJSONWithType(ctx, credsJSON, drive.DriveReadonlyScope, drive.DriveFileScope)
+	creds, err := google.CredentialsFromJSON(ctx, credsJSON, drive.DriveReadonlyScope)
 	if err != nil {
 		log.Printf("[BOOT] GoogleDrive: parse credentials: %v", err)
 		return nil
