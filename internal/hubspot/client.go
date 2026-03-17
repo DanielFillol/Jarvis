@@ -33,6 +33,13 @@ type Client struct {
 	// CatalogCompact is a compact one-liner of all deal/ticket pipelines and
 	// their stages.  Populated asynchronously at startup by GenerateCatalog.
 	CatalogCompact string
+	// CatalogForLLM is a compact ID→label mapping for all pipelines and stages,
+	// intended to be injected into LLM context so it can decode numeric IDs.
+	// Populated asynchronously at startup by GenerateCatalog.
+	CatalogForLLM string
+	// pipelines holds all fetched deal/ticket pipelines for name→ID resolution.
+	// Populated asynchronously at startup by GenerateCatalog.
+	pipelines []*Pipeline
 }
 
 // NewClient creates a new HubSpot client from config.
@@ -106,6 +113,29 @@ func isoToMillis(date string) (int64, error) {
 	return t.UnixMilli(), nil
 }
 
+// findPipelineByQuery returns the first pipeline whose label matches query
+// (case-insensitive exact, then contains).  Returns nil when no match is found.
+func (c *Client) findPipelineByQuery(objectType, query string) *Pipeline {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil
+	}
+	var containsMatch *Pipeline
+	for _, p := range c.pipelines {
+		if p.ObjectType != objectType {
+			continue
+		}
+		label := strings.ToLower(p.Label)
+		if label == q {
+			return p // exact match wins immediately
+		}
+		if containsMatch == nil && (strings.Contains(label, q) || strings.Contains(q, label)) {
+			containsMatch = p
+		}
+	}
+	return containsMatch
+}
+
 // search performs POST /crm/v3/objects/{objectType}/search and returns parsed results.
 // after and before are optional ISO YYYY-MM-DD strings to filter by hs_lastmodifieddate.
 func (c *Client) search(objectType, query, after, before string) ([]*SearchResult, error) {
@@ -114,12 +144,22 @@ func (c *Client) search(objectType, query, after, before string) ([]*SearchResul
 		return nil, fmt.Errorf("unknown hubspot object type: %s", objectType)
 	}
 
-	bodyMap := map[string]interface{}{
-		"query":      query,
-		"properties": props,
-		"limit":      c.searchLimit,
-	}
 	var filters []map[string]interface{}
+
+	// If the query matches a known pipeline name, filter by pipeline ID instead
+	// of doing a text search (the text search API does not index pipeline labels).
+	if pl := c.findPipelineByQuery(objectType, query); pl != nil {
+		pipelineProp := "pipeline"
+		if objectType == "tickets" {
+			pipelineProp = "hs_pipeline"
+		}
+		filters = append(filters, map[string]interface{}{
+			"propertyName": pipelineProp, "operator": "EQ", "value": pl.ID,
+		})
+		log.Printf("[HUBSPOT] query %q matched pipeline %q (id=%s), using property filter", query, pl.Label, pl.ID)
+		query = "" // replace text search with property filter
+	}
+
 	if after != "" {
 		if ms, err := isoToMillis(after); err == nil {
 			filters = append(filters, map[string]interface{}{
@@ -133,6 +173,12 @@ func (c *Client) search(objectType, query, after, before string) ([]*SearchResul
 				"propertyName": "hs_lastmodifieddate", "operator": "LTE", "value": fmt.Sprintf("%d", ms),
 			})
 		}
+	}
+
+	bodyMap := map[string]interface{}{
+		"query":      query,
+		"properties": props,
+		"limit":      c.searchLimit,
 	}
 	if len(filters) > 0 {
 		bodyMap["filterGroups"] = []map[string]interface{}{{"filters": filters}}

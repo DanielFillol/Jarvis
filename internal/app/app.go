@@ -801,6 +801,13 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	jiraCtx := strings.Join(jiraCtxParts, "\n\n")
 	dbCtx := strings.Join(dbCtxParts, "\n\n")
 
+	// Prepend HubSpot pipeline/stage ID→label catalog so the LLM can decode
+	// numeric dealstage/pipeline IDs in the search results.
+	if s.HubSpot != nil && strings.TrimSpace(s.HubSpot.CatalogForLLM) != "" &&
+		hubspotCtx != "" && !strings.HasPrefix(hubspotCtx, "[HUBSPOT_ERROR") && !strings.HasPrefix(hubspotCtx, "[HUBSPOT_EMPTY") {
+		hubspotCtx = s.HubSpot.CatalogForLLM + "\n\n" + hubspotCtx
+	}
+
 	// Build appendDataTable for large inline results.
 	var appendDataTable string
 	for i, qr := range dbQueryResults {
