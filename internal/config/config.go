@@ -100,6 +100,10 @@ type Config struct {
 	HubSpotAPIKey      string
 	HubSpotBaseURL     string
 	HubSpotSearchLimit int
+	// HubSpotPortalID is the numeric HubSpot portal ID used to build direct
+	// record links (app.hubspot.com/contacts/{portalId}/...).  Set via
+	// HUBSPOT_PORTAL_ID env var.  When empty, record URLs are omitted.
+	HubSpotPortalID string
 	// HubSpotCatalogPath is the output path for the generated HubSpot pipeline
 	// catalog Markdown file.  Defaults to "./docs/hubspot_catalog.md".
 	HubSpotCatalogPath string
@@ -180,6 +184,7 @@ func Load() Config {
 	} else {
 		cfg.HubSpotSearchLimit = 10
 	}
+	cfg.HubSpotPortalID = strings.TrimSpace(os.Getenv("HUBSPOT_PORTAL_ID"))
 	cfg.HubSpotCatalogPath = getEnv("HUBSPOT_CATALOG_PATH", "./docs/hubspot_catalog.md")
 
 	cfg.CompanyContextPath = getEnv("COMPANY_CONTEXT_PATH", "./docs/company_context.md")
