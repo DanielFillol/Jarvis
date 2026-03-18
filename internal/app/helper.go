@@ -330,7 +330,7 @@ func buildJiraContextSimple(issues []jira.SearchJQLRespIssue) string {
 		if it.Sprint != "" {
 			sprint = " | sprint=" + it.Sprint
 		}
-		b.WriteString(fmt.Sprintf("%s [%s] (%s) %s — %s | assignee=%s | updated=%s%s\n", it.Key, it.Status, it.Type, it.Priority, it.Summary, it.Assignee, it.Updated, sprint))
+		b.WriteString(fmt.Sprintf("%s [%s] (%s) %s — %s | assignee=%s | updated=%s | created=%s%s\n", it.Key, it.Status, it.Type, it.Priority, it.Summary, it.Assignee, it.Updated, it.Created, sprint))
 		if i >= 39 {
 			remaining := len(issues) - 40
 			if remaining > 0 {
@@ -403,6 +403,36 @@ func isXLSXMimetype(mimetype string) bool {
 	mimetype = strings.ToLower(strings.TrimSpace(mimetype))
 	return mimetype == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
 		mimetype == "application/vnd.ms-excel"
+}
+
+// isGoogleSheetsMimetype reports whether the MIME type is a Google Sheets file.
+func isGoogleSheetsMimetype(mimetype string) bool {
+	return strings.ToLower(strings.TrimSpace(mimetype)) == "application/vnd.google-apps.spreadsheet"
+}
+
+// tailCSVContent keeps the CSV header row and then fills the remaining budget
+// with rows from the END of the content (where newer/appended data lives).
+// This avoids the problem of truncating at the start and only seeing old rows.
+func tailCSVContent(content string, maxChars int) string {
+	if len(content) <= maxChars {
+		return content
+	}
+	headerEnd := strings.IndexByte(content, '\n')
+	if headerEnd < 0 {
+		// No newline at all — just tail the raw content.
+		return content[len(content)-maxChars:]
+	}
+	header := content[:headerEnd+1]
+	budget := maxChars - len(header)
+	if budget <= 0 {
+		return header
+	}
+	tail := content[len(content)-budget:]
+	// Align to the next newline so we don't start mid-row.
+	if nl := strings.IndexByte(tail, '\n'); nl >= 0 {
+		tail = tail[nl+1:]
+	}
+	return header + tail
 }
 
 // isPdfMimetype reports whether the MIME type is a PDF document.
