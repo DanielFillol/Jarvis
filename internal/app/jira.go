@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/DanielFillol/Jarvis/internal/googledrive"
 	"github.com/DanielFillol/Jarvis/internal/jira"
 	"github.com/DanielFillol/Jarvis/internal/llm"
 	"github.com/DanielFillol/Jarvis/internal/parse"
@@ -680,6 +681,51 @@ func (s *Service) buildFileContext(files []slack.File) string {
 		isXLSX := isXLSXMimetype(f.Mimetype)
 		isDocx := isDocxMimetype(f.Mimetype)
 		isPDF := isPdfMimetype(f.Mimetype)
+		isGSheets := isGoogleSheetsMimetype(f.Mimetype)
+
+		if isGSheets {
+			if s.GoogleDrive == nil {
+				log.Printf("[JARVIS] skipping Google Sheets file %q: Google Drive client not configured", f.Name)
+				continue
+			}
+			fileIDs := googledrive.ExtractFileIDsFromText(f.ExternalURL)
+			if len(fileIDs) == 0 {
+				log.Printf("[JARVIS] skipping Google Sheets file %q: no Drive file ID in ExternalURL=%q", f.Name, f.ExternalURL)
+				continue
+			}
+			log.Printf("[JARVIS] fetching Google Sheets file %q via Drive fileID=%s", f.Name, fileIDs[0])
+			result, driveErr := s.GoogleDrive.FetchByFileID(fileIDs[0], "")
+			if driveErr != nil {
+				log.Printf("[JARVIS] failed to fetch Google Sheets %q: %v", f.Name, driveErr)
+				continue
+			}
+			content := result.Content
+			if content == "" {
+				log.Printf("[JARVIS] Google Sheets file %q returned empty content", f.Name)
+				continue
+			}
+			remaining := maxTotalChars - b.Len()
+			if remaining <= 0 {
+				log.Printf("[JARVIS] fileContext cap reached, skipping file %q", f.Name)
+				break
+			}
+			header := fmt.Sprintf("--- arquivo: %s (tipo: %s, fonte: Google Drive) ---\n", f.Name, f.Mimetype)
+			available := remaining - len(header) - 2
+			if available <= 0 {
+				break
+			}
+			b.WriteString(header)
+			if len(content) > available {
+				log.Printf("[JARVIS] truncating Google Sheets file %q: %d → %d chars (tail)", f.Name, len(content), available)
+				b.WriteString(tailCSVContent(content, available))
+				b.WriteString("\n[AVISO: conteúdo truncado — exibindo linhas mais recentes]\n")
+			} else {
+				b.WriteString(content)
+			}
+			b.WriteString("\n\n")
+			continue
+		}
+
 		if !isText && !isXLSX && !isDocx && !isPDF {
 			log.Printf("[JARVIS] skipping unsupported file %q mimetype=%q", f.Name, f.Mimetype)
 			continue
