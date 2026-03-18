@@ -95,6 +95,7 @@ type SearchJQLRespIssue struct {
 	Assignee string
 	Summary  string
 	Updated  string
+	Created  string
 	Sprint   string
 }
 
@@ -151,6 +152,7 @@ type SearchJQLResp struct {
 		Fields struct {
 			Summary string `json:"summary"`
 			Updated string `json:"updated"`
+			Created string `json:"created"`
 			Status  struct {
 				Name string `json:"name"`
 			} `json:"status"`
@@ -312,7 +314,7 @@ func (c *Client) FetchAll(jql string, maxTotal int) ([]SearchJQLRespIssue, error
 	startAt := 0
 	pageSize := 50
 	for {
-		resp, err := c.SearchJQL(jql, startAt, pageSize, []string{"summary", "status", "issuetype", "updated", "project", "priority", "assignee", "customfield_10020"})
+		resp, err := c.SearchJQL(jql, startAt, pageSize, []string{"summary", "status", "issuetype", "updated", "created", "project", "priority", "assignee", "customfield_10020"})
 		if err != nil {
 			if startAt > 0 {
 				// If a further page fails, return what we've accumulated so far
@@ -343,6 +345,7 @@ func (c *Client) FetchAll(jql string, maxTotal int) ([]SearchJQLRespIssue, error
 				Assignee: assignee,
 				Summary:  it.Fields.Summary,
 				Updated:  it.Fields.Updated,
+				Created:  it.Fields.Created,
 				Sprint:   sprint,
 			})
 			if len(all) >= maxTotal {
