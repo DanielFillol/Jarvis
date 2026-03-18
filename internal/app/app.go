@@ -413,6 +413,18 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 						"Informe o usuário que houve um erro ao consultar o Jira e peça para refinar a busca.]")
 				break
 			}
+			// When the initial query returns 0 results, attempt status name correction
+			// before giving up — Jira status names must match exactly and the LLM may
+			// have generated a slightly different casing than what the workflow uses.
+			if len(issues) == 0 {
+				if corrected := correctJQLStatus(jql, s.Jira.WorkflowStatuses); corrected != jql {
+					log.Printf("[JARVIS] jiraJQL corrected for empty result=%q", corrected)
+					if corrIssues, corrErr := s.Jira.FetchAll(corrected, 200); corrErr == nil && len(corrIssues) > 0 {
+						issues = corrIssues
+						log.Printf("[JARVIS] jiraJQL corrected returned issues=%d", len(issues))
+					}
+				}
+			}
 			if len(issues) == 0 {
 				jiraCtxParts = append(jiraCtxParts,
 					fmt.Sprintf("[JIRA_EMPTY: JQL '%s' retornou 0 issues. "+
