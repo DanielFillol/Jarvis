@@ -19,6 +19,7 @@ type File struct {
 	Filetype           string `json:"filetype"`
 	Size               int64  `json:"size"`
 	URLPrivateDownload string `json:"url_private_download"`
+	ExternalURL        string `json:"external_url"`
 }
 
 // GetThreadFiles fetches all file attachments from the messages of a Slack
