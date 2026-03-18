@@ -137,8 +137,12 @@ type ActionDescriptor struct {
 	// hubspot_search
 	HubSpotObjectType string `json:"hubspot_object_type,omitempty"`
 	HubSpotQuery      string `json:"hubspot_query,omitempty"`
-	HubSpotAfter      string `json:"hubspot_after,omitempty"`  // ISO YYYY-MM-DD, inclusive
-	HubSpotBefore     string `json:"hubspot_before,omitempty"` // ISO YYYY-MM-DD, exclusive
+	HubSpotAfter      string `json:"hubspot_after,omitempty"`     // ISO YYYY-MM-DD, inclusive
+	HubSpotBefore     string `json:"hubspot_before,omitempty"`    // ISO YYYY-MM-DD, exclusive
+	HubSpotRecordID   string `json:"hubspot_record_id,omitempty"` // numeric record ID for direct lookup
+
+	// googledrive_search
+	GoogleDriveSheetName string `json:"sheet_name,omitempty"`
 }
 
 const (
@@ -237,10 +241,11 @@ func (c *Client) DecideActions(
 		exampleItems = append(exampleItems, `  {"kind": "outline_search", "query": "processo deploy produção"}`)
 	}
 	if googleDriveEnabled {
-		exampleItems = append(exampleItems, `  {"kind": "googledrive_search", "query": "relatório vendas 2024"}`)
+		exampleItems = append(exampleItems, `  {"kind": "googledrive_search", "query": "relatório vendas 2024", "sheet_name": "Transporte"}`)
 	}
 	if hubspotEnabled {
 		exampleItems = append(exampleItems, `  {"kind": "hubspot_search", "hubspot_object_type": "companies", "hubspot_query": "Acme Corp", "hubspot_after": "2026-01-01"}`)
+		exampleItems = append(exampleItems, `  {"kind": "hubspot_search", "hubspot_object_type": "tickets", "hubspot_record_id": "47919961660"}`)
 	}
 
 	// Jira-specific routing rules.
@@ -269,6 +274,8 @@ Regras para jql (campo de jira_search):
 - Para bugs abertos: issuetype = Bug AND statusCategory != Done
 - Para busca por sprint: sprint = "Sprint N" ou sprint in openSprints() para sprints ativas.
 - SEMPRE agrupe condições OR com parênteses quando combinadas com AND: project = X AND (text ~ "a" OR text ~ "b") — NUNCA escreva: project = X AND text ~ "a" OR text ~ "b"
+- Para perguntas sobre cards "abertos", "criados" ou "registrados" em um período: use o campo created no JQL, NUNCA updated. Exemplos: "abertos em fevereiro/2026" → created >= "2026-02-01" AND created <= "2026-02-29"; "criados em março" → created >= "2026-03-01" AND created <= "2026-03-31".
+- Se o usuário fornecer diretamente uma string JQL na mensagem (ex: "use esse JQL: ...", "rode o JQL:", "execute esse JQL:"), extraia-a exatamente como escrita e use como valor do campo jql. Isso deve sempre gerar uma ação jira_search.
 `
 	} else {
 		jiraRules = `1. "onde falamos", "qual foi a decisão", "me manda o link" → slack_search.
@@ -285,16 +292,17 @@ Regras para jql (campo de jira_search):
 	googleDriveRule := ""
 	if googleDriveEnabled {
 		googleDriveSourceLine = "- Google Drive: arquivos internos, planilhas, apresentações, documentos compartilhados, relatórios, contratos, propostas.\n"
-		googleDriveRule = "13. Quando Google Drive está configurado: inclua googledrive_search quando a resposta provavelmente está em um arquivo compartilhado no Drive (planilha, apresentação, PDF, relatório, contrato). Preencha query com 2–4 termos-chave descritivos do arquivo ou conteúdo buscado.\n"
+		googleDriveRule = "13. Quando Google Drive está configurado: inclua googledrive_search quando a resposta provavelmente está em um arquivo compartilhado no Drive (planilha, apresentação, PDF, relatório, contrato). Preencha query com 2–4 termos-chave descritivos do arquivo ou conteúdo buscado. Quando o usuário mencionar uma aba/sheet específica (ex: \"aba Transporte\", \"na aba X\", \"tab Y\"), preencha sheet_name com o nome exato mencionado; caso contrário, omita sheet_name.\n"
 	}
 	hubspotSourceLine := ""
 	hubspotRule := ""
 	if hubspotEnabled {
 		hubspotSourceLine = "- HubSpot CRM: contatos, empresas, negociações (deals), tickets de suporte, dados de clientes e pipeline comercial.\n"
-		hubspotRule = "14. Quando HubSpot está configurado: inclua hubspot_search quando a pergunta envolve dados de CRM (busca de contato, empresa, deal, ticket, cliente, lead, pipeline). Preencha hubspot_object_type com um de: contacts, companies, deals, tickets (ou deixe vazio para buscar em todos). Preencha hubspot_query com o termo de busca mais relevante.\n" +
+		hubspotRule = "14. Quando HubSpot está configurado: inclua hubspot_search APENAS quando a pergunta envolve dados de CRM (pipeline comercial, status de negociação, contato, empresa, deal, ticket de suporte, lead). NÃO use hubspot_search para dados operacionais como faturamento, preço de coleta, billing_cycle, transações, rotas ou histórico de serviço — esses dados estão no banco de dados (Metabase). Preencha hubspot_object_type com um de: contacts, companies, deals, tickets (ou deixe vazio para buscar em todos). Preencha hubspot_query com o termo de busca mais relevante.\n" +
 			"14a. Se a mesma mensagem pedir explicitamente dados do banco de dados (Metabase) além do CRM, inclua TAMBÉM metabase_query no array — as duas ações devem aparecer juntas.\n" +
 			"14b. Quando o usuário especificar um intervalo de datas, preencha hubspot_after (data inicial inclusiva) e/ou hubspot_before (data final exclusiva) no formato YYYY-MM-DD. Use a data atual fornecida acima para calcular expressões relativas (\"últimos dois meses\", \"mês passado\", \"essa semana\").\n" +
-			"14c. Quando o usuário mencionar um estágio ou pipeline específico (ex: 'enterprise 3.0', 'fechado ganho', 'proposta'), use esse nome como parte do hubspot_query para filtrar negócios naquele estágio. Consulte os Pipelines HubSpot disponíveis listados acima para identificar o nome correto do estágio.\n"
+			"14c. Quando o usuário mencionar um estágio ou pipeline específico (ex: 'enterprise 3.0', 'fechado ganho', 'proposta'), use esse nome como parte do hubspot_query para filtrar negócios naquele estágio. Consulte os Pipelines HubSpot disponíveis listados acima para identificar o nome correto do estágio.\n" +
+			"14d. Quando o usuário fornecer um ID numérico de registro HubSpot (ex: \"47919961660\", \"ticket 12345678\", \"demanda 98765\", \"demanda de serviço 47919961660\"), preencha hubspot_record_id com esse número e hubspot_object_type com o tipo inferido (tickets, deals, contacts, companies) ou deixe vazio para tentar todos os tipos. Quando hubspot_record_id estiver preenchido, hubspot_query pode ser omitido.\n"
 	}
 
 	// Multi-source rule: encourage combining sources when multiple are configured.
@@ -316,11 +324,12 @@ Regras para jql (campo de jira_search):
 	}
 	multiSourceRule := ""
 	if activeSources >= 3 {
-		multiSourceRule = `REGRA GERAL DE MULTI-FONTE: Quando múltiplas fontes estão configuradas, prefira incluir VÁRIAS ações
-no array em vez de apenas uma. Uma resposta completa vale mais que uma resposta rápida. Exemplos:
-- Pergunta sobre empresa ou cliente: inclua hubspot_search E metabase_query se ambos disponíveis.
+		multiSourceRule = `REGRA GERAL DE MULTI-FONTE: Quando múltiplas fontes estão configuradas, escolha as fontes certas para cada tipo de pergunta:
 - Pergunta sobre processo ou entrega: inclua jira_search E slack_search.
-- Nunca descarte uma fonte disponível se ela puder contribuir para a resposta.
+- Pergunta MISTA (dados comerciais/CRM + dados operacionais): inclua hubspot_search E metabase_query.
+- Pergunta PURAMENTE operacional (coletas, faturamento, preços, billing, transações, rotas, contratos) → apenas metabase_query, NÃO inclua hubspot_search.
+- Pergunta PURAMENTE de CRM (pipeline, funil de vendas, status de negociação, dados de contato, leads) → apenas hubspot_search, NÃO inclua metabase_query.
+- Dúvida sobre onde os dados estão: prefira metabase_query para dados numéricos/operacionais, hubspot_search para dados relacionais/comerciais.
 `
 	}
 
@@ -336,7 +345,7 @@ Exemplo de array (inclua apenas as ações necessárias):
 
 Fontes disponíveis:
 %s%s%s%s- Slack: discussões, decisões, links de threads, contexto operacional.
-- Metabase (banco de dados): dados estruturados do banco operacional. Se a pergunta filtra, lista ou consulta entidades (registros, entidades operacionais, transações, pedidos), use metabase_query. NÃO use slack_search para dados que vivem no banco.
+- Metabase (banco de dados): dados estruturados do banco operacional — coletas, faturamento, billing, preços, transações, pedidos, contratos, rotas, materiais, geradores, transportadores, métricas e histórico de qualquer entidade. Se a pergunta envolve métricas, preços, quantidades, status operacional, datas de coleta/entrega/fatura, use metabase_query. NÃO use slack_search para dados que vivem no banco. NÃO use hubspot_search para dados operacionais (fatura, preço, billing_cycle, coleta, transação).
 
 Regras para jira_create e jira_edit:
 - "jira_create": verbo de criação EXPLÍCITO (criar/cria/abre/abrir/gera/gerar) + tipo de issue Jira (tarefa, bug, história, épico, spike), pedido AGORA
@@ -420,6 +429,7 @@ Pergunta:
 				continue
 			}
 			a.Query = strings.TrimSpace(a.Query)
+			a.GoogleDriveSheetName = strings.TrimSpace(a.GoogleDriveSheetName)
 		case ActionHubSpotSearch:
 			if !hubspotEnabled {
 				continue
@@ -428,6 +438,7 @@ Pergunta:
 			a.HubSpotQuery = strings.TrimSpace(a.HubSpotQuery)
 			a.HubSpotAfter = strings.TrimSpace(a.HubSpotAfter)
 			a.HubSpotBefore = strings.TrimSpace(a.HubSpotBefore)
+			a.HubSpotRecordID = strings.TrimSpace(a.HubSpotRecordID)
 		case ActionMetabaseQuery, ActionShowSQL:
 			if len(metabaseDatabases) == 0 {
 				continue
