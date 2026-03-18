@@ -1,19 +1,42 @@
 package googledrive
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"regexp"
 	"strings"
 
+	"github.com/xuri/excelize/v2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
 
 	"github.com/DanielFillol/Jarvis/internal/config"
 )
+
+// reDriveURL matches Google Drive/Docs/Sheets/Slides URLs and captures the file ID.
+var reDriveURL = regexp.MustCompile(
+	`https?://(?:docs|drive)\.google\.com/(?:spreadsheets|document|presentation|file)/d/([a-zA-Z0-9_-]{20,})`,
+)
+
+// ExtractFileIDsFromText finds all Google Drive file IDs embedded in text (e.g. Slack messages).
+// Handles both plain URLs and Slack-formatted <URL|label> links.
+func ExtractFileIDsFromText(text string) []string {
+	matches := reDriveURL.FindAllStringSubmatch(text, -1)
+	seen := map[string]bool{}
+	var ids []string
+	for _, m := range matches {
+		if len(m) >= 2 && !seen[m[1]] {
+			seen[m[1]] = true
+			ids = append(ids, m[1])
+		}
+	}
+	return ids
+}
 
 const maxFileSize = 5 * 1024 * 1024 // 5 MB per file
 
@@ -106,8 +129,44 @@ func (c *Client) SearchFiles(query string) ([]*SearchResult, error) {
 	return results, nil
 }
 
+// filterXLSXBySheet parses XLSX bytes and returns:
+// - content of the named sheet (if found), or
+// - empty string + list of all sheet names (if sheetName not found or empty with multiple sheets).
+func filterXLSXBySheet(data []byte, sheetName string) (content string, sheetNames []string, err error) {
+	f, err := excelize.OpenReader(bytes.NewReader(data))
+	if err != nil {
+		return "", nil, err
+	}
+	defer f.Close()
+
+	sheets := f.GetSheetList()
+	sheetNames = sheets
+
+	// Single sheet and no preference → just render it.
+	if sheetName == "" && len(sheets) == 1 {
+		sheetName = sheets[0]
+	}
+
+	// Match (case-insensitive) — render only that sheet.
+	for _, s := range sheets {
+		if strings.EqualFold(s, sheetName) {
+			rows, _ := f.GetRows(s)
+			var b strings.Builder
+			for _, row := range rows {
+				b.WriteString(strings.Join(row, "\t"))
+				b.WriteByte('\n')
+			}
+			return strings.TrimSpace(b.String()), sheets, nil
+		}
+	}
+
+	// Not found or empty with multiple sheets → return "" + sheet list.
+	return "", sheets, nil
+}
+
 // FetchContent downloads or exports the file and populates r.Content with plain text.
-func (c *Client) FetchContent(r *SearchResult) error {
+// For Google Sheets, sheetName filters to a specific tab; empty = ask when multiple sheets exist.
+func (c *Client) FetchContent(r *SearchResult, sheetName string) error {
 	var data []byte
 	var err error
 
@@ -115,7 +174,7 @@ func (c *Client) FetchContent(r *SearchResult) error {
 	case "application/vnd.google-apps.document":
 		data, err = c.export(r.ID, "text/plain")
 	case "application/vnd.google-apps.spreadsheet":
-		data, err = c.export(r.ID, "text/csv")
+		data, err = c.export(r.ID, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 	case "application/vnd.google-apps.presentation":
 		data, err = c.export(r.ID, "text/plain")
 	default:
@@ -130,6 +189,33 @@ func (c *Client) FetchContent(r *SearchResult) error {
 
 	nameLower := strings.ToLower(r.Name)
 	switch {
+	case r.MimeType == "application/vnd.google-apps.spreadsheet" ||
+		strings.Contains(r.MimeType, "spreadsheetml") ||
+		strings.HasSuffix(nameLower, ".xlsx"):
+		content, sheets, fErr := filterXLSXBySheet(data, sheetName)
+		if fErr != nil {
+			log.Printf("[GDRIVE] filterXLSXBySheet failed for %q: %v", r.Name, fErr)
+			// For native Google Sheets, fall back to CSV export (more reliable than XLSX)
+			if r.MimeType == "application/vnd.google-apps.spreadsheet" {
+				csvData, csvErr := c.export(r.ID, "text/csv")
+				if csvErr == nil && len(csvData) > 0 {
+					log.Printf("[GDRIVE] CSV fallback succeeded for %q (%d bytes)", r.Name, len(csvData))
+					r.Content = string(csvData)
+					return nil
+				}
+				log.Printf("[GDRIVE] CSV fallback also failed for %q: %v", r.Name, csvErr)
+			}
+			r.Content = string(data)
+			return nil
+		}
+		if content != "" {
+			r.Content = content
+		} else {
+			r.Content = fmt.Sprintf(
+				"[GDRIVE_SHEETS: A planilha tem múltiplas abas: %s.\nPergunte ao usuário qual aba deseja consultar.]",
+				strings.Join(sheets, ", "),
+			)
+		}
 	case strings.Contains(r.MimeType, "pdf") || strings.HasSuffix(nameLower, ".pdf"):
 		if c.pdfParser != nil {
 			if text, pErr := c.pdfParser(data); pErr == nil {
@@ -147,16 +233,6 @@ func (c *Client) FetchContent(r *SearchResult) error {
 				return nil
 			} else {
 				log.Printf("[GDRIVE] docxParser failed for %q: %v", r.Name, dErr)
-			}
-		}
-		r.Content = string(data)
-	case strings.Contains(r.MimeType, "spreadsheetml") || strings.HasSuffix(nameLower, ".xlsx"):
-		if c.xlsxParser != nil {
-			if text, xErr := c.xlsxParser(data); xErr == nil {
-				r.Content = text
-				return nil
-			} else {
-				log.Printf("[GDRIVE] xlsxParser failed for %q: %v", r.Name, xErr)
 			}
 		}
 		r.Content = string(data)
@@ -193,13 +269,14 @@ func (c *Client) download(fileID string) ([]byte, error) {
 }
 
 // SearchAndFetch combines SearchFiles and FetchContent into a single call.
-func (c *Client) SearchAndFetch(query string) ([]*SearchResult, error) {
+// sheetName is forwarded to FetchContent for Google Sheets tab filtering.
+func (c *Client) SearchAndFetch(query, sheetName string) ([]*SearchResult, error) {
 	results, err := c.SearchFiles(query)
 	if err != nil {
 		return nil, err
 	}
 	for _, r := range results {
-		if fErr := c.FetchContent(r); fErr != nil {
+		if fErr := c.FetchContent(r, sheetName); fErr != nil {
 			log.Printf("[GDRIVE] FetchContent %q failed: %v", r.Name, fErr)
 		}
 	}
@@ -238,6 +315,25 @@ func FormatContext(results []*SearchResult, maxCharsPerDoc int) string {
 		sb.WriteString("\n")
 	}
 	return sb.String()
+}
+
+// FetchByFileID retrieves a specific file by its Google Drive file ID.
+// sheetName filters to a specific tab for Google Sheets; empty = ask when multiple sheets exist.
+func (c *Client) FetchByFileID(fileID, sheetName string) (*SearchResult, error) {
+	f, err := c.svc.Files.Get(fileID).Fields("id, name, mimeType, webViewLink").Do()
+	if err != nil {
+		return nil, fmt.Errorf("googledrive: get file %s: %w", fileID, err)
+	}
+	r := &SearchResult{
+		ID:       f.Id,
+		Name:     f.Name,
+		MimeType: f.MimeType,
+		WebURL:   f.WebViewLink,
+	}
+	if fErr := c.FetchContent(r, sheetName); fErr != nil {
+		return nil, fErr
+	}
+	return r, nil
 }
 
 // FormatSources returns a Slack mrkdwn line listing source files with clickable links.
