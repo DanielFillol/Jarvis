@@ -63,6 +63,12 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.Slack == nil {
+		log.Printf("[SLACK] Slack client not configured — rejecting event")
+		http.Error(w, "service_unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
 	if err := h.Slack.VerifySignature(r, rawBody); err != nil {
 		log.Printf("[SEC] signature verification failed: %v", err)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
