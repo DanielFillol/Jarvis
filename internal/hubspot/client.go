@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DanielFillol/Jarvis/internal/config"
@@ -29,6 +30,7 @@ type Client struct {
 	baseURL     string
 	apiKey      string
 	searchLimit int
+	portalID    string // optional; used to build direct record links
 	http        *http.Client
 	// CatalogCompact is a compact one-liner of all deal/ticket pipelines and
 	// their stages.  Populated asynchronously at startup by GenerateCatalog.
@@ -40,6 +42,8 @@ type Client struct {
 	// pipelines holds all fetched deal/ticket pipelines for name→ID resolution.
 	// Populated asynchronously at startup by GenerateCatalog.
 	pipelines []*Pipeline
+	// propertiesCache stores objectType → []string of all property names, lazy-loaded.
+	propertiesCache sync.Map
 }
 
 // NewClient creates a new HubSpot client from config.
@@ -56,11 +60,12 @@ func NewClient(cfg config.Config) *Client {
 	if limit <= 0 {
 		limit = 10
 	}
-	log.Printf("[BOOT] HubSpot enabled base_url=%q search_limit=%d", baseURL, limit)
+	log.Printf("[BOOT] HubSpot enabled base_url=%q search_limit=%d portal_id=%q", baseURL, limit, cfg.HubSpotPortalID)
 	c := &Client{
 		baseURL:     baseURL,
 		apiKey:      cfg.HubSpotAPIKey,
 		searchLimit: limit,
+		portalID:    strings.TrimSpace(cfg.HubSpotPortalID),
 		http:        &http.Client{Timeout: 30 * time.Second},
 	}
 	catalogPath := cfg.HubSpotCatalogPath
@@ -102,6 +107,143 @@ func deriveName(objectType string, props map[string]string) string {
 		return props["subject"]
 	}
 	return ""
+}
+
+// recordURL returns the direct HubSpot record URL when portalID is configured.
+// Returns empty string when portalID is not set.
+func (c *Client) recordURL(objectType, id string) string {
+	if c.portalID == "" || id == "" {
+		return ""
+	}
+	// HubSpot URL path uses singular form for some types.
+	pathType := objectType
+	switch objectType {
+	case "contacts":
+		pathType = "contact"
+	case "companies":
+		pathType = "company"
+	case "deals":
+		pathType = "deal"
+	case "tickets":
+		pathType = "ticket"
+	}
+	return fmt.Sprintf("https://app.hubspot.com/contacts/%s/%s/%s", c.portalID, pathType, id)
+}
+
+// fetchAllProperties fetches all property names for an object type from the
+// HubSpot Properties API, caching the result after the first call.
+func (c *Client) fetchAllProperties(objectType string) ([]string, error) {
+	if v, ok := c.propertiesCache.Load(objectType); ok {
+		return v.([]string), nil
+	}
+	url := fmt.Sprintf("%s/crm/v3/properties/%s", c.baseURL, objectType)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("hubspot properties status=%d body=%s", resp.StatusCode, preview(string(rb), 300))
+	}
+	var out struct {
+		Results []struct {
+			Name string `json:"name"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rb, &out); err != nil {
+		return nil, fmt.Errorf("hubspot properties decode: %w", err)
+	}
+	props := make([]string, 0, len(out.Results))
+	for _, r := range out.Results {
+		if r.Name != "" {
+			props = append(props, r.Name)
+		}
+	}
+	c.propertiesCache.Store(objectType, props)
+	log.Printf("[HUBSPOT] fetched %d properties for %s", len(props), objectType)
+	return props, nil
+}
+
+// FetchByID fetches a single CRM record by its numeric ID using the batch/read
+// endpoint with all available properties. Returns nil, nil when the record is
+// not found (404 or empty results) — callers should fall back to text search.
+func (c *Client) FetchByID(objectType, id string) (*SearchResult, error) {
+	allProps, err := c.fetchAllProperties(objectType)
+	if err != nil {
+		// Fall back to standard property set on error.
+		allProps = objectProperties[objectType]
+		log.Printf("[HUBSPOT] fetchAllProperties fallback for %s: %v", objectType, err)
+	}
+
+	bodyMap := map[string]interface{}{
+		"inputs":     []map[string]string{{"id": id}},
+		"properties": allProps,
+	}
+	body, _ := json.Marshal(bodyMap)
+
+	url := fmt.Sprintf("%s/crm/v3/objects/%s/batch/read", c.baseURL, objectType)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+
+	// 404 means the record does not exist — not an error for the caller.
+	if resp.StatusCode == 404 {
+		return nil, nil
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("hubspot batch/read status=%d body=%s", resp.StatusCode, preview(string(rb), 300))
+	}
+
+	var out struct {
+		Results []struct {
+			ID         string            `json:"id"`
+			Properties map[string]string `json:"properties"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rb, &out); err != nil {
+		return nil, fmt.Errorf("hubspot batch/read decode: %w", err)
+	}
+	if len(out.Results) == 0 {
+		return nil, nil
+	}
+
+	r := out.Results[0]
+	props := r.Properties
+	if props == nil {
+		props = map[string]string{}
+	}
+	// Filter out empty values to keep context compact.
+	filtered := make(map[string]string, len(props))
+	for k, v := range props {
+		if strings.TrimSpace(v) != "" {
+			filtered[k] = v
+		}
+	}
+	sr := &SearchResult{
+		ObjectType: objectType,
+		ID:         r.ID,
+		Properties: filtered,
+		Name:       deriveName(objectType, filtered),
+		WebURL:     c.recordURL(objectType, r.ID),
+	}
+	log.Printf("[HUBSPOT] FetchByID type=%s id=%s props=%d name=%q", objectType, id, len(filtered), sr.Name)
+	return sr, nil
 }
 
 // isoToMillis converts an ISO date string (YYYY-MM-DD) to Unix milliseconds.
@@ -224,6 +366,7 @@ func (c *Client) search(objectType, query, after, before string) ([]*SearchResul
 			ID:         r.ID,
 			Properties: props,
 			Name:       deriveName(objectType, props),
+			WebURL:     c.recordURL(objectType, r.ID),
 		}
 		results = append(results, sr)
 	}
@@ -273,6 +416,9 @@ func FormatContext(results []*SearchResult, maxCharsPerResult int) string {
 		if r.Name != "" {
 			parts = append(parts, "Nome: "+r.Name)
 		}
+		if r.WebURL != "" {
+			parts = append(parts, "URL: "+r.WebURL)
+		}
 		for k, v := range r.Properties {
 			if v == "" {
 				continue
@@ -301,7 +447,11 @@ func FormatSources(results []*SearchResult) string {
 		if label == "" {
 			label = r.ID
 		}
-		sb.WriteString(fmt.Sprintf("• %s: %s (ID: %s)\n", strings.Title(r.ObjectType), label, r.ID))
+		if r.WebURL != "" {
+			sb.WriteString(fmt.Sprintf("• %s: <%s|%s> (ID: %s)\n", strings.Title(r.ObjectType), r.WebURL, label, r.ID))
+		} else {
+			sb.WriteString(fmt.Sprintf("• %s: %s (ID: %s)\n", strings.Title(r.ObjectType), label, r.ID))
+		}
 	}
 	return strings.TrimSpace(sb.String())
 }
