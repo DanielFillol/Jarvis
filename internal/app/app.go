@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,9 @@ import (
 	"github.com/DanielFillol/Jarvis/internal/state"
 	"github.com/DanielFillol/Jarvis/internal/telemetry"
 )
+
+// reSheetName matches "aba X" or "tab X" (Portuguese/English) to detect sheet name in user messages.
+var reSheetName = regexp.MustCompile(`(?i)\bab[ao]\s+([^\s,\.]+)`)
 
 // pendingReply holds the message chunks for a long answer awaiting confirmation
 // together with the originTs of the original question that triggered the answer.
@@ -192,6 +196,14 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	// 4) Unified action dispatcher: one LLM call determines every skill needed.
 	// Resolve Slack mentions before passing to the router.
 	questionForLLM := s.Slack.ResolveUserMentions(s.Slack.ResolveChannelMentions(parse.StripSlackPermalinks(question)))
+	// Enhance the question to improve routing accuracy before DecideActions.
+	questionForLLM = s.LLM.EnhancePrompt(
+		questionForLLM,
+		threadHist,
+		s.buildAvailableSources(),
+		s.Cfg.OpenAILesserModel,
+	)
+	log.Printf("[JARVIS] enhanced question=%q", preview(questionForLLM, 180))
 	hasPending := s.Cfg.JiraEnabled() && s.Store.Load(channel, threadTs) != nil
 	storedDBID, _ := s.loadThreadDBID(contextChannel, contextThreadTs)
 
@@ -311,6 +323,31 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 	var slackMatches, jiraIssuesFound int
 	var csvDownloadLine string // set when a CSV file is generated; appended to answer unconditionally
 
+	// Pre-step: directly fetch any Google Drive/Sheets URLs present in the message.
+	if s.GoogleDrive != nil {
+		if driveFileIDs := googledrive.ExtractFileIDsFromText(question); len(driveFileIDs) > 0 {
+			detectedSheetName := ""
+			if m := reSheetName.FindStringSubmatch(question); len(m) >= 2 {
+				detectedSheetName = m[1]
+			}
+			var directResults []*googledrive.SearchResult
+			for _, fileID := range driveFileIDs {
+				log.Printf("[JARVIS] googleDriveDirectFetch fileID=%q sheetName=%q", fileID, detectedSheetName)
+				r, fErr := s.GoogleDrive.FetchByFileID(fileID, detectedSheetName)
+				if fErr != nil {
+					log.Printf("[WARN] googleDriveDirectFetch failed: %v", fErr)
+					continue
+				}
+				directResults = append(directResults, r)
+			}
+			if len(directResults) > 0 {
+				googleDriveCtx = googledrive.FormatContext(directResults, 50000)
+				googleDriveSources = googledrive.FormatSources(directResults)
+				log.Printf("[JARVIS] googleDriveDirectFetch files=%d chars=%d", len(directResults), len(googleDriveCtx))
+			}
+		}
+	}
+
 	for _, action := range contextActions {
 		switch action.Kind {
 
@@ -416,12 +453,12 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 		case llm.ActionGoogleDriveSearch:
 			driveQuery := strings.TrimSpace(action.Query)
 			if s.GoogleDrive != nil && driveQuery != "" {
-				log.Printf("[JARVIS] googleDriveSearch query=%q", driveQuery)
-				results, dErr := s.GoogleDrive.SearchAndFetch(driveQuery)
+				log.Printf("[JARVIS] googleDriveSearch query=%q sheetName=%q", driveQuery, action.GoogleDriveSheetName)
+				results, dErr := s.GoogleDrive.SearchAndFetch(driveQuery, action.GoogleDriveSheetName)
 				if dErr != nil {
 					log.Printf("[WARN] google drive search failed: %v", dErr)
 				} else {
-					googleDriveCtx = googledrive.FormatContext(results, 8000)
+					googleDriveCtx = googledrive.FormatContext(results, 30000)
 					googleDriveSources = googledrive.FormatSources(results)
 					log.Printf("[JARVIS] googleDriveContext files=%d chars=%d", len(results), len(googleDriveCtx))
 					if googleDriveCtx == "" {
@@ -438,6 +475,37 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			query := strings.TrimSpace(action.HubSpotQuery)
 			if query == "" {
 				query = question
+			}
+			// ID-based lookup: try FetchByID first when a record ID is provided.
+			if action.HubSpotRecordID != "" {
+				typesToTry := []string{objectType}
+				if objectType == "" {
+					typesToTry = []string{"tickets", "deals", "contacts", "companies"}
+				}
+				log.Printf("[JARVIS] hubspotFetchByID id=%q types=%v", action.HubSpotRecordID, typesToTry)
+				for _, ot := range typesToTry {
+					r, fErr := s.HubSpot.FetchByID(ot, action.HubSpotRecordID)
+					if fErr != nil {
+						log.Printf("[WARN] hubspot FetchByID type=%s id=%s: %v", ot, action.HubSpotRecordID, fErr)
+						continue
+					}
+					if r != nil {
+						hubspotCtx = hubspot.FormatContext([]*hubspot.SearchResult{r}, 8000)
+						hubspotSources = hubspot.FormatSources([]*hubspot.SearchResult{r})
+						log.Printf("[JARVIS] hubspotFetchByID found type=%s id=%s chars=%d", ot, action.HubSpotRecordID, len(hubspotCtx))
+						break
+					}
+				}
+				if hubspotCtx != "" {
+					break // found by ID — skip text search
+				}
+				// Fall through to text search. Only use the bare record ID when no
+				// richer query is available; if the LLM omitted hubspot_query (leaving
+				// query == question), keep the full question so text search has more
+				// tokens to match against.
+				if query == "" {
+					query = action.HubSpotRecordID
+				}
 			}
 			log.Printf("[JARVIS] hubspotSearch object_type=%q query=%q after=%q before=%q", objectType, query, action.HubSpotAfter, action.HubSpotBefore)
 			results, hErr := s.HubSpot.Search(objectType, query, action.HubSpotAfter, action.HubSpotBefore)
@@ -714,12 +782,12 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 			case llm.ActionGoogleDriveSearch:
 				driveQuery := strings.TrimSpace(action.Query)
 				if s.GoogleDrive != nil && driveQuery != "" {
-					log.Printf("[JARVIS] fallback googleDriveSearch query=%q", driveQuery)
-					results, dErr := s.GoogleDrive.SearchAndFetch(driveQuery)
+					log.Printf("[JARVIS] fallback googleDriveSearch query=%q sheetName=%q", driveQuery, action.GoogleDriveSheetName)
+					results, dErr := s.GoogleDrive.SearchAndFetch(driveQuery, action.GoogleDriveSheetName)
 					if dErr != nil {
 						log.Printf("[WARN] fallback google drive search failed: %v", dErr)
 					} else {
-						googleDriveCtx = googledrive.FormatContext(results, 8000)
+						googleDriveCtx = googledrive.FormatContext(results, 30000)
 						googleDriveSources = googledrive.FormatSources(results)
 						log.Printf("[JARVIS] fallback googleDriveContext files=%d", len(results))
 					}
@@ -732,6 +800,32 @@ func (s *Service) HandleMessage(channel, threadTs, originTs, originalText, quest
 				query := strings.TrimSpace(action.HubSpotQuery)
 				if query == "" {
 					query = question
+				}
+				// ID-based lookup first.
+				if action.HubSpotRecordID != "" {
+					typesToTry := []string{objectType}
+					if objectType == "" {
+						typesToTry = []string{"tickets", "deals", "contacts", "companies"}
+					}
+					log.Printf("[JARVIS] fallback hubspotFetchByID id=%q types=%v", action.HubSpotRecordID, typesToTry)
+					for _, ot := range typesToTry {
+						r, fErr := s.HubSpot.FetchByID(ot, action.HubSpotRecordID)
+						if fErr != nil {
+							log.Printf("[WARN] fallback hubspot FetchByID type=%s id=%s: %v", ot, action.HubSpotRecordID, fErr)
+							continue
+						}
+						if r != nil {
+							hubspotCtx = hubspot.FormatContext([]*hubspot.SearchResult{r}, 8000)
+							hubspotSources = hubspot.FormatSources([]*hubspot.SearchResult{r})
+							break
+						}
+					}
+					if hubspotCtx != "" {
+						break
+					}
+					if query == "" {
+						query = action.HubSpotRecordID
+					}
 				}
 				log.Printf("[JARVIS] fallback hubspotSearch object_type=%q query=%q", objectType, query)
 				results, hErr := s.HubSpot.Search(objectType, query, action.HubSpotAfter, action.HubSpotBefore)
